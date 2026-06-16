@@ -116,6 +116,49 @@ You can tune when HBUP chooses to transcode by adjusting the options under the v
 ##### Final Thoughts
 For quickly trying to get things up and running when you're struggling, always start by forcing the stream quality to `Low`. From there, experiment with the options to tune it to your environment.
 
+#### Cross-VLAN UDP SRTP (snapshots work, live view dies at ~30s)
+
+HomeKit live view uses **UDP SRTP** from your Homebridge host to the viewing device (iPhone, Home Hub, Apple TV). Snapshots use HTTP and are unaffected by UDP firewall rules.
+
+Common symptom: live view starts, then stops around 30 seconds with no obvious FFmpeg error. Structured HBUP logs help distinguish this from input problems:
+
+```
+Stream started: camera=Front Door session=... path=RTSP profile=Medium transcode=no hw=no
+Stream ended: camera=Front Door session=... reason=homekit-stop duration=30.1s first-frame-ms=850 segments-fed=0 ffmpeg-exit=null
+```
+
+When `segments-fed=0`, FFmpeg never received media — check RTSP/API input, not HomeKit timeout. When segments were fed but duration is ~30s, suspect **UDP/SRTP blocked** between VLANs (for example Homebridge on `192.168.30.x` and a Home Hub on `192.168.3.x`).
+
+Workarounds:
+
+  * Allow UDP between Homebridge and HomeKit clients on the SRTP ports shown in verbose FFmpeg logging.
+  * Ensure Homebridge advertises the interface HomeKit expects ([mDNS options](https://github.com/homebridge/homebridge/wiki/mDNS-Options#how-to-select-advertised-network-interfaces)).
+  * On constrained hosts with HKSV enabled, HBUP prefers **RTSP live view on LAN** to reduce Protect controller load — look for `path=RTSP` in stream start logs.
+
+#### `[TSB/API]` vs `[RTSP]` in stream logs
+
+HBUP logs the live view ingress path on each session:
+
+  * **`RTSP`** — direct camera RTSP (lower Protect controller load; preferred on LAN when HKSV is enabled).
+  * **`TSB/API`** — Protect livestream API via the HKSV timeshift buffer (required for package camera, AV1, or remote viewing when API livestreaming is enabled).
+  * **`TSB/RTSP`** — timeshift buffer fed from RTSP instead of the API (debug option `Debug.Video.HKSV.UseRtsp`).
+
+#### Jellyfin FFmpeg and `videoProcessor` (Linux QSV)
+
+The bundled static FFmpeg included with Homebridge often lacks Intel QSV support. On Alder Lake-N and similar hosts, point `videoProcessor` at a Jellyfin-ffmpeg build with QSV enabled, for example `/usr/lib/jellyfin-ffmpeg/ffmpeg`. HBUP validates the path at startup and logs the resolved location.
+
+Intel **Alder Lake-N** (`8086:46d4`) requires a recent kernel for i915 — **6.9+** (ideally 7.0+) — or hardware decode/transcode will not work.
+
+#### Stream telemetry and no-output warnings
+
+Each live view session emits structured start/stop lines at INFO level. If no media reaches FFmpeg within 10 seconds, HBUP logs a warning (without stopping the session — HomeKit owns the 30s timeout):
+
+```
+Camera Name: No stream output after 10s (session=..., path=RTSP). Check UDP path, livestream API availability, or RTSP URL.
+```
+
+Enable `Debug.Video.HKSV.Telemetry` for client IP addresses in telemetry (off by default for privacy).
+
 ### Self-Healing and Camera Restarts
 
 HBUP includes a self-healing feature that monitors camera connectivity. If a camera's livestream API connection continuously times out over an extended period, HBUP will attempt to restart the camera to restore functionality. This behavior is:
@@ -123,6 +166,7 @@ HBUP includes a self-healing feature that monitors camera connectivity. If a cam
   * **Conservative**: Restarts only occur after sustained, repeated failures - not for occasional timeouts or brief network issues.
   * **Logged**: Any restart will be logged so you can see when it occurs.
   * **Configurable**: You can disable self-healing per-device using the `Device.SelfHealing` feature option if you prefer manual control.
+  * **Stress-aware**: When the Protect livestream API is under stress (frequent reconnects), HBUP skips automatic camera reboots and temporarily prefers RTSP live view instead.
 
 If you're seeing frequent camera restarts, this may indicate an underlying issue with your network, the camera firmware, or the Protect controller. Check your Homebridge logs for patterns.
 

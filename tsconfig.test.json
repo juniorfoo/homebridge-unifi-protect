@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+
+    "declaration": false,
+    "noEmit": true,
+    "rootDir": ".",
+    "sourceMap": false,
+    "types": [ "node" ]
+  },
+
+  "exclude": [ "dist", "node_modules" ],
+  "extends": "./tsconfig.json",
+  "include": [ "test/**/*.ts" ]
+}

@@ -12,20 +12,42 @@ import { AudioRecordingCodecType, AudioRecordingSamplerate, AudioStreamingCodecT
 import { BackpressureWriter, FfmpegOptions, FfmpegStreamingProcess, HKSV_FRAGMENT_LENGTH, HOMEKIT_IDR_INTERVAL, type HomebridgePluginLogging,
   type HomebridgeStreamingDelegate, type Nullable, RtpDemuxer, formatBps } from "homebridge-plugin-utils";
 import { PROTECT_HKSV_TIMESHIFT_BUFFER_MAXDURATION, PROTECT_LIVESTREAM_API_IDR_INTERVAL } from "./settings.js";
+import { formatStreamPathLabel, resolveLiveViewRtspEntry, shouldUseTsbApi } from "./stream-path.js";
 import type { ProtectCamera } from "./devices/index.js";
 import type { ProtectNvr } from "./protect-nvr.js";
 import type { ProtectPlatform } from "./protect-platform.js";
 import { ProtectRecordingDelegate } from "./protect-record.js";
 import { ProtectReservedNames } from "./protect-types.js";
 import { ProtectSnapshot } from "./protect-snapshot.js";
+// eslint-disable-next-line sort-imports -- fork stream helpers follow protect-record import group
+import { CopyPathFanoutRegistry } from "./protect-stream-fanout.js";
+import { decideReconfigure } from "./stream-reconfigure.js";
+// eslint-disable-next-line sort-imports -- fork stream helpers follow protect-record import group
+import { abortTsbLivestreamStart } from "./stream-session-cleanup.js";
+// eslint-disable-next-line sort-imports -- fork stream helpers follow protect-record import group
+import { StreamOutputWatchdog, formatNoOutputWarning, formatStreamSessionStart, formatStreamSessionStop } from "./stream-telemetry.js";
+import { formatTranscodeLog, resolveOutputFps, shouldTranscodeVideo } from "./stream-transcode.js";
 import { once } from "node:events";
+
+type StreamVideoParameters = Parameters<typeof decideReconfigure>[1];
+type StreamStopReason = "error" | "ffmpeg-exit" | "homekit-stop" | "livestream-acquire-failed" | "no-output";
 
 interface OngoingSessionEntry {
 
+  fanoutKey?: string;
   ffmpeg: FfmpegStreamingProcess[];
+  firstFrameMs?: number | null;
+  outputWatchdog?: StreamOutputWatchdog;
+  path?: string;
+  profile?: string;
   rtpDemuxer: Nullable<RtpDemuxer>;
   rtpPortReservations: number[];
+  segmentsFed: number;
+  sessionStartedAt: number;
+  stopLogged?: boolean;
   toggleLight?: Service;
+  transcode?: boolean;
+  videoParams?: StreamVideoParameters;
 }
 
 interface SessionInfo {
@@ -66,6 +88,7 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
   private readonly nvr: ProtectNvr;
   private ongoingSessions: Map<string, OngoingSessionEntry>;
   private pendingSessions: Map<string, SessionInfo>;
+  private readonly copyPathFanout: CopyPathFanoutRegistry;
   public readonly platform: ProtectPlatform;
   public readonly protectCamera: ProtectCamera;
   private probesizeOverride: number;
@@ -86,6 +109,7 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
     this.ongoingSessions = new Map();
     this.protectCamera = protectCamera;
     this.pendingSessions = new Map();
+    this.copyPathFanout = new CopyPathFanoutRegistry();
     this.platform = protectCamera.platform;
     this.probesizeOverride = 0;
     this.probesizeOverrideCount = 0;
@@ -423,33 +447,33 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
       return;
     }
 
-    // We transcode based in the following circumstances:
-    //
-    //   1. The user has explicitly configured transcoding.
-    //   2. The user has configured cropping for the video stream.
-    //   3. We are on a high latency streaming session (e.g. cellular). If we're high latency, we'll transcode by default unless the user has asked us not to. Why? It
-    //      generally results in a speedier experience, at the expense of some stream quality (HomeKit tends to request far lower bitrates than Protect is capable of
-    //      producing).
-    //   4. The codec in use on the Protect camera isn't H.264.
-    //
-    // How do we determine if we're a high latency connection? We look at the RTP packet time of the audio packet time for a hint. HomeKit uses values of 20, 30, 40,
-    // and 60ms. We make an assumption, validated by lots of real-world testing, that when we see 60ms used by HomeKit, it's a high latency connection and act
-    // accordingly.
     const isHighLatency = request.audio.packet_time >= 60;
-    const isTranscoding = this.protectCamera.hints.transcode || this.protectCamera.hints.crop || (isHighLatency && this.protectCamera.hints.transcodeHighLatency) ||
-      (this.protectCamera.ufp.videoCodec !== "h264");
+    const transcodeDecision = shouldTranscodeVideo({
+
+      crop: this.protectCamera.hints.crop,
+      hostProfile: this.protectCamera.hostProfile,
+      packetTime: request.audio.packet_time,
+      transcodeFeature: this.protectCamera.hints.transcode,
+      transcodeHighLatency: this.protectCamera.hints.transcodeHighLatency,
+      videoCodec: this.protectCamera.ufp.videoCodec
+    });
+    const isTranscoding = transcodeDecision.transcode;
 
     // Set the initial bitrate we should use for this request based on what HomeKit is requesting.
     let targetBitrate = request.video.max_bit_rate;
 
-    // Only use API livestreaming if we have an active timeshift buffer. Otherwise, we'll fallback to RTSP streaming.
-    let useTsb = this.protectCamera.hints.tsbStreaming && this.hksv?.isRecording;
+    let useTsb = shouldUseTsbApi({
 
-    // If we're A/B testing, switch our streaming types. This is intended for internal development purposes only.
-    if(this.abTest && this.protectCamera.hasFeature("Debug.Video.Stream.ABTest")) {
-
-      useTsb = !useTsb;
-    }
+      abTestFlip: this.abTest,
+      debugAbTestEnabled: this.protectCamera.hasFeature("Debug.Video.Stream.ABTest"),
+      hksvRecording: !!this.hksv?.isRecording,
+      hostProfile: this.protectCamera.hostProfile,
+      isPackageCamera: "packageCamera" in this.protectCamera.accessory.context,
+      packetTime: request.audio.packet_time,
+      preferRtspLiveView: this.protectCamera.preferRtspLiveView,
+      useApiFeature: this.protectCamera.hints.tsbStreaming,
+      videoCodec: this.protectCamera.ufp.videoCodec
+    });
 
     this.abTest = !this.abTest;
 
@@ -470,44 +494,26 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
       useTsb = true;
     }
 
-    // Always try to use API livestreaming if we are looking at the package camera.
-    if(("packageCamera" in this.protectCamera.accessory.context) && !useTsb && this.hksv?.isRecording) {
+    const streamPathLabel = formatStreamPathLabel(useTsb, this.protectCamera.hasFeature("Debug.Video.HKSV.UseRtsp"));
 
-      useTsb = true;
-    }
+    const rtspEntry = resolveLiveViewRtspEntry({
 
-    // If we're using the livestream API and we're timeshifting, we override the stream quality we've determined in favor of our timeshift buffer.
-    let rtspEntry = useTsb ? this.hksv?.rtspEntry : null;
+      findLiveRtsp: (): ReturnType<ProtectCamera["findRtsp"]> => {
 
-    // Find the best RTSP stream based on what we're looking for.
-    if(isTranscoding) {
+        if(isTranscoding) {
 
-      // If we have hardware transcoding enabled, we treat it uniquely and get the highest quality stream we can. Fixed-function hardware transcoders tend to perform
-      // better with higher bitrate sources. Wel also want to generally bias ourselves toward higher quality streams where possible.
-      rtspEntry ??= this.protectCamera.findRtsp(
-        (this.protectCamera.hints.hardwareTranscoding) ? 3840 : request.video.width,
-        (this.protectCamera.hints.hardwareTranscoding) ? 2160 : request.video.height,
-        { biasHigher: true, maxPixels: this.ffmpegOptions.hostSystemMaxPixels }
-      );
+          return this.protectCamera.findRtsp(
+            (this.protectCamera.hints.hardwareTranscoding) ? 3840 : request.video.width,
+            (this.protectCamera.hints.hardwareTranscoding) ? 2160 : request.video.height,
+            { biasHigher: true, maxPixels: this.ffmpegOptions.hostSystemMaxPixels }
+          );
+        }
 
-      // If we have specified the bitrates we want to use when transcoding, let's honor those here.
-      if(isHighLatency && (this.protectCamera.hints.transcodeHighLatencyBitrate > 0)) {
-
-        targetBitrate = this.protectCamera.hints.transcodeHighLatencyBitrate;
-      } else if(!isHighLatency && (this.protectCamera.hints.transcodeBitrate > 0)) {
-
-        targetBitrate = this.protectCamera.hints.transcodeBitrate;
-      }
-
-      // If we're targeting a bitrate that's beyond the capabilities of our input channel, match the bitrate of the input channel.
-      if(rtspEntry && (targetBitrate > (rtspEntry.channel.bitrate / 1000))) {
-
-        targetBitrate = rtspEntry.channel.bitrate / 1000;
-      }
-    } else {
-
-      rtspEntry ??= this.protectCamera.findRtsp(request.video.width, request.video.height);
-    }
+        return this.protectCamera.findRtsp(request.video.width, request.video.height);
+      },
+      hksvRtspEntry: this.hksv?.rtspEntry ?? null,
+      useTsb: useTsb
+    });
 
     if(!rtspEntry) {
 
@@ -521,7 +527,23 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
       return;
     }
 
-    let flashlightService;
+    if(isTranscoding) {
+
+      if(isHighLatency && (this.protectCamera.hints.transcodeHighLatencyBitrate > 0)) {
+
+        targetBitrate = this.protectCamera.hints.transcodeHighLatencyBitrate;
+      } else if(!isHighLatency && (this.protectCamera.hints.transcodeBitrate > 0)) {
+
+        targetBitrate = this.protectCamera.hints.transcodeBitrate;
+      }
+
+      if(targetBitrate > (rtspEntry.channel.bitrate / 1000)) {
+
+        targetBitrate = rtspEntry.channel.bitrate / 1000;
+      }
+    }
+
+    let flashlightService: Service | undefined;
 
     // If we are streaming the package camera, and it's dark outside, activate the flashlight on the camera.
     if("packageCamera" in this.protectCamera.accessory.context) {
@@ -620,9 +642,51 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
 
     hinting.push(...(hinting.length ? [""] : []));
 
-    this.log.info("%sStreaming request: %sx%s@%sfps, %s. Using %s [%s], %s [%s].", hinting.join(" "), request.video.width, request.video.height, request.video.fps,
+    this.log.info("%sStreaming request: %sx%s@%sfps, %s. Using %s [%s], %s [%s]. %s", hinting.join(" "), request.video.width, request.video.height, request.video.fps,
       formatBps(targetBitrate * 1000), rtspEntry.name, this.protectCamera.videoCodecName,
-      formatBps(rtspEntry.channel.bitrate), useTsb ? "TSB/" + (this.protectCamera.hasFeature("Debug.Video.HKSV.UseRtsp") ? "RTSP" : "API") : "RTSP");
+      formatBps(rtspEntry.channel.bitrate), streamPathLabel, formatTranscodeLog(transcodeDecision));
+
+    this.log.info(formatStreamSessionStart({
+
+      camera: this.protectCamera.accessoryName,
+      clientAddress: sessionInfo.address,
+      dst: sessionInfo.hasAudioSupport && this.protectCamera.hints.twoWayAudio ? undefined :
+        sessionInfo.address + ":" + sessionInfo.videoReturnPort.toString(),
+      hardwareTranscode: this.protectCamera.hints.hardwareTranscoding,
+      path: streamPathLabel,
+      profile: rtspEntry.name,
+      sessionId: request.sessionID,
+      transcode: isTranscoding,
+      verboseTelemetry: this.protectCamera.hasFeature("Debug.Video.HKSV.Telemetry")
+    }));
+
+    const sessionStartedAt = Date.now();
+    const outputWatchdog = new StreamOutputWatchdog((): void => {
+
+      this.log.warn(formatNoOutputWarning(this.protectCamera.accessoryName, request.sessionID, streamPathLabel));
+    }, 10000);
+
+    outputWatchdog.arm();
+
+    let fanoutKey: string | undefined;
+
+    if(!isTranscoding && !useTsb) {
+
+      fanoutKey = this.protectCamera.accessory.UUID + ":" + rtspEntry.name;
+      this.copyPathFanout.acquire(fanoutKey);
+    }
+
+    const noteStreamActivity = (): void => {
+
+      const session = this.ongoingSessions.get(request.sessionID);
+
+      if(session && (session.firstFrameMs === undefined)) {
+
+        session.firstFrameMs = Date.now() - session.sessionStartedAt;
+      }
+
+      outputWatchdog.activity();
+    };
 
     // When on high-performance hardware like Apple Silicon, using the TSB, and we don't have low-FPS cameras like the package camera, enable the use of the
     // CPU-intensive FFmpeg minterpolate filter to enable very smooth video, especially when there's motion involved. M3+ Apple Silicon environments are able to reliably
@@ -637,7 +701,7 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
       ffmpegArgs.push(...this.ffmpegOptions.streamEncoder({
 
         bitrate: targetBitrate,
-        fps: useInterpolationFilter ? rtspEntry.channel.fps : request.video.fps,
+        fps: resolveOutputFps(rtspEntry.channel.fps, useInterpolationFilter ? rtspEntry.channel.fps : request.video.fps, useInterpolationFilter),
         height: request.video.height,
         idrInterval: HOMEKIT_IDR_INTERVAL,
         inputFps: rtspEntry.channel.fps,
@@ -783,10 +847,49 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
     }
 
     // Combine everything and start an instance of FFmpeg.
+    const streamingCallback: StreamRequestCallback = (error): void => {
+
+      if(!error) {
+
+        noteStreamActivity();
+      }
+
+      callback(error);
+    };
+
+    const videoParams: StreamVideoParameters = {
+
+      fps: request.video.fps,
+      height: request.video.height,
+      maxBitRate: request.video.max_bit_rate,
+      width: request.video.width
+    };
+
     const ffmpegStream = new FfmpegStreamingProcess(this, request.sessionID, this.ffmpegOptions, ffmpegArgs,
       (sessionInfo.hasAudioSupport && this.protectCamera.hints.twoWayAudio) ? undefined :
         { addressVersion: sessionInfo.addressVersion, port: sessionInfo.videoReturnPort },
-      callback);
+      streamingCallback);
+
+    this.ongoingSessions.set(request.sessionID, {
+
+      fanoutKey: fanoutKey,
+      ffmpeg: [ffmpegStream],
+      outputWatchdog: outputWatchdog,
+      path: streamPathLabel,
+      profile: rtspEntry.name,
+      rtpDemuxer: sessionInfo.rtpDemuxer,
+      rtpPortReservations: sessionInfo.rtpPortReservations,
+      segmentsFed: 0,
+      sessionStartedAt: sessionStartedAt,
+      toggleLight: flashlightService,
+      transcode: isTranscoding,
+      videoParams: videoParams
+    });
+
+    ffmpegStream.ffmpegProcess?.once("exit", (code: number | null): void => {
+
+      this.logStreamSessionStop(request.sessionID, "ffmpeg-exit", code);
+    });
 
     if(useTsb) {
 
@@ -808,6 +911,15 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
 
         // Send the segment to FFmpeg for processing.
         segmentWriter.write(segment);
+
+        const session = this.ongoingSessions.get(request.sessionID);
+
+        if(session) {
+
+          session.segmentsFed++;
+        }
+
+        noteStreamActivity();
       })();
 
       const closeListener = (): void => void ffmpegStream.ffmpegProcess?.stdin.end();
@@ -829,21 +941,38 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
       // Kickoff our livestream.
       if(!(await this.protectCamera.livestream.start(rtspEntry))) {
 
-        livestream.off("segment", livestreamListener);
-        livestream.off("close", closeListener);
+        abortTsbLivestreamStart(streamingCallback, sessionInfo.rtpPortReservations, {
+
+          accessoryName: this.protectCamera.accessoryName,
+          cancelRtpPort: (reservation: number): void => { this.platform.rtpPorts.cancel(reservation); },
+          closeDemuxer: (): void => { sessionInfo.rtpDemuxer?.close(); },
+          closeSegmentWriter: (): void => { segmentWriter.close(); },
+          detachLivestreamListeners: (): void => {
+
+            livestream.off("segment", livestreamListener);
+            livestream.off("close", closeListener);
+          },
+          forceStopStreamingSession: (): void => { this.controller.forceStopStreamingSession(request.sessionID); },
+          isFfmpegStarted: ffmpegStream.isStarted,
+          logError: (message: string): void => { this.log.error("%s: %s", this.protectCamera.accessoryName, message); },
+          stopFfmpeg: (): void => { ffmpegStream.stop(); },
+          stopLivestream: (): void => { this.protectCamera.livestream.stop(rtspEntry); },
+          turnOffFlashlight: (): void => { flashlightService?.setCharacteristic(this.hap.Characteristic.On, false); }
+        });
+
+        outputWatchdog.clear();
+
+        if(fanoutKey) {
+
+          this.copyPathFanout.release(fanoutKey);
+        }
+
+        this.ongoingSessions.delete(request.sessionID);
+        this.pendingSessions.delete(request.sessionID);
 
         return;
       }
     }
-
-    // Some housekeeping for our FFmpeg and demuxer sessions.
-    this.ongoingSessions.set(request.sessionID, {
-
-      ffmpeg: [ffmpegStream],
-      rtpDemuxer: sessionInfo.rtpDemuxer,
-      rtpPortReservations: sessionInfo.rtpPortReservations,
-      toggleLight: flashlightService
-    });
 
     this.pendingSessions.delete(request.sessionID);
 
@@ -1048,9 +1177,31 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
 
       case StreamRequestTypes.RECONFIGURE:
 
-        // Once FFmpeg is updated to support this, we'll enable this one.
         this.log.debug("Streaming parameters adjustment requested by HomeKit: %sx%s, %s fps, %s.",
           request.video.width, request.video.height, request.video.fps, formatBps(request.video.max_bit_rate));
+
+        {
+
+          const videoParams: StreamVideoParameters = {
+
+            fps: request.video.fps,
+            height: request.video.height,
+            maxBitRate: request.video.max_bit_rate,
+            width: request.video.width
+          };
+          const ongoingSession = this.ongoingSessions.get(request.sessionID);
+          const decision = decideReconfigure(ongoingSession?.videoParams, videoParams);
+
+          if(decision.restart && ongoingSession) {
+
+            this.log.info("%s: Restarting live view stream due to %s.", this.protectCamera.accessoryName, decision.reason);
+            this.stopStream(request.sessionID);
+            this.controller.forceStopStreamingSession(request.sessionID);
+          } else if(ongoingSession) {
+
+            ongoingSession.videoParams = videoParams;
+          }
+        }
 
         callback();
 
@@ -1071,10 +1222,19 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
 
     try {
 
+      this.logStreamSessionStop(sessionId, "homekit-stop");
+
       // Stop any FFmpeg instances we have running.
       const ongoingSession = this.ongoingSessions.get(sessionId);
 
       if(ongoingSession) {
+
+        ongoingSession.outputWatchdog?.clear();
+
+        if(ongoingSession.fanoutKey) {
+
+          this.copyPathFanout.release(ongoingSession.fanoutKey);
+        }
 
         for(const ffmpegProcess of ongoingSession.ffmpeg) {
 
@@ -1086,9 +1246,6 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
 
         // Turn off the flashlight on package cameras, if enabled. We explicitly want to call the set handler for the flashlight.
         ongoingSession.toggleLight?.setCharacteristic(this.hap.Characteristic.On, false);
-
-        // Inform the user.
-        this.log.info("Stopped video streaming session.");
 
         // Release our port reservations.
         for(const reservation of ongoingSession.rtpPortReservations) {
@@ -1116,6 +1273,35 @@ export class ProtectStreamingDelegate implements HomebridgeStreamingDelegate {
 
       this.log.error("Error occurred while ending the FFmpeg video processes: %s.", error);
     }
+  }
+
+  private logStreamSessionStop(sessionId: string, reason: StreamStopReason, ffmpegExitCode?: number | null): void {
+
+    const session = this.ongoingSessions.get(sessionId);
+
+    if(!session || session.stopLogged) {
+
+      return;
+    }
+
+    session.stopLogged = true;
+
+    this.log.info(formatStreamSessionStop({
+
+      camera: this.protectCamera.accessoryName,
+      clientAddress: undefined,
+      durationMs: Date.now() - session.sessionStartedAt,
+      ffmpegExitCode: ffmpegExitCode,
+      firstFrameMs: session.firstFrameMs ?? null,
+      hardwareTranscode: this.protectCamera.hints.hardwareTranscoding,
+      path: session.path ?? "RTSP",
+      profile: session.profile ?? "",
+      reason: reason,
+      segmentsFed: session.segmentsFed,
+      sessionId: sessionId,
+      transcode: session.transcode ?? false,
+      verboseTelemetry: this.protectCamera.hasFeature("Debug.Video.HKSV.Telemetry")
+    }));
   }
 
   // Shutdown all our video streams.

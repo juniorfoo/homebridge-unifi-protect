@@ -4,6 +4,7 @@
  */
 import type { FfmpegLivestreamProcess, HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import { PROTECT_LIVESTREAM_API_IDR_INTERVAL, PROTECT_SEGMENT_RESOLUTION } from "./settings.js";
+import { TimeshiftConcatCache, computeTimeshiftSliceStart } from "./timeshift-cache.js";
 import { isKeyframe, runWithTimeout } from "homebridge-plugin-utils";
 import { EventEmitter } from "node:events";
 import type { ProtectCamera } from "./devices/index.js";
@@ -14,6 +15,8 @@ import type { RtspEntry } from "./devices/protect-camera.js";
 export class ProtectTimeshiftBuffer extends EventEmitter {
 
   private _buffer: Buffer[];
+  private bufferGeneration: number;
+  private concatCache: TimeshiftConcatCache;
   private _isStarted: boolean;
   private _isTransmitting: boolean;
   private _keyframes: boolean[];
@@ -33,6 +36,8 @@ export class ProtectTimeshiftBuffer extends EventEmitter {
     super();
 
     this._buffer = [];
+    this.bufferGeneration = 0;
+    this.concatCache = new TimeshiftConcatCache();
     this._isStarted = false;
     this._isTransmitting = false;
     this._keyframes = [];
@@ -214,6 +219,8 @@ export class ProtectTimeshiftBuffer extends EventEmitter {
     this._buffer = [];
     this._keyframes = [];
     this._lastKeyframeTime = 0;
+    this.bufferGeneration++;
+    this.concatCache.invalidate();
   }
 
   // Start transmitting our timeshift buffer. When startIndex is provided, we emit only the buffer slice from that index forward rather than the entire buffer. This
@@ -283,7 +290,7 @@ export class ProtectTimeshiftBuffer extends EventEmitter {
     }
 
     // Figure out where in the timeshift buffer we want to slice.
-    const start = (duration / this._segmentLength);
+    const start = computeTimeshiftSliceStart(duration, this._segmentLength, this._buffer.length);
 
     // We're really trying to get the whole buffer, so let's do that.
     if(start >= this._buffer.length) {
@@ -292,7 +299,13 @@ export class ProtectTimeshiftBuffer extends EventEmitter {
     }
 
     // If we don't have our fMP4 initialization segment, we're done. Otherwise, return the duration requested, starting from the end.
-    return (this.livestream?.initSegment && this._buffer.length) ? Buffer.concat([ this.livestream.initSegment, ...this._buffer.slice(start * -1) ]) : null;
+    return this.concatCache.get({
+
+      buffer: this._buffer,
+      generation: this.bufferGeneration,
+      initSegment: this.livestream?.initSegment ?? undefined,
+      sliceStart: start
+    });
   }
 
   // Return the most recent keyframe segment with its initialization segment, for efficient snapshot extraction. This produces a minimal buffer (init segment + one

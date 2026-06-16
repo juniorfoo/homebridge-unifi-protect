@@ -3,6 +3,8 @@
  * protect-livestream.ts: Protect livestream API manager.
  */
 import { FfmpegLivestreamProcess, sleep } from "homebridge-plugin-utils";
+import { LIVESTREAM_SELF_HEALING_RESTART_THRESHOLD, type LivestreamRestartEvent, countRecentRestarts, shouldAutoPreferRtspLiveView,
+  shouldSkipSelfHealingCameraReboot } from "./livestream-stress.js";
 import { PROTECT_SEGMENT_RESOLUTION } from "./settings.js";
 import type { ProtectCamera } from "./devices/index.js";
 import type { ProtectLivestream } from "unifi-protect";
@@ -21,6 +23,7 @@ export class LivestreamManager {
   private livestreams: Record<string, FfmpegLivestreamProcess | ProtectLivestream>;
   private protectCamera: ProtectCamera;
   private restartCount: Record<string, number>;
+  public restartEvents: LivestreamRestartEvent[];
   private restartDelay: Record<string, number>;
   private restarting: Record<string, boolean>;
   private segmentLengths: Record<string, number>;
@@ -38,6 +41,7 @@ export class LivestreamManager {
     this.livestreams = {};
     this.protectCamera = protectCamera;
     this.restartCount = {};
+    this.restartEvents = [];
     this.restartDelay = {};
     this.restarting = {};
     this.segmentLengths = {};
@@ -142,9 +146,26 @@ export class LivestreamManager {
       return;
     }
 
+    if(!isExternal) {
+
+      this.restartEvents.push({ timestamp: Date.now() });
+
+      if(shouldAutoPreferRtspLiveView(countRecentRestarts(this.restartEvents, Date.now()))) {
+
+        this.protectCamera.activatePreferRtspLiveView();
+      }
+    }
+
     // Self-healing: if we've had too many consecutive restarts from stalls, reboot the camera. We don't count external restarts here because those are downstream
     // failures, not camera problems.
-    if(!isExternal && this.protectCamera.hasFeature("Device.SelfHealing") && (++this.restartCount[index] > 10)) {
+    if(!isExternal && this.protectCamera.hasFeature("Device.SelfHealing") &&
+      !shouldSkipSelfHealingCameraReboot({
+
+
+        hostProfile: this.protectCamera.hostProfile,
+        recentRestartCount: countRecentRestarts(this.restartEvents, Date.now()),
+        selfHealingEnabled: true
+      }) && (++this.restartCount[index] > LIVESTREAM_SELF_HEALING_RESTART_THRESHOLD)) {
 
       this.restartCount[index] = 0;
       this.protectCamera.log.warn("Restarting the camera to reset its connection to the livestream API.");

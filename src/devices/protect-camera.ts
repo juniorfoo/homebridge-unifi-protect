@@ -5,6 +5,10 @@
 import type { CharacteristicValue, PlatformAccessory, Resolution, Service } from "homebridge";
 import type { DeepPartial, ProtectCameraChannelConfig, ProtectCameraConfig, ProtectEventAdd, ProtectEventPacket } from "unifi-protect";
 import { type Nullable, toStartCase } from "homebridge-plugin-utils";
+import { detectHostProfile, formatHostProfileLog, resolveHksvRecordingDefault } from "../host-profile.js";
+// eslint-disable-next-line sort-imports -- host-profile and livestream-stress are paired fork helpers
+import { LIVESTREAM_PREFER_RTSP_DURATION_MS, formatLivestreamStressAdvisory } from "../livestream-stress.js";
+import type { HostProfile } from "../host-profile.js";
 import { LivestreamManager } from "../protect-livestream.js";
 import type { MessageSwitchInterface } from "./protect-doorbell.js";
 import { PROTECT_FFMPEG_AUDIO_FILTER_FFTNR } from "../settings.js";
@@ -46,6 +50,8 @@ export class ProtectCamera extends ProtectDevice {
   public readonly livestream: LivestreamManager;
   public messageSwitches: Map<string, MessageSwitchInterface>;
   public packageCamera?: Nullable<ProtectCameraPackage>;
+  public hostProfile: HostProfile = "default";
+  public preferRtspLiveViewUntil = 0;
   private rtspEntries: RtspEntry[];
   public stream?: ProtectStreamingDelegate;
   public ufp: ProtectCameraConfig;
@@ -107,6 +113,17 @@ export class ProtectCamera extends ProtectDevice {
     }
 
     return true;
+  }
+
+  public get preferRtspLiveView(): boolean {
+
+    return Date.now() < this.preferRtspLiveViewUntil;
+  }
+
+  public activatePreferRtspLiveView(): void {
+
+    this.preferRtspLiveViewUntil = Date.now() + LIVESTREAM_PREFER_RTSP_DURATION_MS;
+    this.log.warn(formatLivestreamStressAdvisory(this.accessoryName));
   }
 
   // Configure a camera accessory for HomeKit.
@@ -1097,30 +1114,40 @@ export class ProtectCamera extends ProtectDevice {
     // Configure the video stream with our resolutions.
     this.stream = new ProtectStreamingDelegate(this, this.rtspEntries.map(x => x.resolution));
 
+    this.hostProfile = detectHostProfile({
+
+      cpuCores: undefined,
+      hardwareTranscoding: this.hints.hardwareTranscoding,
+      hasQsv: this.platform.codecSupport.hasEncoder("h264", "h264_qsv"),
+      hostSystem: this.platform.codecSupport.hostSystem
+    });
+
+    this.log.info(formatHostProfileLog(this.hostProfile, this.hints.hardwareTranscoding,
+      this.platform.codecSupport.hasEncoder("h264", "h264_qsv")));
+
     // If the user hasn't overriden our defaults, make sure we account for constrained hardware environments.
     if(!this.hints.recordingDefault) {
 
-      switch(this.platform.codecSupport.hostSystem) {
+      const max1080Profile = this.findRtsp(1920, 1080, { maxPixels: this.stream.ffmpegOptions.hostSystemMaxPixels })?.channel.name ?? "";
 
-        case "raspbian":
+      this.hints.recordingDefault = resolveHksvRecordingDefault(this.hostProfile, this.hints.hardwareTranscoding, max1080Profile);
 
-          // For constrained CPU environments like Raspberry Pi, we default to recording from the highest quality channel we can, that's at or below 1080p. That provides
-          // a reasonable default, while still allowing users who really want to, to be able to specify something else.
-          this.hints.recordingDefault = this.findRtsp(1920, 1080, { maxPixels: this.stream.ffmpegOptions.hostSystemMaxPixels })?.channel.name ?? "";
+      if(this.hostProfile === "pi") {
 
-          break;
-
-        default:
-
-          // We default to no preference for the default Protect camera channel.
-          this.hints.recordingDefault = this.hints.hardwareTranscoding ? "High" : "";
-
-          break;
+        // Preserve legacy Pi behavior when findRtsp returns a specific ≤1080p channel name.
+        this.hints.recordingDefault = max1080Profile || this.hints.recordingDefault;
       }
     } else {
 
       // Inform the user if we've set a recording default.
       this.log.info("HomeKit Secure Video event recording configured to use only: %s.", toStartCase(this.hints.recordingDefault.toLowerCase()));
+    }
+
+    if(this.hints.recordingDefault && !this.hasFeature("Video.HKSV.Record.Only.High") &&
+      !this.hasFeature("Video.HKSV.Record.Only.Medium") && !this.hasFeature("Video.HKSV.Record.Only.Low")) {
+
+      this.log.info("HomeKit Secure Video event recording configured to use only: %s.",
+        toStartCase(this.hints.recordingDefault.toLowerCase()));
     }
 
     // Fire up the controller and inform HomeKit about it.

@@ -10,6 +10,7 @@ import { PROTECT_MQTT_TOPIC } from "./settings.js";
 import { ProtectNvr } from "./protect-nvr.js";
 import ffmpegPath from "ffmpeg-for-homebridge";
 import util from "node:util";
+import { validateVideoProcessorPath } from "./video-processor.js";
 
 export class ProtectPlatform implements DynamicPlatformPlugin {
 
@@ -43,6 +44,22 @@ export class ProtectPlatform implements DynamicPlatformPlugin {
       verboseFfmpeg: config?.verboseFfmpeg === true,
       videoProcessor: (config?.videoProcessor as string | undefined) ?? ffmpegPath ?? "ffmpeg"
     };
+
+    const videoProcessorValidation = validateVideoProcessorPath(this.config.videoProcessor, {
+
+      bundledFfmpegPath: ffmpegPath ?? undefined
+    });
+
+    this.config.videoProcessor = videoProcessorValidation.resolvedPath;
+
+    if(!videoProcessorValidation.valid) {
+
+      this.log.error(videoProcessorValidation.error ??
+        "Configured FFmpeg path failed validation. Falling back to the resolved path: " + videoProcessorValidation.resolvedPath);
+    } else {
+
+      this.log.info("Using FFmpeg at: %s", videoProcessorValidation.resolvedPath);
+    }
 
     // We need a UniFi Protect controller configured to do anything.
     if(!this.config.controllers.length) {
