@@ -1,0 +1,506 @@
+/* Copyright(C) 2019-2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
+ * security-system.ts: Security system accessory for UniFi Protect.
+ */
+import { acquireService, composeSignals, validService } from "homebridge-plugin-utils";
+import type { CharacteristicValue } from "homebridge";
+import type { ProtectAccessory } from "../types.ts";
+import { ProtectBase } from "../devices/device-base.ts";
+import type { ProtectNvr } from "../nvr/nvr.ts";
+import { ProtectReservedNames } from "../types.ts";
+
+export class ProtectSecuritySystem extends ProtectBase {
+
+  public accessory: ProtectAccessory;
+  // The per-owner abort controller. Aborting it (on accessory removal) unwinds this owner's MQTT registrations without waiting for the plugin to shut down.
+  private readonly controller: AbortController;
+  private isAlarmTriggered: boolean;
+  // The composed owner-lifetime signal that scopes this owner's MQTT registrations: aborts when EITHER this owner's controller is aborted OR the NVR's terminal
+  // shutdown signal fires.
+  private readonly signal: AbortSignal;
+
+  // Create an instance.
+  constructor(nvr: ProtectNvr, accessory: ProtectAccessory) {
+
+    super(nvr);
+
+    // Build the owner-lifetime signal BEFORE configureDevice runs, so the MQTT subscriptions it registers thread the composed signal rather than the base controller
+    // signal.
+    this.accessory = accessory;
+    this.controller = new AbortController();
+    this.isAlarmTriggered = false;
+    this.signal = composeSignals(this.controller.signal, nvr.signal);
+
+    this.configureDevice();
+  }
+
+  // The owner-lifetime signal scoping this owner's MQTT registrations. The security system is the one controller-scoped owner whose lifetime is shorter than the
+  // controller connection: its accessory comes and goes with the Protect-* liveviews, so its registrations must unwind with the accessory, not with the plugin. This
+  // overrides the base seam, which returns the controller-lifetime nvr.signal that the teardown-less controller-scoped owners ride.
+  protected override get observeSignal(): AbortSignal {
+
+    return this.signal;
+  }
+
+  // Release this owner's MQTT registrations when its accessory is removed. Deleting the last Protect-* liveview removes the security accessory, and this abort unwinds
+  // exactly this owner's securitysystem get/set handlers so they no longer command the cameras. A later re-add builds a fresh instance whose constructor subscribes anew.
+  public cleanup(): void {
+
+    this.controller.abort();
+  }
+
+  // Configure a security system accessory for HomeKit.
+  private configureDevice(): boolean {
+
+    let securityState: CharacteristicValue = this.hap.Characteristic.SecuritySystemCurrentState.STAY_ARM;
+
+    // Save the security system state before we wipe out the context.
+    if(this.accessory.context.securityState !== undefined) {
+
+      securityState = this.accessory.context.securityState;
+    }
+
+    // Clean out the context object in case it's been polluted somehow.
+    this.accessory.context = {};
+    this.accessory.context.nvr = this.nvr.ufp.mac;
+    this.accessory.context.securityState = securityState;
+
+    this.configureInfo();
+
+    this.configureMqtt();
+
+    this.configureSecuritySystem();
+
+    this.configureSecurityAlarm();
+
+    return true;
+  }
+
+  // Configure the security system device information for HomeKit.
+  private configureInfo(): boolean {
+
+    // Update the manufacturer information for this security system.
+    this.accessory.getService(this.hap.Service.AccessoryInformation)?.updateCharacteristic(this.hap.Characteristic.Manufacturer, "github.com/hjdhjd");
+
+    // Update the model information for this security system.
+    this.accessory.getService(this.hap.Service.AccessoryInformation)?.updateCharacteristic(this.hap.Characteristic.Model, "UniFi Protect Liveview Security System");
+
+    // Update the serial number for this security system - we base this off of the NVR.
+    this.accessory.getService(this.hap.Service.AccessoryInformation)?.updateCharacteristic(this.hap.Characteristic.SerialNumber, this.nvr.ufp.mac + ".Security");
+
+    // Update the hardware revision for this security system - we base this off of the NVR.
+    this.accessory.getService(this.hap.Service.AccessoryInformation)?.updateCharacteristic(this.hap.Characteristic.HardwareRevision, this.nvr.ufp.hardwareRevision);
+
+    return true;
+  }
+
+  // Configure MQTT capabilities for the security system.
+  private configureMqtt(): boolean {
+
+    // Get the current status of the security system.
+    this.subscribeGet("securitysystem", "security system state", () => {
+
+      return this.currentSecuritySystemState;
+    });
+
+    // Set the security system state.
+    this.subscribeSet("securitysystem", "security system state", (value: string) => {
+
+      const SecuritySystemCurrentState = this.hap.Characteristic.SecuritySystemCurrentState;
+      const SecuritySystemTargetState = this.hap.Characteristic.SecuritySystemTargetState;
+
+      // The definite-assignment assertion is safe because alarmState is read only in the ALARM_TRIGGERED branch below, which is reachable only from the "alarmon" and
+      // "alarmoff" cases, and both of those cases assign alarmState before the switch falls through to that branch.
+      let alarmState!: boolean;
+      let targetState: CharacteristicValue;
+
+      // Map the request to our security states.
+      switch(value) {
+
+        case "home":
+
+          targetState = SecuritySystemTargetState.STAY_ARM;
+
+          break;
+
+        case "away":
+
+          targetState = SecuritySystemTargetState.AWAY_ARM;
+
+          break;
+
+        case "night":
+
+          targetState = SecuritySystemTargetState.NIGHT_ARM;
+
+          break;
+
+        case "alarmoff":
+
+          targetState = SecuritySystemCurrentState.ALARM_TRIGGERED;
+          alarmState = false;
+
+          break;
+
+        case "alarmon":
+
+          targetState = SecuritySystemCurrentState.ALARM_TRIGGERED;
+          alarmState = true;
+
+          break;
+
+        case "off":
+
+          targetState = SecuritySystemTargetState.DISARM;
+
+          break;
+
+        default:
+
+          // The user sent a bad value. Ignore it and we're done.
+          this.log.error("Unable to process MQTT security system setting: %s.", value);
+
+          return;
+      }
+
+      // The security alarm gets handled differently than the other state settings.
+      if(targetState === SecuritySystemCurrentState.ALARM_TRIGGERED) {
+
+        this.setSecurityAlarm(alarmState);
+
+        return;
+      }
+
+      // Set the security state, and we're done.
+      this.accessory.getService(this.hap.Service.SecuritySystem)?.updateCharacteristic(SecuritySystemTargetState, targetState);
+      this.setSecurityState(targetState);
+    });
+
+    return true;
+  }
+
+  // Configure the security system for HomeKit.
+  private configureSecuritySystem(): boolean {
+
+    // Acquire (find or create) the security system service.
+    const service = acquireService(this.accessory, this.hap.Service.SecuritySystem, this.accessory.displayName);
+
+    if(!service) {
+
+      this.log.error("Unable to add security system.");
+
+      return false;
+    }
+
+    const SecuritySystemCurrentState = this.hap.Characteristic.SecuritySystemCurrentState;
+    const SecuritySystemTargetState = this.hap.Characteristic.SecuritySystemTargetState;
+
+    let targetSecurityState: CharacteristicValue;
+
+    switch(this.accessory.context.securityState) {
+
+      case SecuritySystemCurrentState.STAY_ARM:
+
+        targetSecurityState = SecuritySystemTargetState.STAY_ARM;
+
+        break;
+
+      case SecuritySystemCurrentState.AWAY_ARM:
+
+        targetSecurityState = SecuritySystemTargetState.AWAY_ARM;
+
+        break;
+
+      case SecuritySystemCurrentState.NIGHT_ARM:
+
+        targetSecurityState = SecuritySystemTargetState.NIGHT_ARM;
+
+        break;
+
+      case SecuritySystemCurrentState.DISARMED:
+      default:
+
+        targetSecurityState = SecuritySystemTargetState.DISARM;
+
+        break;
+    }
+
+    // Handlers to get our current state, and initialize on startup.
+    service.updateCharacteristic(SecuritySystemCurrentState, this.accessory.context.securityState ?? SecuritySystemCurrentState.DISARMED)
+      .getCharacteristic(SecuritySystemCurrentState).onGet(() => {
+
+        return this.isAlarmTriggered ? this.hap.Characteristic.SecuritySystemCurrentState.ALARM_TRIGGERED :
+          (this.accessory.context.securityState ?? SecuritySystemCurrentState.DISARMED);
+      });
+
+    // Handlers for triggering a change in the security system state.
+    this.accessory.getService(this.hap.Service.SecuritySystem)?.getCharacteristic(SecuritySystemTargetState).onSet(this.setSecurityState.bind(this));
+
+    // Set the initial state after we have setup our handlers above. This way, when we startup, we
+    // automatically restore the scene we've been set to, if any.
+    this.accessory.getService(this.hap.Service.SecuritySystem)?.updateCharacteristic(SecuritySystemTargetState, targetSecurityState);
+
+    return true;
+  }
+
+  // Configure the security alarm for HomeKit.
+  private configureSecurityAlarm(): boolean {
+
+    this.isAlarmTriggered = false;
+
+    // Have we enabled the security system alarm?
+    if(!validService(this.accessory, this.hap.Service.Switch, this.nvr.hasFeature("SecuritySystem.Alarm"))) {
+
+      return false;
+    }
+
+    // Acquire the service.
+    const service = acquireService(this.accessory, this.hap.Service.Switch, this.accessory.displayName + " Security Alarm");
+
+    if(!service) {
+
+      this.log.error("Unable to add security system alarm.");
+
+      return false;
+    }
+
+    // Notify the user that we're enabled.
+    this.log.info("Enabling the security alarm switch on the security system accessory.");
+
+    // Activate or deactivate the security alarm.
+    service.getCharacteristic(this.hap.Characteristic.On).onGet(() => this.isAlarmTriggered);
+    service.getCharacteristic(this.hap.Characteristic.On).onSet((value: CharacteristicValue) => {
+
+      this.setSecurityAlarm(!!value);
+      this.log.info("Security system alarm %s.", value ? "triggered" : "reset");
+    });
+
+    // Initialize the value.
+    service.updateCharacteristic(this.hap.Characteristic.On, this.isAlarmTriggered);
+
+    return true;
+  }
+
+  // Update security system accessory settings.
+  public updateDevice(): boolean {
+
+    // We always have a disarmed state available to us.
+    const availableSecurityStates = [this.hap.Characteristic.SecuritySystemTargetState.DISARM];
+    const liveviews = this.nvr.client.liveviews;
+
+    // No liveviews configured - we're done.
+    if(!liveviews.length) {
+
+      return false;
+    }
+
+    for(const securityState of [
+      [ "Protect-Away".toLowerCase(), this.hap.Characteristic.SecuritySystemTargetState.AWAY_ARM ],
+      [ "Protect-Home".toLowerCase(), this.hap.Characteristic.SecuritySystemTargetState.STAY_ARM ],
+      [ "Protect-Night".toLowerCase(), this.hap.Characteristic.SecuritySystemTargetState.NIGHT_ARM ]
+    ]) {
+
+      // If we don't have this liveview configured, don't add it to the property list for the security system accessory.
+      if(!liveviews.some(x => x.name.toLowerCase() === securityState[0])) {
+
+        continue;
+      }
+
+      // The array literal above mixes strings and numbers with no explicit tuple type, so it widens to an array of "string | number" pairs and this
+      // element infers as that union. The cast is safe because this index always holds the numeric HomeKit state constant, never the liveview name string.
+      availableSecurityStates.push(securityState[1] as number);
+    }
+
+    // Narrow the visible target states to those we can actually reach, always applying whatever we computed. Removing the last Protect-Away/Home/Night liveview
+    // re-narrows the Home app's menu to disarm-only rather than latching the previous shape, and adding one back re-widens it.
+    const securityService = this.accessory.getService(this.hap.Service.SecuritySystem);
+
+    securityService?.getCharacteristic(this.hap.Characteristic.SecuritySystemTargetState).setProps({ validValues: availableSecurityStates });
+
+    // If the currently selected target state is no longer one of the available values - its arm liveview was removed out from under it - snap the displayed selection to
+    // disarm so the Home app shows the truth. This is a display-only correction: updateCharacteristic pushes a status value and fires no onSet, so no scene sweep runs
+    // and the Protect controller state is left untouched.
+    const currentTarget = securityService?.getCharacteristic(this.hap.Characteristic.SecuritySystemTargetState).value;
+
+    if((typeof currentTarget === "number") && !availableSecurityStates.includes(currentTarget)) {
+
+      securityService?.updateCharacteristic(this.hap.Characteristic.SecuritySystemTargetState, this.hap.Characteristic.SecuritySystemTargetState.DISARM);
+    }
+
+    return true;
+  }
+
+  // Utility to translate security system states.
+  private get currentSecuritySystemState(): string {
+
+    const securitySystemCurrentState: Record<number, string> = {
+
+      [this.hap.Characteristic.SecuritySystemCurrentState.ALARM_TRIGGERED]: "Alarm",
+      [this.hap.Characteristic.SecuritySystemCurrentState.AWAY_ARM]: "Away",
+      [this.hap.Characteristic.SecuritySystemCurrentState.DISARMED]: "Off",
+      [this.hap.Characteristic.SecuritySystemCurrentState.NIGHT_ARM]: "Night",
+      [this.hap.Characteristic.SecuritySystemCurrentState.STAY_ARM]: "Home"
+    };
+
+    return this.isAlarmTriggered ? "Alarm" : securitySystemCurrentState[Number(this.accessory.context.securityState)] ?? "Off";
+  }
+
+  // Change the security system state, and enable or disable motion detection accordingly.
+  private setSecurityState(value: CharacteristicValue): void {
+
+    const liveviews = this.nvr.client.liveviews;
+    let newState: CharacteristicValue;
+    const SecuritySystemCurrentState = this.hap.Characteristic.SecuritySystemCurrentState;
+    const SecuritySystemTargetState = this.hap.Characteristic.SecuritySystemTargetState;
+    let viewScene = "";
+
+    // If we don't have any liveviews, there's nothing for us to do.
+    if(!liveviews.length) {
+
+      return;
+    }
+
+    // We have three different states which can be triggered (aside from disarming). Those states are home, away, and night. We use this as a convenient way to easily
+    // enable or disable motion detection on a Protect controller and effectively give us scene-type functionality in a nice way.
+    switch(value) {
+
+      case SecuritySystemTargetState.STAY_ARM:
+
+        newState = SecuritySystemCurrentState.STAY_ARM;
+        viewScene = "Protect-Home".toLowerCase();
+
+        break;
+
+      case SecuritySystemTargetState.AWAY_ARM:
+
+        newState = SecuritySystemCurrentState.AWAY_ARM;
+        viewScene = "Protect-Away".toLowerCase();
+
+        break;
+
+      case SecuritySystemTargetState.NIGHT_ARM:
+
+        newState = SecuritySystemCurrentState.NIGHT_ARM;
+        viewScene = "Protect-Night".toLowerCase();
+
+        break;
+
+      case SecuritySystemTargetState.DISARM:
+
+        newState = SecuritySystemCurrentState.DISARMED;
+        viewScene = "Protect-Off".toLowerCase();
+
+        break;
+
+      default:
+
+        newState = SecuritySystemCurrentState.DISARMED;
+
+        break;
+    }
+
+    // Get the complete list of cameras in the liveview we're interested in. This cryptic line grabs the list of liveviews that have the name we're interested in (turns
+    // out, you can define multiple liveviews in Protect with the same name...who knew!), and then create a single list containing all of the cameras found.
+    const targetCameraIds = liveviews.filter(view => view.name.toLowerCase() === viewScene).map(view => view.slots.map(slots => slots.cameras)).flat(2);
+
+    // We don't have a liveview for this state and we aren't disarming - update state for the user and we're done.
+    if((newState !== SecuritySystemCurrentState.DISARMED) && !targetCameraIds.length) {
+
+      this.log.info("No liveview configured for this security system state. Create a liveview named %s in the Protect webUI to use this feature.", viewScene);
+
+      this.accessory.context.securityState = newState;
+      this.accessory.getService(this.hap.Service.SecuritySystem)?.updateCharacteristic(SecuritySystemCurrentState, newState);
+
+      return;
+    }
+
+    this.log.info("Setting the liveview scene: %s.", viewScene);
+
+    // Iterate through the list of accessories and set the Protect scene.
+    for(const targetAccessory of this.platform.accessories) {
+
+      const targetDevice = this.nvr.configuredDevices.get(targetAccessory.UUID);
+
+      // We only want accessories associated with this Protect controller whose controller record is still present. A device lingering in the removal grace has a vanished
+      // record, so we gate on recordPresent and read its non-throwing protectId below rather than reading through the throwing projection.
+      if(!targetDevice || !targetDevice.recordPresent || (targetAccessory.context.nvr !== this.nvr.ufp.mac)) {
+
+        continue;
+      }
+
+      // Protect liveviews contain only cameras, so arm and disarm sweep motion detection across the camera family alone. A sensor or light can never be a liveview
+      // member, could never be re-enabled by any arm state, and its motion delivery must never be latched off by a scene change - so we skip it here. The modelKey
+      // accessor is non-throwing by design, safe to read after the recordPresent gate above.
+      if(targetDevice.modelKey !== "camera") {
+
+        continue;
+      }
+
+      let targetState = false;
+
+      // If we're disarming, then all Protect cameras will disable motion detection in HomeKit. Otherwise, check to see if this is one of the cameras we want to turn on
+      // motion detection for.
+      if(((newState !== SecuritySystemCurrentState.DISARMED) || targetCameraIds.length) &&
+        targetCameraIds.some(thisCameraId => thisCameraId === targetDevice.protectId)) {
+
+        targetState = true;
+      }
+
+      // Only take action to change motion detection state if needed.
+      if(targetAccessory.context.detectMotion !== targetState) {
+
+        targetAccessory.context.detectMotion = targetState;
+
+        // Update the switch service, if present.
+        const motionSwitch = targetAccessory.getServiceById(this.hap.Service.Switch, ProtectReservedNames.SWITCH_MOTION_SENSOR);
+
+        if(motionSwitch) {
+
+          motionSwitch.updateCharacteristic(this.hap.Characteristic.On, targetAccessory.context.detectMotion);
+        }
+
+        this.log.info("%s -> %s: Motion detection %s.", viewScene, targetAccessory.displayName,
+          targetAccessory.context.detectMotion ? "enabled" : "disabled");
+      }
+    }
+
+    // Inform the user of our new state.
+    this.accessory.context.securityState = newState;
+    this.accessory.getService(this.hap.Service.SecuritySystem)?.updateCharacteristic(SecuritySystemCurrentState, newState);
+
+    // Reset our alarm state and update our alarm switch.
+    this.isAlarmTriggered = false;
+
+    if(this.accessory.getService(this.hap.Service.Switch)?.getCharacteristic(this.hap.Characteristic.On).value !== this.isAlarmTriggered) {
+
+      this.accessory.getService(this.hap.Service.Switch)?.updateCharacteristic(this.hap.Characteristic.On, this.isAlarmTriggered);
+    }
+
+    // Publish to MQTT, if configured.
+    this.publish("securitysystem", this.currentSecuritySystemState);
+  }
+
+  // Set the security alarm.
+  private setSecurityAlarm(value: boolean): void {
+
+    // Nothing to do.
+    if(this.isAlarmTriggered === value) {
+
+      return;
+    }
+
+    // Update the alarm state.
+    this.isAlarmTriggered = value;
+
+    // Update the security system state.
+    this.accessory.getService(this.hap.Service.SecuritySystem)?.updateCharacteristic(this.hap.Characteristic.SecuritySystemCurrentState,
+      this.isAlarmTriggered ? this.hap.Characteristic.SecuritySystemCurrentState.ALARM_TRIGGERED :
+        (this.accessory.context.securityState ?? this.hap.Characteristic.SecuritySystemCurrentState.DISARMED));
+
+    // Update the security alarm state.
+    this.accessory.getService(this.hap.Service.Switch)?.updateCharacteristic(this.hap.Characteristic.On, this.isAlarmTriggered);
+
+    // Publish to MQTT, if configured.
+    this.publish("securitysystem", this.currentSecuritySystemState);
+  }
+}

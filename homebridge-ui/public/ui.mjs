@@ -4,113 +4,130 @@
  */
 "use strict";
 
-import { webUi } from "./lib/webUi.mjs";
+import { controllers, hasValidCredentials, primaryController, withPrimaryCredentials } from "./protect-config.mjs";
+import { webUi } from "homebridge-plugin-utils/webUi.mjs";
 
-// Execute our first run screen if we don't have valid Protect login credentials and a controller.
-const firstRunIsRequired = () => {
+// Execute our first run screen if we don't have valid Protect login credentials and a controller. The framework injects our primary platform-config entry, so this is
+// a pure predicate over the persisted config rather than a reach into the feature-options page's state.
+const firstRunIsRequired = ({ config }) => !hasValidCredentials(config);
 
-  if(ui.featureOptions.currentConfig.length && ui.featureOptions.currentConfig[0].controllers?.length &&
-    ui.featureOptions.currentConfig[0].controllers[0]?.address?.length && ui.featureOptions.currentConfig[0].controllers[0]?.username?.length &&
-    ui.featureOptions.currentConfig[0].controllers[0]?.password?.length) {
+// Initialize our first run screen with any information from our existing configuration. The injected config is the primary platform entry; we pre-populate the form
+// from its primary controller, if one is already configured.
+const firstRunOnStart = ({ config }) => {
 
-    return false;
-  }
+  const controller = primaryController(config);
+
+  document.getElementById("address").value = controller?.address ?? "";
+  document.getElementById("username").value = controller?.username ?? "";
+  document.getElementById("password").value = controller?.password ?? "";
 
   return true;
 };
 
-// Initialize our first run screen with any information from our existing configuration.
-const firstRunOnStart = () => {
+/* Render the plugin's first-run login error display. Guidance sentences render as text nodes separated by <br> elements, and the failure detail - when present -
+ * renders inside a <code class="text-danger"> via textContent, so a controller-reported string is shown as text rather than interpreted as markup. Assembling DOM
+ * nodes here (rather than an innerHTML string) keeps that trust boundary in one place, matching buildStatRow's discipline. An empty lines array renders no guidance,
+ * and an omitted or empty detail renders no code element.
+ */
+const renderLoginError = (lines, detail) => {
 
-  // Pre-populate with anything we might already have in our configuration.
-  document.getElementById("address").value = ui.featureOptions.currentConfig[0].controllers?.[0]?.address ?? "";
-  document.getElementById("username").value = ui.featureOptions.currentConfig[0].controllers?.[0]?.username ?? "";
-  document.getElementById("password").value = ui.featureOptions.currentConfig[0].controllers?.[0]?.password ?? "";
+  const nodes = [];
 
-  return true;
+  for(const line of lines) {
+
+    nodes.push(document.createTextNode(line), document.createElement("br"));
+  }
+
+  if(detail?.length) {
+
+    const errorCode = document.createElement("code");
+
+    errorCode.className = "text-danger";
+    errorCode.textContent = detail;
+    nodes.push(errorCode);
+  }
+
+  document.getElementById("loginError").replaceChildren(...nodes);
 };
 
 // Validate our Protect credentials.
-const firstRunOnSubmit = async () => {
+const firstRunOnSubmit = async ({ commit, config }) => {
 
   const address = document.getElementById("address").value;
   const username = document.getElementById("username").value;
   const password = document.getElementById("password").value;
-  const tdLoginError = document.getElementById("loginError");
 
-  tdLoginError.innerHTML = "&nbsp;";
+  document.getElementById("loginError").innerHTML = "&nbsp;";
 
   if(!address?.length || !username?.length || !password?.length) {
 
-    tdLoginError.innerHTML = "<code class=\"text-danger\">Please enter a valid UniFi Protect controller address, username and password.</code>";
+    renderLoginError([], "Please enter a valid UniFi Protect controller address, username and password.");
     homebridge.hideSpinner();
 
     return false;
   }
 
-  const ufpDevices = await homebridge.request("/getDevices", { address: address, password: password, username: username });
+  try {
 
-  // Couldn't connect to the Protect controller for some reason.
-  if(!ufpDevices?.length) {
+    const { devices, error } = await homebridge.request("/getDevices", { address: address, password: password, username: username });
 
-    tdLoginError.innerHTML = "Unable to login to the UniFi Protect controller.<br>Please check your controller address, username, and password.<br>" +
-      "<code class=\"text-danger\">" + (await homebridge.request("/getErrorMessage")) + "</code>";
+    // Couldn't connect to the Protect controller. The two guidance sentences frame the failure and the controller-sourced error detail arrives with the device-list
+    // response, rendered as text so it is never interpreted as markup.
+    if(!devices?.length) {
+
+      renderLoginError([ "Unable to login to the UniFi Protect controller.", "Please check your controller address, username, and password." ], error);
+      homebridge.hideSpinner();
+
+      return false;
+    }
+
+    // Persist the validated credentials through the framework's single write seam. We own the shape of the write - credentials live under the primary controller, which
+    // withPrimaryCredentials encodes while preserving any additional controllers - and the session owns persistence and the preservation of sibling platform entries.
+    await commit(withPrimaryCredentials(config, { address, password, username }));
+
+    return true;
+  } catch(err) {
+
+    // The fallible sequence above can throw when the UI server fails to start or respond, or when the config write rejects. Rendering into the login display keeps the
+    // user on the form with concrete guidance and the specific failure, while the framework's toast stays the generic net for consumers without their own handling -
+    // this catch resolves first, so that toast never fires for this plugin.
+    renderLoginError(["Unable to complete the plugin configuration."], (err instanceof Error) ? err.message : String(err));
     homebridge.hideSpinner();
 
     return false;
   }
-
-  // Save the login credentials to our configuration.
-  if(!ui.featureOptions.currentConfig[0].controllers?.length) {
-
-    ui.featureOptions.currentConfig[0].controllers = [{}];
-  }
-
-  ui.featureOptions.currentConfig[0].controllers[0].address = address;
-  ui.featureOptions.currentConfig[0].controllers[0].username = username;
-  ui.featureOptions.currentConfig[0].controllers[0].password = password;
-
-  await homebridge.updatePluginConfig(ui.featureOptions.currentConfig);
-
-  return true;
 };
 
-// Return whether a given device is a controller.
+// The Protect API represents the controller itself as a device whose model key is "nvr" - every other model key belongs to a device the controller manages.
 const isController = (device) => device.modelKey === "nvr";
 
-// Return the list of controllers from our plugin configuration.
-const getControllers = () => {
+// Return the list of controllers from our plugin configuration. The framework injects our primary platform-config entry; we map each configured controller to the
+// sidebar shape, deliberately carrying no credentials into the rendered list.
+const getControllers = ({ config }) => controllers(config).map((controller) => ({ name: controller.address, serialNumber: controller.address }));
 
-  const controllers = [];
+// Return the list of devices associated with a given Protect controller, paired with the connection outcome. The framework injects the live platform config alongside
+// the selected controller, so we can recover the selected controller's credentials (which the sidebar entries deliberately omit) without reaching for the config
+// ourselves. A connection failure travels back on the result rather than through a separate request.
+const getDevices = async (selectedController, { config }) => {
 
-  // Grab the controllers from our configuration.
-  for(const controller of ui.featureOptions.currentConfig[0].controllers ?? []) {
-
-    controllers.push({ name: controller.address, serialNumber: controller.address });
-  }
-
-  return controllers;
-};
-
-// Return the list of devices associated with a given Protect controller.
-const getDevices = async (selectedController) => {
-
-  // If we're in the global context, we have no devices.
+  // The global context legitimately has no devices and no failure.
   if(!selectedController) {
 
-    return [];
+    return { devices: [], error: "" };
   }
 
-  // Find the entry in our plugin configuration.
-  const controller = (ui.featureOptions.currentConfig[0].controllers ?? []).find(c => c.address === selectedController.serialNumber);
+  // Find the entry in our plugin configuration. A sidebar entry can outlive a Settings-tab edit that removed its controller, so a miss is a carried failure with an
+  // actionable message rather than a silent empty result that would render nothing the user can act on.
+  const controller = controllers(config).find((c) => c.address === selectedController.serialNumber);
 
   if(!controller) {
 
-    return [];
+    return { devices: [], error: "The selected controller is no longer in the plugin configuration." };
   }
 
-  // Retrieve the current list of devices from the Protect controller.
-  const devices = await homebridge.request("/getDevices", { address: controller.address, password: controller.password, username: controller.username });
+  // The browser cannot reach the Protect controller directly, so we bridge the request through the plugin's UI server, which holds the controller credentials. The
+  // server returns the device list and the connection error together.
+  const { devices, error } = await homebridge.request("/getDevices", { address: controller.address, password: controller.password, username: controller.username });
 
   // Add the fields that the webUI framework is looking for to render.
   for(const device of devices) {
@@ -119,7 +136,7 @@ const getDevices = async (selectedController) => {
     device.serialNumber = device.mac;
     device.sidebarGroup = device.modelKey + "s";
 
-    // We update the name of the controller that we show users once we've connected with the controller and have it's name.
+    // We update the name of the controller that we show users once we've connected with the controller and have its name.
     if(isController(device)) {
 
       const activeController = [...document.querySelectorAll("[data-navigation='controller']")].find(c => c.getAttribute("data-device-serial") === controller.address);
@@ -131,24 +148,30 @@ const getDevices = async (selectedController) => {
     }
   }
 
-  return devices;
+  return { devices, error };
 };
 
 // Only show feature options that are valid for the capabilities of this device.
 const validOption = (device, option) => {
 
+  // Each device's capability metadata takes a different shape, so five independent meta-gates test for exclusion below, and any one hiding the option is
+  // enough: hasAccessFeature reads the Access device's feature flags, hasFeature reads the Protect device's feature flags, hasProperty checks whether the
+  // named property is merely present on the device, modelKey compares the device's own model against the option's supported models, and hasSmartObjectType
+  // compares the device's smart-detection capabilities against the option's supported smart-object types.
   if(device && (device.modelKey !== "nvr") && (
-    (option.hasAccessFeature && (!device.accessDeviceMetadata?.featureFlags || !option.hasAccessFeature.some(x => device.accessDeviceMetadata.featureFlags[x]))) ||
-    (option.hasFeature && (!device.featureFlags || !option.hasFeature.some(x => device.featureFlags[x]))) ||
-    (option.hasProperty && !option.hasProperty.some(x => x in device)) ||
-    (option.modelKey && (option.modelKey !== "all") && !option.modelKey.includes(device.modelKey)) ||
-    (option.hasSmartObjectType && device.featureFlags?.smartDetectTypes && !option.hasSmartObjectType.some(x => device.featureFlags.smartDetectTypes.includes(x))))) {
+    (option.meta?.hasAccessFeature && (!device.accessDeviceMetadata?.featureFlags ||
+      !option.meta?.hasAccessFeature.some(x => device.accessDeviceMetadata.featureFlags[x]))) ||
+    (option.meta?.hasFeature && (!device.featureFlags || !option.meta?.hasFeature.some(x => device.featureFlags[x]))) ||
+    (option.meta?.hasProperty && !option.meta?.hasProperty.some(x => x in device)) ||
+    (option.meta?.modelKey && (option.meta?.modelKey !== "all") && !option.meta?.modelKey.includes(device.modelKey)) ||
+    (option.meta?.hasSmartObjectType && device.featureFlags?.smartDetectTypes &&
+      !option.meta?.hasSmartObjectType.some(x => device.featureFlags.smartDetectTypes.includes(x))))) {
 
     return false;
   }
 
   // Test for the explicit exclusion of a property if it's true.
-  if(device && option.isNotProperty?.some(x => device[x] === true)) {
+  if(device && option.meta?.isNotProperty?.some(x => device[x] === true)) {
 
     return false;
   }
@@ -158,7 +181,7 @@ const validOption = (device, option) => {
 
     case "camera":
 
-      if(option.hasCameraFeature && !option.hasCameraFeature.some(x => device.featureFlags[x])) {
+      if(option.meta?.hasCameraFeature && !option.meta?.hasCameraFeature.some(x => device.featureFlags[x])) {
 
         return false;
       }
@@ -167,7 +190,7 @@ const validOption = (device, option) => {
 
     case "light":
 
-      if(option.hasLightProperty && !option.hasLightProperty.some(x => x in device)) {
+      if(option.meta?.hasLightProperty && !option.meta?.hasLightProperty.some(x => x in device)) {
 
         return false;
       }
@@ -176,7 +199,7 @@ const validOption = (device, option) => {
 
     case "sensor":
 
-      if(option.hasSensorProperty && !option.hasSensorProperty.some(x => x in device)) {
+      if(option.meta?.hasSensorProperty && !option.meta?.hasSensorProperty.some(x => x in device)) {
 
         return false;
       }
@@ -201,24 +224,49 @@ const validOptionCategory = (device, category) => {
   }
 
   // Only show device categories we're explicitly interested in.
-  if(!category.modelKey?.some(model => [ "all", device.modelKey ].includes(model))) {
+  if(!category.meta?.modelKey?.some(model => [ "all", device.modelKey ].includes(model))) {
 
     return false;
   }
 
   // Test for the explicit exclusion of a property if it's true.
-  if(category.isNotProperty?.some(x => device[x] === true)) {
+  if(category.meta?.isNotProperty?.some(x => device[x] === true)) {
 
     return false;
   }
 
   // Test for the feature availability on a specific device type.
-  if(category["has" + device.modelKey.charAt(0).toUpperCase() + device.modelKey.slice(1) + "Feature"]?.some(x => !device.featureFlags?.[x])) {
+  if(category.meta?.featureByModel?.[device.modelKey]?.some(x => !device.featureFlags?.[x])) {
 
     return false;
   }
 
   return true;
+};
+
+/* Build one row of the device-stats grid. We construct DOM nodes directly via createElement / textContent rather than concatenating into innerHTML so any HTML
+ * metacharacter in a device field (model, MAC address, IP address) renders as text instead of being interpreted as markup. The discovery boundary is the trust line,
+ * and treating controller-reported strings as data rather than HTML is the cleanest place to enforce it.
+ */
+const buildStatRow = (label, value, valueClassName) => {
+
+  const item = document.createElement("div");
+
+  item.className = "stat-item";
+
+  const labelSpan = document.createElement("span");
+
+  labelSpan.className = "stat-label";
+  labelSpan.textContent = label;
+
+  const valueSpan = document.createElement("span");
+
+  valueSpan.className = valueClassName;
+  valueSpan.textContent = value ?? "";
+
+  item.append(labelSpan, valueSpan);
+
+  return item;
 };
 
 // Show the details for this device.
@@ -229,32 +277,33 @@ const showProtectDetails = (device) => {
   // No device specified, we must be in a global context.
   if(!device) {
 
-    deviceStatsContainer.innerHTML = "";
+    deviceStatsContainer.textContent = "";
 
     return;
   }
 
-  // Populate the infopanel.
-  deviceStatsContainer.innerHTML =
-    "<div class=\"device-stats-grid\">" +
-      "<div class=\"stat-item\">" +
-        "<span class=\"stat-label\">Model</span>" +
-        "<span class=\"stat-value\">" + (device.marketName ?? device.type) + "</span>" +
-      "</div>" +
-      "<div class=\"stat-item\">" +
-        "<span class=\"stat-label\">MAC Address</span>" +
-        "<span class=\"stat-value font-monospace\">" + device.mac + "</span>" +
-      "</div>" +
-      "<div class=\"stat-item\">" +
-        "<span class=\"stat-label\">IP Address</span>" +
-        "<span class=\"stat-value font-monospace\">" +
-          (device.host ?? (device.modelKey === "sensor" ? (device.connectionType === "lora" ? "SuperLink" : "Bluetooth") + " Device" : "None")) + "</span>" +
-      "</div>" +
-      "<div class=\"stat-item\">" +
-        "<span class=\"stat-label\">Status</span>" +
-        "<span class=\"stat-value\">" + (("state" in device) ? (device.state.charAt(0).toUpperCase() + device.state.slice(1).toLowerCase()) : "Connected") + "</span>" +
-      "</div>" +
-    "</div>";
+  // Compute the IP-address value: cameras and most devices report a host. A device without one is reached over LoRa (SuperLink) or, for a sensor specifically, over
+  // Bluetooth. The relay is a LoRa device but reports a null connectionType on the wire, so we key it by model instead; everything else reports none.
+  const isSuperLink = (device.connectionType === "lora") || (device.modelKey === "relay");
+
+  const ipValue = device.host ?? (isSuperLink ? "SuperLink Device" : ((device.modelKey === "sensor") ? "Bluetooth Device" : "None"));
+
+  // Compute the status value: title-case the device state when present, otherwise report a connected controller.
+  const statusValue = ("state" in device) ? (device.state.charAt(0).toUpperCase() + device.state.slice(1).toLowerCase()) : "Connected";
+
+  // Build the device-details grid fresh so successive selections do not stack stale rows.
+  const grid = document.createElement("div");
+
+  grid.className = "device-stats-grid";
+  grid.append(
+
+    buildStatRow("Model", device.marketName ?? device.type, "stat-value"),
+    buildStatRow("MAC Address", device.mac, "stat-value font-monospace"),
+    buildStatRow("IP Address", ipValue, "stat-value font-monospace"),
+    buildStatRow("Status", statusValue, "stat-value")
+  );
+
+  deviceStatsContainer.replaceChildren(grid);
 };
 
 // Parameters for our feature options webUI.
@@ -269,6 +318,9 @@ const featureOptionsParams = {
   },
   ui: {
 
+    // The delay before the connection-error view re-enables its retry button, overriding the library's five-second default. A UniFi Protect controller can take well
+    // over five seconds to authenticate and return its bootstrap, so twenty seconds keeps an impatient user from hammering retry while the first connection attempt is
+    // still in flight.
     controllerRetryEnableDelayMs: 20000,
     isController: isController,
     validOption: validOption,

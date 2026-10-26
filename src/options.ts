@@ -1,0 +1,350 @@
+/* Copyright(C) 2020-2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
+ * options.ts: Feature option and type definitions for UniFi Protect.
+ */
+import type { FeatureCategoryEntry, FeatureOptionEntry } from "homebridge-plugin-utils";
+import { PROTECT_DEVICE_REMOVAL_DELAY_INTERVAL, PROTECT_DOORBELL_CHIME_DURATION_DIGITAL, PROTECT_FFMPEG_AUDIO_FILTER_FFTNR, PROTECT_FFMPEG_AUDIO_FILTER_HIGHPASS,
+  PROTECT_FFMPEG_AUDIO_FILTER_LOWPASS, PROTECT_M3U_PLAYLIST_PORT, PROTECT_MOTION_DURATION, PROTECT_NVR_REBOOT_INTERVAL, PROTECT_OCCUPANCY_DURATION,
+  PROTECT_TRANSCODE_BITRATE, PROTECT_TRANSCODE_HIGH_LATENCY_BITRATE } from "./settings.ts";
+
+// Plugin configuration options.
+export interface ProtectOptions {
+
+  controllers: ProtectNvrOptions[];
+  debugAll: boolean;
+  options: string[];
+  ringDelay: number;
+  verboseFfmpeg: boolean;
+  videoProcessor: string;
+}
+
+// NVR configuration options.
+export interface ProtectNvrOptions {
+
+  address: string;
+  doorbellMessages?: {
+
+    duration: number;
+    message: string;
+  }[];
+  mqttTopic: string;
+  mqttUrl?: string;
+  name?: string;
+  overrideAddress?: string;
+  password: string;
+  username: string;
+}
+
+// The plugin's webUI and documentation renderer make use of additional metadata to only surface the feature options relevant for a particular device. These properties
+// ride in the opaque `meta` channel that homebridge-plugin-utils forwards back to us without interpreting, and provide that metadata.
+//
+// hasAccessFeature:    Properties in the UniFi Access metadata featureFlags object that must be enabled for this option to be exposed.
+// hasCameraFeature:    Properties in the featureFlags object on cameras that must be enabled for this option to be exposed.
+// hasFeature:          Properties in the featureFlags object that must be enabled for this option to be exposed.
+// hasLightProperty:    Properties that must exist on the device object for a light device for this option to be exposed.
+// hasProperty:         Properties that must exist on the device object for this option to be exposed.
+// hasSensorProperty:   Properties that must exist on the device object for a sensor device for this option to be exposed.
+// hasSmartObjectType:  Smart object detection capability that must exist for this option to be exposed.
+// isNotProperty:       Properties that must specifically not exist on the device object for this option to be exposed.
+// modelKey:            Device categories that the option applies to, or "all" for any device type.
+interface ProtectOptionMeta {
+
+  hasAccessFeature?: string[];
+  hasCameraFeature?: string[];
+  hasFeature?: string[];
+  hasLightProperty?: string[];
+  hasProperty?: string[];
+  hasSensorProperty?: string[];
+  hasSmartObjectType?: string[];
+  isNotProperty?: string[];
+  modelKey?: string[];
+}
+
+// Category-level metadata mirroring the option-level channel above.
+//
+// featureByModel:  Per device-model featureFlags that must be enabled for the category to be exposed on that model. For example { sensor: ["motion"] } gates the
+//                  category on a sensor's "motion" feature flag.
+// isNotProperty:   Properties that must specifically not exist on the device object for this category to be exposed.
+// modelKey:        Device categories that the category applies to, or "all" for any device type.
+interface ProtectCategoryMeta {
+
+  featureByModel?: Record<string, string[]>;
+  isNotProperty?: string[];
+  modelKey?: string[];
+}
+
+/* eslint-disable @stylistic/max-len */
+
+// Feature option categories.
+export const featureOptionCategories: FeatureCategoryEntry<ProtectCategoryMeta>[] = [
+
+  { description: "Audio", meta: { modelKey: ["camera"] }, name: "Audio" },
+  { description: "Device-wide", meta: { modelKey: ["all"] }, name: "Device" },
+  { description: "Doorbell & Chime", meta: { modelKey: ["camera"] }, name: "Doorbell" },
+  { description: "Fob", meta: { modelKey: ["fob"] }, name: "Fob" },
+  { description: "Logging", meta: { modelKey: [ "camera", "light", "sensor" ] }, name: "Log" },
+  { description: "Motion & Occupancy", meta: { featureByModel: { sensor: ["motion"] }, isNotProperty: [ "isAdoptedByAccessApp", "isThirdPartyCamera" ], modelKey: [ "camera", "light", "sensor" ] }, name: "Motion" },
+  { description: "Protect Controller", meta: { modelKey: [ "camera", "nvr" ] }, name: "Nvr" },
+  { description: "Relay", meta: { modelKey: ["relay"] }, name: "Relay" },
+  { description: "Security System", meta: { modelKey: ["nvr"] }, name: "SecuritySystem" },
+  { description: "Sensor", meta: { modelKey: ["sensor"] }, name: "Sensor" },
+  { description: "UniFi Access", meta: { modelKey: ["camera"] }, name: "UniFi.Access" },
+  { description: "Video & Streaming", meta: { modelKey: ["camera"] }, name: "Video" },
+  { description: "HomeKit Secure Video", meta: { isNotProperty: ["isThirdPartyCamera"], modelKey: ["camera"] }, name: "Video.HKSV" },
+  { description: "Timeshift Buffer", meta: { isNotProperty: ["isThirdPartyCamera"], modelKey: ["camera"] }, name: "Video.Timeshift" }
+];
+
+export const featureOptions: Record<string, FeatureOptionEntry<ProtectOptionMeta>[]> = {
+
+  // Audio options.
+  "Audio": [
+
+    { default: true, description: "Audio support.", meta: { hasFeature: ["hasMic"] }, name: "" },
+    { default: false, description: "Audio filter for ambient noise suppression.", meta: { hasFeature: ["hasMic"] }, name: "Filter.Noise" },
+    { default: true, defaultValue: PROTECT_FFMPEG_AUDIO_FILTER_FFTNR, description: "Noise reduction amount, in decibels, for the FFmpeg afftdn filter.", group: "Filter.Noise", name: "Filter.Noise.FftNr" },
+    { default: true, defaultValue: PROTECT_FFMPEG_AUDIO_FILTER_HIGHPASS, description: "Frequency, in Hertz, for the FFmpeg highpass filter.", group: "Filter.Noise", name: "Filter.Noise.HighPass" },
+    { default: true, defaultValue: PROTECT_FFMPEG_AUDIO_FILTER_LOWPASS, description: "Frequency, in Hertz, for the FFmpeg lowpass filter.", group: "Filter.Noise", name: "Filter.Noise.LowPass" },
+    { default: true, description: "Two-way audio support on supported cameras.", meta: { hasFeature: ["hasSpeaker"] }, name: "TwoWay" },
+    { default: false, description: "Send two-way audio directly to supported cameras, bypassing the controller. Useful for working around bugs in some Protect controller firmware versions.", group: "TwoWay", meta: { hasFeature: ["hasSpeaker"] }, name: "TwoWay.Direct" }
+  ],
+
+  // Device options.
+  "Device": [
+
+    { default: true, description: "Make this device available in HomeKit.", name: "" },
+    { default: true, description: "Enable the status indicator light for this device in HomeKit.", meta: { hasFeature: ["hasLedStatus"], modelKey: ["camera"] }, name: "StatusLed" },
+    { default: false, description: "Add a switch accessory to control the status indicator light in HomeKit.", meta: { hasCameraFeature: ["hasLedStatus"], hasLightProperty: ["lightDeviceSettings"], hasSensorProperty: ["ledSettings"], modelKey: [ "camera", "light", "relay", "sensor" ] }, name: "StatusLed.Switch" },
+    { default: true, description: "Enable the night vision indicator light for this device in HomeKit.", meta: { hasFeature: ["hasLedIr"], modelKey: ["camera"] }, name: "NightVision" },
+    { default: false, description: "Add a dimmer accessory to control the night vision state in HomeKit.", meta: { hasFeature: ["hasLedIr"], modelKey: ["camera"] }, name: "NightVision.Dimmer" },
+    { default: true, description: "Enable the ambient light sensor for this device in HomeKit.", meta: { hasCameraFeature: ["hasLuxCheck"], hasSensorProperty: ["lightSettings"], modelKey: [ "camera", "sensor" ] }, name: "AmbientLightSensor" },
+    { default: false, description: "Make this a standalone device in HomeKit that will need to be added to HomeKit through the Home app.", name: "Standalone" },
+    { default: true, description: "Attempt to restart misbehaving devices. This is always done very conservatively and only after periods of extended device-specific issues.", meta: { modelKey: ["camera"] }, name: "SelfHealing" },
+    { default: false, description: "Synchronize the UniFi Protect name of this device with HomeKit. Synchronization is one-way only, syncing the device name from UniFi Protect to HomeKit.", name: "SyncName" }
+  ],
+
+  // Doorbell options.
+  "Doorbell": [
+
+    { default: false, description: "Add a contact sensor that gets activates when a fingerprint or NFC successfully authenticates on a Protect doorbell.", meta: { hasFeature: ["hasFingerprintSensor"] }, name: "AuthSensor" },
+    { default: false, description: "Add a switch accessory to control whether HomeKit will chime when the doorbell is pressed.", name: "Mute" },
+    { default: false, description: "Enable the doorbell messages feature.", meta: { hasFeature: ["isDoorbell"] }, name: "Messages" },
+    { default: true, description: "Use messages saved to the Protect NVR as message switches.", group: "Messages", meta: { hasFeature: ["isDoorbell"] }, name: "Messages.FromDoorbell" },
+    { default: false, description: "Add a dimmer accessory to control the Protect chime volume in HomeKit.", meta: { hasFeature: ["isDoorbell"] }, name: "Volume.Dimmer" },
+    { default: false, description: "Add switch accessories to control the physical chimes attached to a Protect doorbell.", meta: { hasFeature: ["hasChime"] }, name: "PhysicalChime" },
+    { default: true, defaultValue: PROTECT_DOORBELL_CHIME_DURATION_DIGITAL, description: "Chime duration, in milliseconds, of a digital physical chime attached to a Protect doorbell.", group: "PhysicalChime", meta: { hasFeature: ["hasChime"] }, name: "PhysicalChime.Duration.Digital" },
+    { default: true, description: "Add a light accessory to control the flashlight on a Protect doorbell package camera.", meta: { hasFeature: ["hasPackageCamera"] }, name: "PackageCamera.Flashlight" },
+    { default: false, description: "Add a switch accessory to trigger doorbell ring events on a Protect camera or doorbell.", name: "Trigger" }
+  ],
+
+  // Fob options.
+  "Fob": [
+
+    { default: true, description: "Make the Arm (1) fob button available in HomeKit.", meta: { modelKey: ["fob"] }, name: "Button.Arm" },
+    { default: true, description: "Make the Night (2) fob button available in HomeKit.", meta: { modelKey: ["fob"] }, name: "Button.Night" },
+    { default: true, description: "Make the Disarm (3) fob button available in HomeKit.", meta: { modelKey: ["fob"] }, name: "Button.Disarm" },
+    { default: true, description: "Make the Panic (4) fob button available in HomeKit.", meta: { modelKey: ["fob"] }, name: "Button.Panic" },
+    { default: true, description: "Make the Right fob button available in HomeKit.", meta: { modelKey: ["fob"] }, name: "Button.Right" },
+    { default: true, description: "Make the Left fob button available in HomeKit.", meta: { modelKey: ["fob"] }, name: "Button.Left" }
+  ],
+
+  // Logging options.
+  "Log": [
+
+    { default: true, description: "Log doorbell ring events in Homebridge.", meta: { modelKey: ["camera"] }, name: "Doorbell" },
+    { default: false, description: "Log HomeKit Secure Video recording events in Homebridge.", meta: { isNotProperty: ["isThirdPartyCamera"], modelKey: ["camera"] }, name: "HKSV" },
+    { default: false, description: "Log motion events in Homebridge.", meta: { hasProperty: [ "isMotionDetected", "isPirMotionDetected" ], isNotProperty: ["isThirdPartyCamera"] }, name: "Motion" }
+  ],
+
+  // Motion options.
+  "Motion": [
+
+    { default: true, defaultValue: PROTECT_MOTION_DURATION, description: "Duration, in seconds, of a single motion event, before allowing a new one.", name: "Duration" },
+    { default: false, description: "Add an occupancy sensor accessory using motion sensor activity to determine occupancy. By default, any motion will trigger occupancy. If the smart detection feature option is enabled, it will be used instead.", meta: { hasProperty: [ "isMotionDetected", "isPirMotionDetected" ] }, name: "OccupancySensor" },
+    { default: true, defaultValue: PROTECT_OCCUPANCY_DURATION, description: "Duration, in seconds, to wait without receiving a motion event to determine when occupancy is no longer detected.", group: "OccupancySensor", name: "OccupancySensor.Duration" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's animal detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.Animal" },
+    { default: true, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's face detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.Face" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's license plate detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.LicensePlate" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's package detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.Package" },
+    { default: true, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's person detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.Person" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's vehicle detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.Vehicle" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's baby crying audio detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.AlrmBabyCry" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's bark audio detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.AlrmBark" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's car alarm audio detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.AlrmBurglar" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's car horn audio detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.AlrmCarHorn" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's CO alarm audio detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.AlrmCmonx" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's glass break audio detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.alrmGlassBreak" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's siren audio detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.AlrmSiren" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's smoke alarm audio detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.AlrmSmoke" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's speaking audio detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.AlrmSpeak" },
+    { default: false, description: "When using both the occupancy sensor and smart detection feature options, use UniFi Protect's CO and smoke alarm audio detection to trigger occupancy.", group: "OccupancySensor", meta: { hasFeature: ["hasSmartDetect"] }, name: "OccupancySensor.Smoke_cmonx" },
+    { default: false, description: "Use UniFi Protect smart detection for HomeKit motion events when on a supported device.", meta: { hasFeature: ["hasSmartDetect"] }, name: "SmartDetect" },
+    { default: false, description: "Add contact sensors for each smart detection object type that UniFi Protect supports.", group: "SmartDetect", meta: { hasFeature: ["hasSmartDetect"] }, name: "SmartDetect.ObjectSensors" },
+    { default: false, defaultValue: "", description: "Add a contact sensor accessory that will match a specific license plate detected by UniFi Protect. You may specify multiple license plates by using hyphens to distinguish unique license plates (e.g. PLATE1-PLATE2-PLATE3).", group: "SmartDetect", inputSize: 20, meta: { hasSmartObjectType: ["licensePlate"] }, name: "SmartDetect.ObjectSensors.LicensePlate" },
+    { default: false, description: "Add a switch accessory to activate or deactivate motion detection in HomeKit.", meta: { hasProperty: [ "isMotionDetected", "isPirMotionDetected" ] }, name: "Switch" },
+    { default: false, description: "Add a switch accessory to manually trigger a motion detection event in HomeKit.", meta: { hasProperty: [ "isMotionDetected", "isPirMotionDetected" ] }, name: "Trigger" }
+  ],
+
+  // NVR options.
+  "Nvr": [
+
+    { default: false, defaultValue: PROTECT_M3U_PLAYLIST_PORT, description: "Publish an M3U playlist of Protect cameras on the specified port of this Homebridge server that is suitable for use in apps (e.g. Channels DVR) that can make camera livestreams available through them.", meta: { modelKey: ["nvr"] }, name: "Service.Playlist" },
+    { default: true, defaultValue: PROTECT_DEVICE_REMOVAL_DELAY_INTERVAL, description: "Delay, in seconds, before removing devices that are no longer detected on the Protect controller. Removal is held off while the controller is unreachable or restarting, and resumes once it is healthy again: immediately, if the delay is disabled.", meta: { modelKey: ["nvr"] }, name: "DelayDeviceRemoval" },
+    { default: false, description: "Publish all the realtime telemetry received from the Protect controller to MQTT.", meta: { modelKey: ["nvr"] }, name: "Publish.Telemetry" },
+    { default: false, defaultValue: PROTECT_NVR_REBOOT_INTERVAL, description: "Proactively reboot the UniFi Protect controller on a scheduled interval, in hours. Active HomeKit Secure Video recording events will be allowed to complete before rebooting. Use with care.", meta: { modelKey: ["nvr"] }, name: "Reboot" },
+    { default: false, description: "Add switch accessories to control the native recording capabilities of the UniFi Protect NVR.", meta: { modelKey: ["camera"] }, name: "Recording.Switch" },
+    { default: false, description: "Add sensor accessories to display the Protect controller system information (currently only the temperature).", meta: { modelKey: ["nvr"] }, name: "SystemInfo" }
+  ],
+
+  // Relay options.
+  "Relay": [
+
+    { default: true, description: "Make relay output 1 available in HomeKit as a switch.", meta: { modelKey: ["relay"] }, name: "Output.1" },
+    { default: true, description: "Make relay output 2 available in HomeKit as a switch.", meta: { modelKey: ["relay"] }, name: "Output.2" }
+  ],
+
+  // Security system options.
+  "SecuritySystem": [
+
+    { default: false, description: "Add a switch accessory to trigger the security system accessory, when using the liveview feature option.", name: "Alarm" }
+  ],
+
+  // Sensor options.
+  "Sensor": [
+
+    { default: false, description: "Expose the Protect leak sensor as a contact sensor instead of a leak sensor. This is useful for automation scenarios since HomeKit contact sensors offer more flexible automation options than leak sensors, which are primarily designed for alerts.", name: "MoistureSensor" }
+  ],
+
+  // UniFi Access options.
+  "UniFi.Access": [
+
+    { default: true, description: "Add a lock accessory to unlock. Currently, Protect only supports unlocking Access readers with a camera on the same controller as Protect.", meta: { hasAccessFeature: ["supportUnlock"] }, name: "Lock" }
+  ],
+
+  // Video options.
+  "Video": [
+
+    { default: true, description: "Use hardware-accelerated transcoding when available (Apple Macs, Intel Quick Sync Video-enabled CPUs, Raspberry Pi 4).", name: "Transcode.Hardware" },
+    { default: true, description: "When streaming to low-latency clients (e.g. at home), transcode livestreams, instead of transmuxing them.", name: "Transcode" },
+    { default: true, defaultValue: PROTECT_TRANSCODE_BITRATE, description: "Bitrate, in kilobits per second, to use when transcoding to low-latency (e.g. at home) clients, ignoring the bitrate HomeKit requests. HomeKit typically requests lower video quality than you may desire in your environment.", group: "Transcode", name: "Transcode.Bitrate" },
+    { default: true, description: "When streaming to high-latency clients (e.g. cellular connections), transcode livestreams instead of transmuxing them.", name: "Transcode.HighLatency" },
+    { default: true, defaultValue: PROTECT_TRANSCODE_HIGH_LATENCY_BITRATE, description: "Bitrate, in kilobits per second, to use when transcoding to high-latency (e.g. cellular) clients, ignoring the bitrate HomeKit requests. HomeKit typically requests lower video quality than you may desire in your environment.", group: "Transcode.HighLatency", name: "Transcode.HighLatency.Bitrate" },
+    { default: false, description: "When livestreaming directly from the camera over RTSP, force the use of the high quality video stream from the Protect controller.", name: "Rtsp.Only.High" },
+    { default: false, description: "When livestreaming directly from the camera over RTSP, force the use of the medium quality video stream from the Protect controller.", name: "Rtsp.Only.Medium" },
+    { default: false, description: "When livestreaming directly from the camera over RTSP, force the use of the low quality video stream from the Protect controller.", name: "Rtsp.Only.Low" },
+    { default: false, description: "Crop the camera video stream. Enabling this option will also force transcoding of livestreams.", name: "Crop" },
+    { default: true, defaultValue: 0, description: "Left offset of the crop window, as a percentage of the original image width.", group: "Crop", name: "Crop.X" },
+    { default: true, defaultValue: 0, description: "Top offset of the crop window, as a percentage of the original image height.", group: "Crop", name: "Crop.Y" },
+    { default: true, defaultValue: 100, description: "Width of the crop window, as a percentage of original image width.", group: "Crop", name: "Crop.Width" },
+    { default: true, defaultValue: 100, description: "Height of the crop window, as a percentage of original image height.", group: "Crop", name: "Crop.Height" },
+    { default: true, description: "Enable higher quality snapshots.", name: "HighResSnapshots" }
+  ],
+
+  // HomeKit Secure Video options.
+  "Video.HKSV": [
+
+    { default: false, description: "Use the camera status indicator light to show when an HKSV event is being recorded.", name: "StatusLedIndicator" },
+    { default: false, description: "Add a switch accessory to enable or disable HKSV event recording.", name: "Recording.Switch" }
+  ],
+
+  // Timeshift buffer options.
+  "Video.Timeshift": [
+
+    { default: true, description: "Maintain a rolling timeshift buffer of the camera's livestream to power live viewing, HomeKit Secure Video, and snapshots. Disabling this streams live views directly from the camera over RTSP instead.", name: "Livestream" },
+    { default: false, description: "Populate the timeshift buffer that feeds HomeKit Secure Video, buffer-backed live views, and snapshots from the high quality video stream from the Protect controller.", name: "Only.High" },
+    { default: false, description: "Populate the timeshift buffer that feeds HomeKit Secure Video, buffer-backed live views, and snapshots from the medium quality video stream from the Protect controller.", name: "Only.Medium" },
+    { default: false, description: "Populate the timeshift buffer that feeds HomeKit Secure Video, buffer-backed live views, and snapshots from the low quality video stream from the Protect controller.", name: "Only.Low" }
+  ]
+};
+/* eslint-enable @stylistic/max-len */
+
+/* Documentation presentation. The two maps and the two scope hooks below are build-time-only doc copy, colocated with the catalog they describe so all option-related
+ * knowledge lives in one module. homebridge-plugin-utils' `prepare-docs` CLI optionally imports `describeOptionScope` / `describeCategoryScope` from this module and
+ * threads them into the shared documentation renderer, which owns all base-shaped scaffolding (index, headings, anchors, the key cell, the default cell, the column
+ * math) and delegates only the plugin-private scope prose to these hooks. They read the typed `meta` channel directly.
+ */
+
+// Human-readable expansion of each device model key, used by both hooks. The unknown-key fallback in each hook surfaces a raw key verbatim rather than swallowing it.
+const modelMap: Record<string, string> = {
+
+  "all": "all Protect device types",
+  "camera": "Protect cameras",
+  "fob": "Protect fobs",
+  "light": "Protect lights",
+  "nvr": "Protect controllers",
+  "relay": "Protect relays",
+  "sensor": "Protect sensors"
+};
+
+// Human-readable expansion of each capability flag an option can be gated on, surfaced in the per-option "Supported on" line.
+const capabilityMap: Record<string, string> = {
+
+  "hasChime": "Protect doorbells that have a physical chime",
+  "hasFingerprintSensor": "Protect doorbells that have a fingerprint sensor",
+  "hasLedIr": "Protect cameras that have infrared LEDs",
+  "hasLedStatus": "Protect devices with a status LED",
+  "hasLuxCheck": "Protect cameras that have an ambient light sensor",
+  "hasMic": "Protect cameras that have a microphone",
+  "hasMotionZones": "Protect cameras that have a motion sensor",
+  "hasPackageCamera": "Protect doorbells that have a package camera",
+  "hasSmartDetect": "Protect devices that support smart motion detection (e.g. G4-series cameras and better)",
+  "hasSpeaker": "Protect devices that have a speaker (e.g. Protect doorbells)",
+  "isDoorbell": "Protect devices that have a doorbell",
+  "isMotionDetected": "Protect devices that have a motion sensor",
+  "isPirMotionDetected": "Protect devices that have a motion sensor",
+  "ledSettings": "Protect devices that have a status indicator light",
+  "licensePlate": "Protect devices that support license plate smart detection",
+  "supportUnlock": "Protect cameras paired with a UniFi Access reader that supports remote unlock"
+};
+
+// Module-scope list formatter for the category device-scope sentence. It handles "X", "X and Y", and "X, Y, and Z" uniformly.
+const lf = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
+
+/**
+ * Documentation hook: returns the device-scope sentence emitted under a category heading, naming the device models the category applies to, or `undefined` when the
+ * category declares no model scope.
+ *
+ * @param category - The category entry whose `meta.modelKey` scope to describe.
+ *
+ * @returns The full "These option(s) apply to: ..." sentence, or `undefined` to omit the line.
+ */
+export const describeCategoryScope = (category: FeatureCategoryEntry<ProtectCategoryMeta>): string | undefined => {
+
+  const models = category.meta?.modelKey;
+
+  if(!models) {
+
+    return undefined;
+  }
+
+  return "These option(s) apply to: " + lf.format(models.map(key => modelMap[key] ?? key)) + ".";
+};
+
+/**
+ * Documentation hook: returns the "Supported on ..." suffix appended to an option's description cell, naming the capability or device model the option is gated on, or
+ * `undefined` when the option declares no scope. The capability flags fall through in priority order, with the device model as the catch-all when none is set. We use
+ * graceful map fallback (`?? cap` / `?? model`) so an unmapped key surfaces verbatim rather than the literal "undefined".
+ *
+ * @param option - The option entry whose `meta` scope to describe.
+ *
+ * @returns The full " <BR>*Supported on ...*" suffix, or `undefined` to omit it.
+ */
+export const describeOptionScope = (option: FeatureOptionEntry<ProtectOptionMeta>): string | undefined => {
+
+  const m = option.meta;
+  const cap = m?.hasFeature?.[0] ?? m?.hasCameraFeature?.[0] ?? m?.hasLightProperty?.[0] ?? m?.hasSensorProperty?.[0] ?? m?.hasProperty?.[0] ??
+    m?.hasSmartObjectType?.[0] ?? m?.hasAccessFeature?.[0];
+
+  if(cap) {
+
+    return " <BR>*Supported on " + (capabilityMap[cap] ?? cap) + ".*";
+  }
+
+  const model = m?.modelKey?.[0];
+
+  if(model) {
+
+    return " <BR>*Supported on " + (modelMap[model] ?? model) + ".*";
+  }
+
+  return undefined;
+};

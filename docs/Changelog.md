@@ -2,6 +2,60 @@
 
 All notable changes to this project will be documented in this file.
 
+## 8.1.0 (2026-07-19)
+  * Improvement: HomeKit Secure Video recordings from doorbells now record audio at the doorbell's native 48 kHz rather than 16 kHz.
+  * Improvement: the extra-smooth live view processing on Apple Silicon now integrates with hardware acceleration cleanly in every configuration...a partially-accelerated setup can no longer end up with a broken livestream.
+  * Improvement: in multi-controller environments, each controller health report is attributed by the controller address it carries, removing any chance of cross-controller mixups.
+  * Improvement: fob buttons now honor the button label style you've selected in the Protect webUI - numbers or security actions - and switching styles updates the button names in HomeKit automatically...though if you've renamed a button yourself, your name always wins. The buttons are also ordered to match the Protect webUI.
+  * Improvement: when the settings webUI fails to load in your browser, it now explains what happened on the page itself instead of showing a blank screen.
+  * Fix: an account without the full management role once again streams using whichever RTSP channels are already enabled on each camera, addressing a regression from v7...in HBUP 8.0, a camera with any RTSP channel disabled could lose live streaming and HomeKit Secure Video entirely on such accounts.
+  * Fix: HomeKit Secure Video readiness is no longer announced for a camera that dropped offline while its recording buffer was still starting.
+  * Fix: when two-way audio is lost mid-session, HBUP now says so plainly in the log instead of continuing silently without return audio.
+  * Fix: MQTT publish failures are now contained and reported instead of escaping as unhandled errors.
+  * Housekeeping.
+
+## 8.0.1 (2026-07-14)
+  * Improvement: minor robustness improvements when reserving streaming ports.
+  * Fix: the webUI's device discovery now works on Node 22.
+  * Fix: liveview scenes now stay with their owning controller in multi-controller environments...one controller can no longer remove or block another's scene switches...and activating a scene over MQTT now works. The security system accessory also refreshes its available arm states as you add and remove liveviews.
+  * Fix: livestream startup and teardown is now airtight...a stream that fails to start cleans up completely rather than leaving a session behind.
+  * Fix: an error inside a HomeKit-triggered action is now contained and logged instead of risking a crash.
+  * Fix: hanging up a two-way audio call during setup now ends cleanly instead of logging an error.
+  * Fix: stale video from the timeshift buffer is never served after a livestream reconnect...live views, HKSV recordings, and snapshots always reflect current content.
+  * Fix: HomeKit Secure Video recording management is steadier through camera removal and recovery.
+  * Fix: HomeKit Secure Video recording durations are now logged accurately.
+  * Fix: restarting Homebridge no longer briefly kicks off recovery work mid-shutdown.
+  * Fix: controller health is tracked per exact address, so controllers with similar addresses no longer cross-contaminate each other's status.
+  * Fix: disabling a controller now removes its system information and liveview accessories.
+  * Fix: smart detection events now publish with the right detection identity and topics, and settle cleanly when a device is removed.
+  * Fix: doorbell messages clear their switches when they expire or are removed, messages set over MQTT are validated, and ringtone playback and service ordering behave correctly.
+  * Fix: device settings persist across reconfigurations, and services added during live updates initialize correctly.
+  * Fix: rapid flashlight toggles now honor your latest intent.
+  * Fix: streaming follows a camera when its IP address changes.
+  * Fix: night vision settings now map consistently everywhere they appear.
+  * Fix: the settings webUI now tells you what actually went wrong...connection failures report the right controller's error, and a failed first-run setup explains itself instead of stalling silently.
+  * Fix: upgrading the plugin can no longer pair fresh webUI code with a stale cached module.
+  * Fix: relays now show their SuperLink connection in the webUI device details.
+  * Housekeeping.
+
+## 8.0.0 (2026-07-08)
+  * **HBUP 8 is the biggest release I've put out in a long time. I've reimagined the plugin and the library that powers it from first principles, with a focus on elegance, performance, and a genuinely modern foundation. A modern Node baseline let me build entirely on today's JavaScript and runtime features and leave years of legacy compatibility behind. This is a major version bump, and there are breaking changes for some users, so please read through the notes below before you upgrade.**
+  * **Breaking change: Homebridge 2.0 is now required.** HBUP 8 no longer supports Homebridge 1.x.
+  * **Breaking change: live viewing is now backed by a standing timeshift buffer by default**, which also powers HomeKit Secure Video and snapshots. It's a better experience for most setups, but it changes how a handful of feature options work...so if you run anything other than the defaults, particularly if you forced direct RTSP or pinned a stream quality, please review the revised [feature options](https://github.com/hjdhjd/homebridge-unifi-protect/blob/main/docs/FeatureOptions.md). Specifically: `Video.Stream.UseApi` has been removed...to stream live views over direct RTSP instead of the buffer, disable the new `Video.Timeshift.Livestream` option; `Video.Stream.Only.*` is now `Video.Rtsp.Only.*`; and `Video.HKSV.Record.Only.*` is now `Video.Timeshift.Only.*`.
+  * **Note on AV1 cameras:** the version of FFmpeg that HBUP bundles (FFmpeg 8.0) can't stream AV1 over RTSP, so an AV1-encoded camera needs the timeshift buffer enabled to livestream - exactly as it did before, so nothing changes for you here. Newer FFmpeg releases (8.1 and later) add AV1-over-RTSP support, and I'll enable it for the folks who want it in a future release.
+  * New feature: HBUP now exposes UniFi Protect relays in HomeKit. Each relay output appears as its own switch, and you can hide any of them individually through the new Relay feature options.
+  * New feature: HBUP now exposes UniFi Protect glass break sensors in HomeKit as contact sensors.
+  * New feature: HBUP now exposes UniFi Protect fobs in HomeKit. Each fob appears as a set of six buttons (Arm, Disarm, Night, Panic, Left, and Right) that you can use to trigger HomeKit automations, and you can hide any buttons you don't need.
+  * New feature: UniFi Access intercom doorbell presses now surface as HomeKit doorbell rings, so an Access intercom drives the same notifications and automations as a Protect doorbell.
+  * New feature: a camera's ambient light sensor is now available in HomeKit as a light sensor. A new feature option lets you hide it, and that option applies to Protect sensor accessories as well.
+  * Improvement: HBUP now surfaces a camera's capabilities the moment your controller reports them, without needing a Homebridge restart. Two-way audio, tamper detection, the night vision dimmer, a UniFi Access lock, and the ambient light sensor all appear as soon as they become available.
+  * Improvement: continued HomeKit Secure Video recording resilience. HBUP recovers more gracefully from controller hiccups, ends a recording cleanly when a camera drops offline, and re-establishes recording when it returns.
+  * Improvement: smarter livestream recovery. HBUP now reads your controller's health to decide how to respond...waiting out an overloaded controller, holding off on reconnects for a camera the controller reports offline, and rebooting a genuinely stuck camera...and it keeps working even when a device is unadopted at the controller.
+  * Improvement: quieter logs during controller reboots. When HBUP recognizes a controller reboot, it keeps the resulting livestream and recording chatter at the debug level and narrates the recovery in plain language once the controller comes back, instead of flooding your log with warnings.
+  * Improvement: scheduled controller reboots now go through the controller's own reboot and recover over the surviving connection.
+  * Fix: cameras that report no audio track now livestream correctly, rather than failing when a microphone isn't present.
+  * Housekeeping.
+
 ## 7.29.0 (2026-04-09)
   * Improvement: continued HKSV recording resilience improvements. HBUP now recovers from livestream discontinuities during active recordings, detects livestream stalls faster, and automatically resumes HKSV on cameras that were offline at HBUP startup once they come back online - resulting in fewer missed or incomplete HKSV events.
   * Improvement: HKSV recordings now gracefully handle the non-standard frame rates that some Protect cameras advertise, which can shift across firmware updates.
