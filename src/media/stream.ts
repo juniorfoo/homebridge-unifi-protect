@@ -29,8 +29,8 @@ import { logLivestreamIterationError } from "./livestream.ts";
 import { resolveSessionSource } from "./stream-source-policy.ts";
 import { streamingSamplerates } from "./stream-delegate.ts";
 /* eslint-disable sort-imports -- multi-member telemetry import must follow single-member neighbor imports without reordering paths. */
-import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart,
-  formatStreamSessionStop } from "./stream-telemetry.ts";
+import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart, formatStreamSessionStop,
+  recordStreamMediaActivityIfOwner } from "./stream-telemetry.ts";
 /* eslint-enable sort-imports */
 
 interface StreamSessionDiagnostics {
@@ -548,21 +548,14 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     }));
   }
 
-  private noteStreamActivity(sessionId: string): void {
+  private recordTsbMediaSegmentForOwner(sessionId: string, owner: StreamSessionDiagnostics): void {
 
-    const diagnostics = this.diagnosticsForSession(sessionId);
-
-    if(!diagnostics) {
+    if(!recordStreamMediaActivityIfOwner(this.sessionDiagnosticsById.get(sessionId), owner, Date.now())) {
 
       return;
     }
 
-    if(diagnostics.firstFrameMs === undefined) {
-
-      diagnostics.firstFrameMs = Date.now() - diagnostics.sessionStartedAt;
-    }
-
-    diagnostics.outputWatchdog.activity();
+    owner.outputWatchdog.activity();
   }
 
   // Consume Segments from a livestream subscription and write them through to FFmpeg via the supplied BackpressureWriter. FFmpeg needs a valid fMP4 header before any
@@ -1157,14 +1150,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       // Drive the segment iterator in the background.
       void this.consumeStreamSegments(ffmpegStream, subscription, segmentWriter, tsBuffer, (): void => {
 
-        const diagnostics = this.diagnosticsForSession(request.sessionID);
-
-        if(diagnostics) {
-
-          diagnostics.segmentsFed++;
-        }
-
-        this.noteStreamActivity(request.sessionID);
+        this.recordTsbMediaSegmentForOwner(request.sessionID, sessionDiagnostics);
       });
 
       // Wait for the session to establish. If it fails (provisioning deadline expired), dispose the prepared session and bail. The FFmpeg was spawned above before this
