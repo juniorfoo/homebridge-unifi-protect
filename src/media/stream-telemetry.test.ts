@@ -4,8 +4,8 @@
  */
 import { describe, test } from "node:test";
 /* eslint-disable-next-line sort-imports -- multi-member local import follows node:test per stream-ffmpeg-process.test.ts pattern. */
-import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart, formatStreamSessionStop,
-  recordStreamMediaActivityIfOwner } from "./stream-telemetry.ts";
+import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, establishmentFailureStopReason, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart,
+  formatStreamSessionStop, recordStreamMediaActivityIfOwner } from "./stream-telemetry.ts";
 import assert from "node:assert/strict";
 
 const baseStart = {
@@ -94,6 +94,37 @@ describe("formatNoOutputWarning", () => {
     assert.match(line, /No stream output after 10s/);
     assert.match(line, /session=sess-1, path=RTSP/);
     assert.equal(STREAM_NO_OUTPUT_WARNING_MS, 10000);
+  });
+});
+
+describe("establishmentFailureStopReason", () => {
+
+  test("returns livestream-acquire-failed when ffmpeg-exit was not logged yet", () => {
+
+    assert.equal(establishmentFailureStopReason(false), "livestream-acquire-failed");
+  });
+
+  test("returns null after ffmpeg-exit telemetry so establishment cleanup does not mislabel the stop", () => {
+
+    assert.equal(establishmentFailureStopReason(true), null);
+
+    const ffmpegStopLine = formatStreamSessionStop({
+
+      camera: "Example Camera",
+      durationMs: 500,
+      ffmpegExitCode: 1,
+      hardwareTranscode: false,
+      path: "TSB/API",
+      profile: "High",
+      reason: "ffmpeg-exit",
+      segmentsFed: 0,
+      sessionId: "sess-1",
+      transcode: false,
+      verboseTelemetry: true
+    });
+
+    assert.match(ffmpegStopLine, /reason=ffmpeg-exit/);
+    assert.doesNotMatch(ffmpegStopLine, /livestream-acquire-failed/);
   });
 });
 

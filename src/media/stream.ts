@@ -29,8 +29,8 @@ import { logLivestreamIterationError } from "./livestream.ts";
 import { resolveSessionSource } from "./stream-source-policy.ts";
 import { streamingSamplerates } from "./stream-delegate.ts";
 /* eslint-disable sort-imports -- multi-member telemetry import must follow single-member neighbor imports without reordering paths. */
-import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart, formatStreamSessionStop,
-  recordStreamMediaActivityIfOwner } from "./stream-telemetry.ts";
+import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, establishmentFailureStopReason, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart,
+  formatStreamSessionStop, recordStreamMediaActivityIfOwner } from "./stream-telemetry.ts";
 /* eslint-enable sort-imports */
 
 interface StreamSessionDiagnostics {
@@ -495,11 +495,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     // Add it to the pending session queue so we're ready to start when we're called upon.
     this.pendingSessions.set(request.sessionID, sessionInfo);
     callback(undefined, response);
-  }
-
-  private diagnosticsForSession(sessionId: string): StreamSessionDiagnostics | undefined {
-
-    return this.sessionDiagnosticsById.get(sessionId);
   }
 
   private endStreamDiagnosticsIfStillOwned(sessionId: string, owner: StreamSessionDiagnostics): void {
@@ -1120,11 +1115,15 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       void subscription?.[Symbol.asyncDispose]();
       segmentWriter?.abort();
 
-      if(this.ongoingSessions.has(request.sessionID) && !isHbpuAbortReason(ffmpegStream.signal.reason, "shutdown")) {
+      if(!isHbpuAbortReason(ffmpegStream.signal.reason, "shutdown")) {
 
         this.logStreamSessionStopForOwner(request.sessionID, sessionDiagnostics, "ffmpeg-exit", ffmpegExitCode);
-        this.controller.forceStopStreamingSession(request.sessionID);
-        this.stopStream(request.sessionID);
+
+        if(this.ongoingSessions.has(request.sessionID)) {
+
+          this.controller.forceStopStreamingSession(request.sessionID);
+          this.stopStream(request.sessionID);
+        }
       }
     };
 
@@ -1158,7 +1157,13 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       // cascades through the shared signal to the FFmpeg, the writer, and the subscription, so no separate manual teardown of the three is needed.
       if(!(await subscription.whenEstablished())) {
 
-        this.logStreamSessionStopForOwner(request.sessionID, sessionDiagnostics, "livestream-acquire-failed");
+        const establishmentReason = establishmentFailureStopReason(sessionDiagnostics.stopLogged);
+
+        if(establishmentReason) {
+
+          this.logStreamSessionStopForOwner(request.sessionID, sessionDiagnostics, establishmentReason);
+        }
+
         this.endStreamDiagnosticsIfStillOwned(request.sessionID, sessionDiagnostics);
         this.disposePreparedSession(request.sessionID, sessionInfo);
 
