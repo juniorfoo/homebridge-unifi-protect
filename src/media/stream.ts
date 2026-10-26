@@ -28,8 +28,10 @@ import type { TalkbackSession } from "unifi-protect";
 import { logLivestreamIterationError } from "./livestream.ts";
 import { resolveSessionSource } from "./stream-source-policy.ts";
 import { streamingSamplerates } from "./stream-delegate.ts";
-import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart, formatStreamSessionStop,
-  type StreamStopReason } from "./stream-telemetry.ts";
+/* eslint-disable sort-imports -- multi-member telemetry import must follow single-member neighbor imports without reordering paths. */
+import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart,
+  formatStreamSessionStop } from "./stream-telemetry.ts";
+/* eslint-enable sort-imports */
 
 interface StreamSessionDiagnostics {
 
@@ -507,7 +509,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     this.sessionDiagnosticsById.delete(sessionId);
   }
 
-  private logStreamSessionStop(sessionId: string, reason: StreamStopReason, ffmpegExitCode?: number | null): void {
+  private logStreamSessionStop(sessionId: string, reason: "ffmpeg-exit" | "homekit-stop" | "livestream-acquire-failed", ffmpegExitCode?: number | null): void {
 
     const diagnostics = this.diagnosticsForSession(sessionId);
 
@@ -919,7 +921,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       this.log.warn(formatNoOutputWarning(this.protectCamera.accessoryName, request.sessionID, streamPathLabel));
     }, STREAM_NO_OUTPUT_WARNING_MS);
 
-    // Arm only on the pooled livestream (stdin) path. Direct RTSP already has homebridge-plugin-utils' returnPort inbound-silence watchdog (~5s force-stop); a second timer on FFmpeg stderr would clear too early and duplicate operator signals.
+    // Arm only on the pooled livestream (stdin) path. Direct RTSP already has the returnPort inbound-silence watchdog (~5s force-stop) from homebridge-plugin-utils;
+    // a second timer tied to FFmpeg stderr would clear too early and duplicate operator signals.
     if(useTsb) {
 
       outputWatchdog.arm();
