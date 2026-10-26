@@ -69,6 +69,18 @@ export interface StreamMediaActivityState {
 
 // Identity guard for live-view diagnostics: only the diagnostics object still registered for a session id may accrue media-segment activity. Stale subscription
 // callbacks can drain queued segments after STOP/START reuses the same HomeKit session id (see timeshift.ts consumeSegments identity guard).
+// When FFmpeg exits organically during the TSB `whenEstablished()` window, the bridge logs `ffmpeg-exit` first; a subsequent subscription failure must not emit
+// `livestream-acquire-failed` (duplicate/misleading telemetry).
+export function establishmentFailureStopReason(stopAlreadyLogged: boolean): StreamStopReason | null {
+
+  if(stopAlreadyLogged) {
+
+    return null;
+  }
+
+  return "livestream-acquire-failed";
+}
+
 export function recordStreamMediaActivityIfOwner(mapEntry: StreamMediaActivityState | undefined, owner: StreamMediaActivityState, nowMs: number): boolean {
 
   if(mapEntry !== owner) {
