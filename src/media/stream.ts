@@ -28,6 +28,20 @@ import type { TalkbackSession } from "unifi-protect";
 import { logLivestreamIterationError } from "./livestream.ts";
 import { resolveSessionSource } from "./stream-source-policy.ts";
 import { streamingSamplerates } from "./stream-delegate.ts";
+import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart, formatStreamSessionStop,
+  type StreamStopReason } from "./stream-telemetry.ts";
+
+interface StreamSessionDiagnostics {
+
+  firstFrameMs?: number | null;
+  outputWatchdog: StreamOutputWatchdog;
+  path: string;
+  profile: string;
+  segmentsFed: number;
+  sessionStartedAt: number;
+  stopLogged: boolean;
+  transcode: boolean;
+}
 
 interface OngoingSessionEntry {
 
@@ -108,6 +122,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
   public readonly log: HomebridgePluginLogging;
   private readonly nvr: ProtectNvr;
   private ongoingSessions: Map<string, OngoingSessionEntry>;
+  private readonly sessionDiagnosticsById: Map<string, StreamSessionDiagnostics>;
   private pendingSessions: Map<string, SessionInfo>;
   public readonly platform: ProtectPlatform;
   public readonly protectCamera: ProtectCameraHost;
@@ -131,6 +146,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     this.log = protectCamera.log;
     this.nvr = protectCamera.nvr;
     this.ongoingSessions = new Map();
+    this.sessionDiagnosticsById = new Map();
     this.protectCamera = protectCamera;
     this.pendingSessions = new Map();
     this.platform = protectCamera.platform;
@@ -478,6 +494,74 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     callback(undefined, response);
   }
 
+  private diagnosticsForSession(sessionId: string): StreamSessionDiagnostics | undefined {
+
+    return this.sessionDiagnosticsById.get(sessionId);
+  }
+
+  private endStreamDiagnostics(sessionId: string): void {
+
+    const diagnostics = this.diagnosticsForSession(sessionId);
+
+    diagnostics?.outputWatchdog.clear();
+    this.sessionDiagnosticsById.delete(sessionId);
+  }
+
+  private logStreamSessionStop(sessionId: string, reason: StreamStopReason, ffmpegExitCode?: number | null): void {
+
+    const diagnostics = this.diagnosticsForSession(sessionId);
+
+    if(!diagnostics) {
+
+      return;
+    }
+
+    diagnostics.outputWatchdog.clear();
+
+    if(!this.protectCamera.hasFeature("Debug.Video.HKSV.Telemetry") || diagnostics.stopLogged) {
+
+      return;
+    }
+
+    diagnostics.stopLogged = true;
+
+    const verboseTelemetry = true;
+
+    this.log.info(formatStreamSessionStop({
+
+      camera: this.protectCamera.accessoryName,
+      clientAddress: undefined,
+      durationMs: Date.now() - diagnostics.sessionStartedAt,
+      ffmpegExitCode: ffmpegExitCode,
+      firstFrameMs: diagnostics.firstFrameMs ?? null,
+      hardwareTranscode: this.ffmpegOptions.hardwareEncodes("stream"),
+      path: diagnostics.path,
+      profile: diagnostics.profile,
+      reason: reason,
+      segmentsFed: diagnostics.segmentsFed,
+      sessionId: sessionId,
+      transcode: diagnostics.transcode,
+      verboseTelemetry: verboseTelemetry
+    }));
+  }
+
+  private noteStreamActivity(sessionId: string): void {
+
+    const diagnostics = this.diagnosticsForSession(sessionId);
+
+    if(!diagnostics) {
+
+      return;
+    }
+
+    if(diagnostics.firstFrameMs === undefined) {
+
+      diagnostics.firstFrameMs = Date.now() - diagnostics.sessionStartedAt;
+    }
+
+    diagnostics.outputWatchdog.activity();
+  }
+
   // Consume Segments from a livestream subscription and write them through to FFmpeg via the supplied BackpressureWriter. FFmpeg needs a valid fMP4 header before any
   // MOOF/MDAT data, so we prepend the header exactly once on the first media: either the pre-existing timeshift buffer slice (which already contains the init segment
   // followed by recent frames) or the subscription's cached init segment data on its own. The unifi-protect library's pool yields the init as its own Segment, so we
@@ -485,7 +569,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
   // and consume the cached initSegment.data instead. Error classification is centralised in logLivestreamIterationError so every livestream consumer uses identical
   // phrasing.
   private async consumeStreamSegments(ffmpegStream: ProtectStreamingFfmpegProcess, subscription: LivestreamSubscription, segmentWriter: BackpressureWriter,
-    tsBuffer: Nullable<Buffer>): Promise<void> {
+    tsBuffer: Nullable<Buffer>, onMediaSegment?: () => void): Promise<void> {
 
     let headerWritten = false;
 
@@ -531,6 +615,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
           void segmentWriter.write(header).catch((error: unknown) => this.log.debug("Live stream backpressure write dropped.", { error }));
         }
+
+        onMediaSegment?.();
 
         // Write the media fragment. The homebridge-plugin-utils write() returns a typed-rejecting Promise; the .catch (debug) swallows BackpressureClosedStreamError /
         // signal.reason on teardown (the common case when FFmpeg exits mid-write). No highWaterMark (unbounded) and no segment-count accounting, unlike HKSV.
@@ -820,9 +906,56 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     hinting.push(...(hinting.length ? [""] : []));
 
+    const streamPathLabel = formatLiveViewPathLabel(useTsb, this.protectCamera.hasFeature("Debug.Video.Timeshift.UseRtsp"));
+    const verboseTelemetry = this.protectCamera.hasFeature("Debug.Video.HKSV.Telemetry");
+
     this.log.info("%sStreaming request: %sx%s@%sfps, %s. Using %s [%s], %s [%s].", hinting.join(" "), request.video.width, request.video.height, request.video.fps,
       formatBps(targetBitrate * 1000), channelProfile.name, this.protectCamera.videoCodecName,
-      formatBps(channelProfile.channel.bitrate), useTsb ? "TSB/" + (this.protectCamera.hasFeature("Debug.Video.Timeshift.UseRtsp") ? "RTSP" : "API") : "RTSP");
+      formatBps(channelProfile.channel.bitrate), streamPathLabel);
+
+    const sessionStartedAt = Date.now();
+    const outputWatchdog = new StreamOutputWatchdog((): void => {
+
+      this.log.warn(formatNoOutputWarning(this.protectCamera.accessoryName, request.sessionID, streamPathLabel));
+    }, STREAM_NO_OUTPUT_WARNING_MS);
+
+    // Arm only on the pooled livestream (stdin) path. Direct RTSP already has homebridge-plugin-utils' returnPort inbound-silence watchdog (~5s force-stop); a second timer on FFmpeg stderr would clear too early and duplicate operator signals.
+    if(useTsb) {
+
+      outputWatchdog.arm();
+    }
+
+    const sessionDiagnostics: StreamSessionDiagnostics = {
+
+      firstFrameMs: undefined,
+      outputWatchdog: outputWatchdog,
+      path: streamPathLabel,
+      profile: channelProfile.name,
+      segmentsFed: 0,
+      sessionStartedAt: sessionStartedAt,
+      stopLogged: false,
+      transcode: isTranscoding
+    };
+
+    if(verboseTelemetry) {
+
+      this.log.info(formatStreamSessionStart({
+
+        camera: this.protectCamera.accessoryName,
+        clientAddress: sessionInfo.address,
+        dst: sessionInfo.hasAudioSupport && this.protectCamera.hints.twoWayAudio ? undefined :
+          sessionInfo.address + ":" + sessionInfo.videoReturnPort.toString(),
+        hardwareTranscode: this.ffmpegOptions.hardwareEncodes("stream"),
+        path: streamPathLabel,
+        profile: channelProfile.name,
+        sessionId: request.sessionID,
+        transcode: isTranscoding,
+        verboseTelemetry: verboseTelemetry
+      }));
+    }
+
+    this.endStreamDiagnostics(request.sessionID);
+    this.sessionDiagnosticsById.set(request.sessionID, sessionDiagnostics);
 
     // When on high-performance hardware like Apple Silicon, using the TSB, and we don't have low-FPS cameras like the package camera, enable the use of the
     // CPU-intensive FFmpeg minterpolate filter to enable very smooth video, especially when there's motion involved. M3+ Apple Silicon environments are able to reliably
@@ -986,19 +1119,20 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     // FFmpeg still needs its subscription/writer reclaimed - so the same cleanup runs on either branch. The organic discriminator reads signal.reason: stopStream
     // aborts with an explicit HbpuAbortError("shutdown"), so isHbpuAbortReason(reason, "shutdown") suppresses the self-stop double-fire; the entry-existence guard is
     // defense-in-depth. This is the started-then-died force-stop, and the returnPort watchdog timeout flows through the same path.
-    const bridge = (): void => {
+    const bridge = (ffmpegExitCode?: number | null): void => {
 
       void subscription?.[Symbol.asyncDispose]();
       segmentWriter?.abort();
 
       if(this.ongoingSessions.has(request.sessionID) && !isHbpuAbortReason(ffmpegStream.signal.reason, "shutdown")) {
 
+        this.logStreamSessionStop(request.sessionID, "ffmpeg-exit", ffmpegExitCode);
         this.controller.forceStopStreamingSession(request.sessionID);
         this.stopStream(request.sessionID);
       }
     };
 
-    void ffmpegStream.exited.then(() => bridge(), () => bridge());
+    void ffmpegStream.exited.then((exitInfo) => bridge(exitInfo.exitCode), () => bridge());
 
     if(useTsb) {
 
@@ -1018,13 +1152,25 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       subscription = this.protectCamera.livestream(channelProfile, { signal: sessionInfo.abortController.signal, urgency: () => PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_MS });
 
       // Drive the segment iterator in the background.
-      void this.consumeStreamSegments(ffmpegStream, subscription, segmentWriter, tsBuffer);
+      void this.consumeStreamSegments(ffmpegStream, subscription, segmentWriter, tsBuffer, (): void => {
+
+        const diagnostics = this.diagnosticsForSession(request.sessionID);
+
+        if(diagnostics) {
+
+          diagnostics.segmentsFed++;
+        }
+
+        this.noteStreamActivity(request.sessionID);
+      });
 
       // Wait for the session to establish. If it fails (provisioning deadline expired), dispose the prepared session and bail. The FFmpeg was spawned above before this
       // await, so it must be torn down here rather than left to sit until its returnPort watchdog fires; aborting the umbrella controller inside the disposal helper
       // cascades through the shared signal to the FFmpeg, the writer, and the subscription, so no separate manual teardown of the three is needed.
       if(!(await subscription.whenEstablished())) {
 
+        this.logStreamSessionStop(request.sessionID, "livestream-acquire-failed");
+        this.endStreamDiagnostics(request.sessionID);
         this.disposePreparedSession(request.sessionID, sessionInfo);
 
         return;
@@ -1038,6 +1184,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       // same wait is an adjacent race tracked separately.
       if(this.pendingSessions.get(request.sessionID) !== sessionInfo) {
 
+        this.endStreamDiagnostics(request.sessionID);
         this.disposePreparedSession(request.sessionID, sessionInfo);
 
         return;
@@ -1298,6 +1445,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     try {
 
+      this.logStreamSessionStop(sessionId, "homekit-stop");
+
       // Stop any FFmpeg instances we have running.
       const ongoingSession = this.ongoingSessions.get(sessionId);
 
@@ -1316,8 +1465,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         // to call the set handler for the flashlight.
         ongoingSession.toggleLight?.setCharacteristic(this.hap.Characteristic.On, false);
 
-        // Inform the user.
-        this.log.info("Stopped video streaming session.");
+        // Inform the user when structured telemetry is off (telemetry users get a Stream ended line from logStreamSessionStop above).
+        if(!this.protectCamera.hasFeature("Debug.Video.HKSV.Telemetry")) {
+
+          this.log.info("Stopped video streaming session.");
+        }
 
         // Release our port reservations. Disposal is a pure in-memory release that resolves on the same microtask (no I/O), so the fire-and-forget keeps stopStream
         // synchronous.
@@ -1339,6 +1491,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
       // Delete the ongoing entry. The pending entry, if there was one, was already deleted by the disposal helper.
       this.ongoingSessions.delete(sessionId);
+      this.endStreamDiagnostics(sessionId);
     } catch(error) {
 
       this.log.error("Unable to cleanly end the FFmpeg video processes: %s.", formatErrorMessage(error));
