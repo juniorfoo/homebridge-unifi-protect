@@ -36,6 +36,7 @@ import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, formatLiveViewPathLa
 interface StreamSessionDiagnostics {
 
   firstFrameMs?: number | null;
+  hardwareTranscode: boolean;
   outputWatchdog: StreamOutputWatchdog;
   path: string;
   profile: string;
@@ -501,49 +502,49 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     return this.sessionDiagnosticsById.get(sessionId);
   }
 
-  private endStreamDiagnostics(sessionId: string): void {
+  private endStreamDiagnosticsIfStillOwned(sessionId: string, owner: StreamSessionDiagnostics): void {
 
-    const diagnostics = this.diagnosticsForSession(sessionId);
+    if(this.sessionDiagnosticsById.get(sessionId) !== owner) {
 
-    diagnostics?.outputWatchdog.clear();
+      return;
+    }
+
+    owner.outputWatchdog.clear();
     this.sessionDiagnosticsById.delete(sessionId);
   }
 
-  private logStreamSessionStop(sessionId: string, reason: "ffmpeg-exit" | "homekit-stop" | "livestream-acquire-failed", ffmpegExitCode?: number | null): void {
+  private logStreamSessionStopForOwner(sessionId: string, owner: StreamSessionDiagnostics, reason: "ffmpeg-exit" | "homekit-stop" | "livestream-acquire-failed",
+    ffmpegExitCode?: number | null): void {
 
-    const diagnostics = this.diagnosticsForSession(sessionId);
-
-    if(!diagnostics) {
-
-      return;
-    }
-
-    diagnostics.outputWatchdog.clear();
-
-    if(!this.protectCamera.hasFeature("Debug.Video.HKSV.Telemetry") || diagnostics.stopLogged) {
+    if(this.sessionDiagnosticsById.get(sessionId) !== owner) {
 
       return;
     }
 
-    diagnostics.stopLogged = true;
+    owner.outputWatchdog.clear();
 
-    const verboseTelemetry = true;
+    if(!this.protectCamera.hasFeature("Debug.Video.HKSV.Telemetry") || owner.stopLogged) {
+
+      return;
+    }
+
+    owner.stopLogged = true;
 
     this.log.info(formatStreamSessionStop({
 
       camera: this.protectCamera.accessoryName,
       clientAddress: undefined,
-      durationMs: Date.now() - diagnostics.sessionStartedAt,
+      durationMs: Date.now() - owner.sessionStartedAt,
       ffmpegExitCode: ffmpegExitCode,
-      firstFrameMs: diagnostics.firstFrameMs ?? null,
-      hardwareTranscode: this.ffmpegOptions.hardwareEncodes("stream"),
-      path: diagnostics.path,
-      profile: diagnostics.profile,
+      firstFrameMs: owner.firstFrameMs ?? null,
+      hardwareTranscode: owner.hardwareTranscode,
+      path: owner.path,
+      profile: owner.profile,
       reason: reason,
-      segmentsFed: diagnostics.segmentsFed,
+      segmentsFed: owner.segmentsFed,
       sessionId: sessionId,
-      transcode: diagnostics.transcode,
-      verboseTelemetry: verboseTelemetry
+      transcode: owner.transcode,
+      verboseTelemetry: true
     }));
   }
 
@@ -931,6 +932,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     const sessionDiagnostics: StreamSessionDiagnostics = {
 
       firstFrameMs: undefined,
+      hardwareTranscode: isTranscoding && this.ffmpegOptions.hardwareEncodes("stream"),
       outputWatchdog: outputWatchdog,
       path: streamPathLabel,
       profile: channelProfile.name,
@@ -946,9 +948,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         camera: this.protectCamera.accessoryName,
         clientAddress: sessionInfo.address,
-        dst: sessionInfo.hasAudioSupport && this.protectCamera.hints.twoWayAudio ? undefined :
-          sessionInfo.address + ":" + sessionInfo.videoReturnPort.toString(),
-        hardwareTranscode: this.ffmpegOptions.hardwareEncodes("stream"),
+        dst: sessionInfo.address + ":" + sessionInfo.videoPort.toString(),
+        hardwareTranscode: sessionDiagnostics.hardwareTranscode,
         path: streamPathLabel,
         profile: channelProfile.name,
         sessionId: request.sessionID,
@@ -957,7 +958,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       }));
     }
 
-    this.endStreamDiagnostics(request.sessionID);
     this.sessionDiagnosticsById.set(request.sessionID, sessionDiagnostics);
 
     // When on high-performance hardware like Apple Silicon, using the TSB, and we don't have low-FPS cameras like the package camera, enable the use of the
@@ -1129,7 +1129,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
       if(this.ongoingSessions.has(request.sessionID) && !isHbpuAbortReason(ffmpegStream.signal.reason, "shutdown")) {
 
-        this.logStreamSessionStop(request.sessionID, "ffmpeg-exit", ffmpegExitCode);
+        this.logStreamSessionStopForOwner(request.sessionID, sessionDiagnostics, "ffmpeg-exit", ffmpegExitCode);
         this.controller.forceStopStreamingSession(request.sessionID);
         this.stopStream(request.sessionID);
       }
@@ -1172,8 +1172,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       // cascades through the shared signal to the FFmpeg, the writer, and the subscription, so no separate manual teardown of the three is needed.
       if(!(await subscription.whenEstablished())) {
 
-        this.logStreamSessionStop(request.sessionID, "livestream-acquire-failed");
-        this.endStreamDiagnostics(request.sessionID);
+        this.logStreamSessionStopForOwner(request.sessionID, sessionDiagnostics, "livestream-acquire-failed");
+        this.endStreamDiagnosticsIfStillOwned(request.sessionID, sessionDiagnostics);
         this.disposePreparedSession(request.sessionID, sessionInfo);
 
         return;
@@ -1187,7 +1187,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       // same wait is an adjacent race tracked separately.
       if(this.pendingSessions.get(request.sessionID) !== sessionInfo) {
 
-        this.endStreamDiagnostics(request.sessionID);
+        this.endStreamDiagnosticsIfStillOwned(request.sessionID, sessionDiagnostics);
         this.disposePreparedSession(request.sessionID, sessionInfo);
 
         return;
@@ -1448,7 +1448,12 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     try {
 
-      this.logStreamSessionStop(sessionId, "homekit-stop");
+      const diagnosticsOwner = this.sessionDiagnosticsById.get(sessionId);
+
+      if(diagnosticsOwner) {
+
+        this.logStreamSessionStopForOwner(sessionId, diagnosticsOwner, "homekit-stop");
+      }
 
       // Stop any FFmpeg instances we have running.
       const ongoingSession = this.ongoingSessions.get(sessionId);
@@ -1494,7 +1499,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
       // Delete the ongoing entry. The pending entry, if there was one, was already deleted by the disposal helper.
       this.ongoingSessions.delete(sessionId);
-      this.endStreamDiagnostics(sessionId);
+
+      if(diagnosticsOwner) {
+
+        this.endStreamDiagnosticsIfStillOwned(sessionId, diagnosticsOwner);
+      }
     } catch(error) {
 
       this.log.error("Unable to cleanly end the FFmpeg video processes: %s.", formatErrorMessage(error));
