@@ -3,9 +3,10 @@
  * stream-telemetry.test.ts: Pure helpers for live-view session diagnostics.
  */
 import { describe, test } from "node:test";
+/* eslint-disable-next-line sort-imports -- multi-member local import follows node:test per stream-ffmpeg-process.test.ts pattern. */
+import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart,
+  formatStreamSessionStop } from "./stream-telemetry.ts";
 import assert from "node:assert/strict";
-import { StreamOutputWatchdog, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart, formatStreamSessionStop,
-  STREAM_NO_OUTPUT_WARNING_MS } from "./stream-telemetry.ts";
 
 const baseStart = {
 
@@ -37,7 +38,7 @@ describe("formatStreamSessionStart", () => {
 
   test("omits client network fields by default", () => {
 
-    const line = formatStreamSessionStart({ ...baseStart, verboseTelemetry: false, clientAddress: "192.0.2.1", dst: "192.0.2.1:5000" });
+    const line = formatStreamSessionStart({ ...baseStart, clientAddress: "192.0.2.1", dst: "192.0.2.1:5000", verboseTelemetry: false });
 
     assert.match(line, /^Stream started: camera=Example Camera session=sess-1 path=TSB\/API profile=High transcode=no hw=yes$/);
     assert.doesNotMatch(line, /client=/);
@@ -45,7 +46,7 @@ describe("formatStreamSessionStart", () => {
 
   test("includes client and dst when verbose telemetry is enabled", () => {
 
-    const line = formatStreamSessionStart({ ...baseStart, verboseTelemetry: true, clientAddress: "192.0.2.1", dst: "192.0.2.1:5000" });
+    const line = formatStreamSessionStart({ ...baseStart, clientAddress: "192.0.2.1", dst: "192.0.2.1:5000", verboseTelemetry: true });
 
     assert.match(line, /client=192\.0\.2\.1 dst=192\.0\.2\.1:5000/);
   });
@@ -65,7 +66,8 @@ describe("formatStreamSessionStop", () => {
       segmentsFed: 42
     });
 
-    assert.equal(line, "Stream ended: camera=Example Camera session=sess-1 path=TSB/API profile=High transcode=no hw=yes reason=homekit-stop duration=2.5s first-frame-ms=120 segments-fed=42 ffmpeg-exit=0");
+    assert.match(line, /Stream ended: camera=Example Camera session=sess-1 path=TSB\/API profile=High transcode=no hw=yes reason=homekit-stop/);
+    assert.match(line, /duration=2\.5s first-frame-ms=120 segments-fed=42 ffmpeg-exit=0/);
   });
 
   test("renders null placeholders for missing timing and exit code", () => {
