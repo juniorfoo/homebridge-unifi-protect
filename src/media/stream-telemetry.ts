@@ -60,6 +60,32 @@ export function formatNoOutputWarning(camera: string, sessionId: string, path: s
     "). Check UDP path, livestream API availability, or RTSP URL.";
 }
 
+export interface StreamMediaActivityState {
+
+  firstFrameMs?: number | null;
+  segmentsFed: number;
+  sessionStartedAt: number;
+}
+
+// Identity guard for live-view diagnostics: only the diagnostics object still registered for a session id may accrue media-segment activity. Stale subscription
+// callbacks can drain queued segments after STOP/START reuses the same HomeKit session id (see timeshift.ts consumeSegments identity guard).
+export function recordStreamMediaActivityIfOwner(mapEntry: StreamMediaActivityState | undefined, owner: StreamMediaActivityState, nowMs: number): boolean {
+
+  if(mapEntry !== owner) {
+
+    return false;
+  }
+
+  owner.segmentsFed++;
+
+  if(owner.firstFrameMs === undefined) {
+
+    owner.firstFrameMs = nowMs - owner.sessionStartedAt;
+  }
+
+  return true;
+}
+
 // One-shot watchdog: the first activity() disarms the timer; arm() starts the no-output deadline from session start.
 export class StreamOutputWatchdog {
 

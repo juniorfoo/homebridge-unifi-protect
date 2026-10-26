@@ -4,8 +4,8 @@
  */
 import { describe, test } from "node:test";
 /* eslint-disable-next-line sort-imports -- multi-member local import follows node:test per stream-ffmpeg-process.test.ts pattern. */
-import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart,
-  formatStreamSessionStop } from "./stream-telemetry.ts";
+import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart, formatStreamSessionStop,
+  recordStreamMediaActivityIfOwner } from "./stream-telemetry.ts";
 import assert from "node:assert/strict";
 
 const baseStart = {
@@ -94,6 +94,30 @@ describe("formatNoOutputWarning", () => {
     assert.match(line, /No stream output after 10s/);
     assert.match(line, /session=sess-1, path=RTSP/);
     assert.equal(STREAM_NO_OUTPUT_WARNING_MS, 10000);
+  });
+});
+
+describe("recordStreamMediaActivityIfOwner", () => {
+
+  test("does not mutate a replacement diagnostics object after session id reuse", () => {
+
+    const staleOwner = { firstFrameMs: undefined, segmentsFed: 0, sessionStartedAt: 1000 };
+    const replacement = { firstFrameMs: undefined, segmentsFed: 0, sessionStartedAt: 2000 };
+    const mapEntry = replacement;
+
+    assert.equal(recordStreamMediaActivityIfOwner(mapEntry, staleOwner, 1500), false);
+    assert.equal(replacement.segmentsFed, 0);
+    assert.equal(replacement.firstFrameMs, undefined);
+    assert.equal(staleOwner.segmentsFed, 0);
+  });
+
+  test("records segment count and first-frame timing for the current owner", () => {
+
+    const owner = { firstFrameMs: undefined, segmentsFed: 0, sessionStartedAt: 1000 };
+
+    assert.equal(recordStreamMediaActivityIfOwner(owner, owner, 1250), true);
+    assert.equal(owner.segmentsFed, 1);
+    assert.equal(owner.firstFrameMs, 250);
   });
 });
 
