@@ -17,3 +17,28 @@ jobs:
   ci:
     uses: hjdhjd/github-workflows/.github/workflows/nodejs-ci.yml@main
     secrets: inherit
+
+  test:
+    name: "Test (node:test)"
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [ lts/-1, lts/* ]
+
+    steps:
+      - name: Checkout the repository.
+        uses: actions/checkout@v6
+
+      - name: Setup the node ${{ matrix.node-version }} environment.
+        uses: actions/setup-node@v6
+        with:
+          cache: npm
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies and run tests.
+        env:
+          CI: true
+        run: |
+          npm ci
+          npm test
