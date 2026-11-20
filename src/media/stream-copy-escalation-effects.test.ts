@@ -32,7 +32,7 @@ const MEDIA_C = Buffer.from("media-c");
 
 const stubChannel = {
 
-  channel: { bitrate: 4_000_000, fps: 15, height: 1080, id: 0, width: 1920 },
+  channel: { bitrate: 4000000, fps: 15, height: 1080, id: 0, width: 1920 },
   name: "high",
   url: "rtsps://stub/high"
 } as ChannelProfile;
@@ -54,19 +54,19 @@ function makeSubscription(segments: { data: Buffer; discontinuity?: boolean; typ
 
     disposeCalls: 0,
     initSegment: { data: INIT },
-    async *[Symbol.asyncIterator]() {
+    async *[Symbol.asyncIterator](): AsyncGenerator<(typeof segments)[number], void, undefined> {
 
       for(const segment of segments) {
 
         yield segment;
       }
     },
-    async [Symbol.asyncDispose]() {
+    async [Symbol.asyncDispose](): Promise<void> {
 
       disposeCalls += 1;
       (sub as { disposeCalls: number }).disposeCalls = disposeCalls;
     },
-    async whenEstablished() {
+    async whenEstablished(): Promise<boolean> {
 
       return true;
     }
@@ -131,7 +131,12 @@ interface SessionInfoStub {
 }
 
 function makeWriterRail(sessionInfo: SessionInfoStub, getActive: () => TestLiveStreamingFfmpegProcess,
-  init?: ConstructorParameters<typeof BackpressureWriter>[1]) {
+  init?: ConstructorParameters<typeof BackpressureWriter>[1]): {
+
+  current: BackpressureWriter;
+  getSegmentWriter: () => BackpressureWriter;
+  rotateSegmentWriter: (replacement: FfmpegStreamingProcess) => BackpressureWriter;
+} {
 
   const rail = createTsbSegmentWriterRail({
 
@@ -153,7 +158,7 @@ function makeWriterRail(sessionInfo: SessionInfoStub, getActive: () => TestLiveS
   };
 }
 
-function makeHarness(spawned: TestLiveStreamingFfmpegProcess[]) {
+function makeHarness(spawned: TestLiveStreamingFfmpegProcess[]): LiveVideoFfmpegSpawner {
 
   const spawner: LiveVideoFfmpegSpawner = (_options: FfmpegOptions, init) => {
 
@@ -184,7 +189,7 @@ describe("copy-to-transcode replacement effects", () => {
 
     const spawned: TestLiveStreamingFfmpegProcess[] = [];
     const copy = new TestLiveStreamingFfmpegProcess("copy");
-    const sessionInfo: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 51_000 };
+    const sessionInfo: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 51000 };
     const owner = makeDiagnostics(sessionInfo);
     const sessionId = "sess-1";
     const ongoingSessions = new Map([[ sessionId, { abortController: sessionInfo.abortController, ffmpeg: [castProtect(copy)] } ]]);
@@ -241,7 +246,7 @@ describe("copy-to-transcode replacement effects", () => {
   test("fMP4 ordering: init is primed on respawn and again before media when segments arrive during replacement", async () => {
 
     const copy = new TestLiveStreamingFfmpegProcess("copy");
-    const sessionInfo: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 52_000 };
+    const sessionInfo: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 52000 };
     const owner = makeDiagnostics(sessionInfo);
     const feedState: LiveTsbFeedState = { allowTimeshiftPrefix: false, headerWritten: true, primeMediaFloor: null };
     const subscription = makeSubscription([{ data: MEDIA_C, type: "media" }]);
@@ -295,8 +300,8 @@ describe("copy-to-transcode replacement effects", () => {
   test("RTP cleanup: copy return-port socket is released; STOP tears down replacement and subscription once", async () => {
 
     const spawned: TestLiveStreamingFfmpegProcess[] = [];
-    const copy = new TestLiveStreamingFfmpegProcess("copy", { returnPort: { ipFamily: "ipv4", port: 53_000 } });
-    const sessionInfo: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 53_001 };
+    const copy = new TestLiveStreamingFfmpegProcess("copy", { returnPort: { ipFamily: "ipv4", port: 53000 } });
+    const sessionInfo: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 53001 };
     const owner = makeDiagnostics(sessionInfo);
     const sessionId = "sess-1";
     const subscription = makeSubscription([], sessionInfo.abortController.signal);
@@ -357,7 +362,7 @@ describe("copy-to-transcode replacement effects", () => {
     const copy = new TestLiveStreamingFfmpegProcess("copy");
     const pendingController = new AbortController();
     const replacementController = new AbortController();
-    const pendingSession: SessionInfoStub = { abortController: pendingController, addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 54_000 };
+    const pendingSession: SessionInfoStub = { abortController: pendingController, addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 54000 };
     const owner = makeDiagnostics(pendingSession);
     const sessionId = "homekit-1";
     const pendingSessions = new Map([[ sessionId, pendingSession ]]);
@@ -394,8 +399,8 @@ describe("copy-to-transcode replacement effects", () => {
 
     const staleCopy = new TestLiveStreamingFfmpegProcess("stale");
     const replacement = new TestLiveStreamingFfmpegProcess("replacement");
-    const staleSession: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 55_000 };
-    const replacementSession: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 55_001 };
+    const staleSession: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 55000 };
+    const replacementSession: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 55001 };
     const staleOwner = makeDiagnostics(staleSession);
     const sessionId = "sess";
     const pending = new Map([[ sessionId, replacementSession ]]);
@@ -456,7 +461,7 @@ describe("copy-to-transcode replacement effects", () => {
   test("backpressure: dead copy stdin poisons the writer; rotation delivers init then live media to the replacement", async () => {
 
     const copy = new TestLiveStreamingFfmpegProcess("copy", { blockStdin: true });
-    const sessionInfo: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 56_000 };
+    const sessionInfo: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 56000 };
     const owner = makeDiagnostics(sessionInfo);
     const feedState: LiveTsbFeedState = { allowTimeshiftPrefix: false, headerWritten: true, primeMediaFloor: null };
     const subscription = makeSubscription([], sessionInfo.abortController.signal);
@@ -544,8 +549,8 @@ describe("copy-to-transcode replacement effects", () => {
 
   test("backpressure: STOP during blocked copy stdin write tears down writer and subscription once", async () => {
 
-    const sessionInfo: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 57_000 };
-    const copy = new TestLiveStreamingFfmpegProcess("copy", { blockStdin: true, pipeBreakOnTeardown: false, returnPort: { ipFamily: "ipv4", port: 57_000 } });
+    const sessionInfo: SessionInfoStub = { abortController: new AbortController(), addressVersion: "ipv4", hasAudioSupport: false, videoReturnPort: 57000 };
+    const copy = new TestLiveStreamingFfmpegProcess("copy", { blockStdin: true, pipeBreakOnTeardown: false, returnPort: { ipFamily: "ipv4", port: 57000 } });
     const subscription = makeSubscription([], sessionInfo.abortController.signal);
     const segmentWriter = new BackpressureWriter(() => castProtect(copy).stdin, { signal: sessionInfo.abortController.signal });
 

@@ -3,32 +3,28 @@
 /* eslint-disable camelcase, sort-imports */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { H264Level, H264Profile } from "homebridge-plugin-utils";
+import type { BackpressureWriter, FfmpegOptions } from "homebridge-plugin-utils";
+import { FfmpegOptions as FfmpegOptionsImpl, H264Level, H264Profile, HOMEKIT_IDR_INTERVAL } from "homebridge-plugin-utils";
 import type { StartStreamRequest } from "homebridge";
 import { makeTestCameraHost } from "./testing.helpers.ts";
 import type { TestCameraHost } from "./testing.helpers.ts";
 import { createTsbSegmentWriterRail } from "./stream-live-feed.ts";
-import type { BackpressureWriter } from "homebridge-plugin-utils";
 import type { ProtectStreamingFfmpegProcess } from "./stream-ffmpeg-process.ts";
 import { TestLiveStreamingFfmpegProcess } from "./test-live-ffmpeg-process.ts";
-import { FfmpegOptions as FfmpegOptionsImpl } from "homebridge-plugin-utils";
-import type { FfmpegOptions } from "homebridge-plugin-utils";
-import { resolveStreamOutputFps } from "./stream-transcode-policy.ts";
+import type { LiveVideoEncodeDecision } from "./stream-transcode-policy.ts";
+import { resolveStreamOutputFps, resolveVideoCopyExitBridgeAction } from "./stream-transcode-policy.ts";
 import { appendLiveVideoEncodeToFfmpegArgs, buildLiveVideoEncodeInput, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge,
   refreshBufferBackedChannelProfileForEncode, resolveCopyEscalationKeyframePrimingBuffer, resolveFmp4InitForLiveDeclaredCheck, resolveStartStreamEncodePlan,
   resolveStartStreamForceTranscodeDueToUserOption, resolveStreamEgressBitrateBps, resolveTimeshiftBufferLiveChannel,
   shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
-import type { LiveVideoEncodeDecision } from "./stream-transcode-policy.ts";
 import type { ChannelProfile } from "./resolution.ts";
 import { parseH264AvcCFromFmp4Init } from "./h264-fmp4-avcc.ts";
 import { TEST_H264_MAIN_PPS, testH264SpsForProfileLevel } from "./h264-test-bytes.ts";
 import { makeChannel } from "../camera.fixtures.ts";
-import { HOMEKIT_IDR_INTERVAL } from "homebridge-plugin-utils";
-import { resolveVideoCopyExitBridgeAction } from "./stream-transcode-policy.ts";
 
 const stubChannel: ChannelProfile = {
 
-  channel: { bitrate: 4_000_000, fps: 15, height: 720, id: 1, name: "medium", width: 1280 },
+  channel: { bitrate: 4000000, fps: 15, height: 720, id: 1, name: "medium", width: 1280 },
   name: "medium"
 } as ChannelProfile;
 
@@ -125,11 +121,11 @@ describe("stream-live-wiring", () => {
 
     const camera = testCameraHost();
 
-    camera.hasFeature = (option) => option === "Video.Transcode";
+    camera.hasFeature = (option: string): boolean => option === "Video.Transcode";
 
     assert.equal(resolveStartStreamForceTranscodeDueToUserOption(camera, false), true);
 
-    camera.hasFeature = () => false;
+    camera.hasFeature = (): boolean => false;
     assert.equal(resolveStartStreamForceTranscodeDueToUserOption(camera, false), false);
   });
 
@@ -177,8 +173,8 @@ describe("stream-live-wiring", () => {
 
   test("resolveStreamEgressBitrateBps uses transcode target or source channel bitrate", () => {
 
-    assert.equal(resolveStreamEgressBitrateBps(true, 2000, 4_000_000), 2_000_000);
-    assert.equal(resolveStreamEgressBitrateBps(false, 2000, 4_000_000), 4_000_000);
+    assert.equal(resolveStreamEgressBitrateBps(true, 2000, 4000000), 2000000);
+    assert.equal(resolveStreamEgressBitrateBps(false, 2000, 4000000), 4000000);
   });
 
   test("createCopyEscalationTsbResume uses production writer rotation", () => {
@@ -213,14 +209,14 @@ describe("stream-live-wiring", () => {
 
     const liveChannel = makeChannel({ fps: 30, height: 720, id: 1, name: "medium", width: 1280 });
 
-    liveChannel.bitrate = 4_000_000;
+    liveChannel.bitrate = 4000000;
     camera.ufp = { ...camera.ufp, channels: [liveChannel] };
 
     const stale = stubChannel;
     const refreshed = refreshBufferBackedChannelProfileForEncode(camera, stale);
 
     assert.ok(refreshed);
-    assert.equal(refreshed?.channel.fps, 30);
+    assert.equal(refreshed.channel.fps, 30);
   });
 
   test("resolveTimeshiftBufferLiveChannel forces transcode on width-only geometry drift (X4)", () => {
@@ -228,7 +224,7 @@ describe("stream-live-wiring", () => {
     const camera = testCameraHost();
     const liveChannel = makeChannel({ fps: 15, height: 720, id: 1, name: "medium", width: 1280 });
 
-    liveChannel.bitrate = 4_000_000;
+    liveChannel.bitrate = 4000000;
     camera.ufp = { ...camera.ufp, channels: [liveChannel] };
     const bufferWide: ChannelProfile = { ...stubChannel, channel: { ...stubChannel.channel, width: 1920 } };
     const resolved = resolveTimeshiftBufferLiveChannel(bufferWide, camera);
@@ -242,7 +238,7 @@ describe("stream-live-wiring", () => {
     const camera = testCameraHost();
     const liveChannel = makeChannel({ fps: 15, height: 720, id: 1, name: "medium", width: 1280 });
 
-    liveChannel.bitrate = 4_000_000;
+    liveChannel.bitrate = 4000000;
     camera.ufp = { ...camera.ufp, channels: [liveChannel] };
     const bufferTall: ChannelProfile = { ...stubChannel, channel: { ...stubChannel.channel, height: 1080 } };
     const resolved = resolveTimeshiftBufferLiveChannel(bufferTall, camera);
@@ -256,7 +252,7 @@ describe("stream-live-wiring", () => {
     const camera = testCameraHost();
     const liveChannel = makeChannel({ fps: 15, height: 720, id: 1, name: "medium", width: 1280 });
 
-    liveChannel.bitrate = 4_000_000;
+    liveChannel.bitrate = 4000000;
     camera.ufp = { ...camera.ufp, channels: [liveChannel] };
     const buffer30: ChannelProfile = { ...stubChannel, channel: { ...stubChannel.channel, fps: 30 } };
     const resolved = resolveTimeshiftBufferLiveChannel(buffer30, camera);
@@ -276,7 +272,7 @@ describe("stream-live-wiring", () => {
 
     const liveChannel = makeChannel({ fps: 30, height: 720, id: 1, name: "medium", width: 1280 });
 
-    liveChannel.bitrate = 4_000_000;
+    liveChannel.bitrate = 4000000;
     camera.ufp = { ...camera.ufp, channels: [liveChannel] };
     const refreshed = refreshBufferBackedChannelProfileForEncode(camera, stubChannel);
     const init = buildFmp4Init(77, 31);
@@ -451,7 +447,7 @@ describe("appendLiveVideoEncodeToFfmpegArgs output fps", () => {
       debug: false,
       hardwareDecoding: true,
       hardwareTranscoding: true,
-      log: { debug: () => undefined, error: () => undefined, info: () => undefined, warn: () => undefined },
+      log: { debug: (): void => undefined, error: (): void => undefined, info: (): void => undefined, warn: (): void => undefined },
       name: (): string => "hardware-wiring-test"
     });
 

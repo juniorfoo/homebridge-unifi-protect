@@ -136,7 +136,7 @@ export function buildLiveVideoEncodeInput(protectCamera: ProtectCameraHost, requ
   };
 }
 
-export function resolveLiveTranscodeTargetBitrate(protectCamera: ProtectCameraHost, request: StartStreamRequest, profile: ChannelProfile,
+export function resolveLiveTranscodeTargetBitrate(protectCamera: ProtectCameraHost, _request: StartStreamRequest, profile: ChannelProfile,
   isHighLatency: boolean, targetBitrateKbps: number): number {
 
   return resolveLiveTranscodeBitrate({

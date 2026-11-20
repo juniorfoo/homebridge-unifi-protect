@@ -57,7 +57,7 @@ describe("rotateBackpressureWriterForCopyEscalation", () => {
     let stdin: Writable = new Writable({ write: (_chunk, _encoding, callback) => callback() });
     const poisoned = new BackpressureWriter(() => stdin, { signal: signal });
 
-    stdin = new Writable({ write: (_chunk, _encoding, callback) => callback() });
+    stdin = new Writable({ write: (_chunk, _encoding, callback): void => callback() });
 
     const replacement = rotateBackpressureWriterForCopyEscalation({
 
@@ -103,14 +103,15 @@ describe("primeLiveFfmpegStdinAfterRespawn", () => {
 
     const proc = new TestLiveStreamingFfmpegProcess("prime-floor");
     const init = Buffer.from("init-segment");
-    const lagging = makeNonKeyframeFragment(0xAB, { baseMediaDecodeTime: 77_777, sequenceNumber: 7 });
+    const lagging = makeNonKeyframeFragment(0xAB, { baseMediaDecodeTime: 77777, sequenceNumber: 7 });
     const priming = Buffer.concat([lagging.data]);
     const feedState: LiveTsbFeedState = { allowTimeshiftPrefix: true, headerWritten: false, primeMediaFloor: null };
 
     primeLiveFfmpegStdinAfterRespawn(feedState, { initSegment: { data: init } } as never, proc as never, priming);
 
-    assert.equal(feedState.primeMediaFloor?.trackDecodeTimes[1], 77_777);
-    assert.equal(feedState.primeMediaFloor?.sequenceNumber, 7);
+    assert.ok(feedState.primeMediaFloor);
+    assert.equal(feedState.primeMediaFloor.trackDecodeTimes[1], 77777);
+    assert.equal(feedState.primeMediaFloor.sequenceNumber, 7);
   });
 
   test("records per-track floors from every moof in a keyframe priming buffer", () => {
@@ -124,9 +125,10 @@ describe("primeLiveFfmpegStdinAfterRespawn", () => {
 
     primeLiveFfmpegStdinAfterRespawn(feedState, { initSegment: { data: init } } as never, proc as never, priming);
 
-    assert.equal(feedState.primeMediaFloor?.trackDecodeTimes[1], 100);
-    assert.equal(feedState.primeMediaFloor?.trackDecodeTimes[2], 200);
-    assert.equal(feedState.primeMediaFloor?.sequenceNumber, 6);
+    assert.ok(feedState.primeMediaFloor);
+    assert.equal(feedState.primeMediaFloor.trackDecodeTimes[1], 100);
+    assert.equal(feedState.primeMediaFloor.trackDecodeTimes[2], 200);
+    assert.equal(feedState.primeMediaFloor.sequenceNumber, 6);
   });
 });
 
@@ -145,11 +147,11 @@ function makeMediaSubscription(segments: { data: Buffer; type: "init" | "media" 
   return {
 
     initSegment: { data: Buffer.from("init") },
-    [Symbol.asyncIterator]() {
+    [Symbol.asyncIterator](): AsyncIterator<(typeof segments)[number]> {
 
       return {
 
-        async next() {
+        async next(): Promise<IteratorResult<(typeof segments)[number]>> {
 
           if(index >= segments.length) {
 
@@ -159,6 +161,8 @@ function makeMediaSubscription(segments: { data: Buffer; type: "init" | "media" 
           const value = segments[index];
 
           index += 1;
+
+          assert.ok(value);
 
           return { done: false, value };
         }
@@ -177,10 +181,10 @@ describe("consumeLiveStreamSegments prime dedup", () => {
 
       allowTimeshiftPrefix: false,
       headerWritten: true,
-      primeMediaFloor: livePrimeMediaFloorFromIdentity({ baseMediaDecodeTime: 77_777, sequenceNumber: 7, trackId: 1 })
+      primeMediaFloor: livePrimeMediaFloorFromIdentity({ baseMediaDecodeTime: 77777, sequenceNumber: 7, trackId: 1 })
     };
     const writer = new BackpressureWriter(() => proc.stdin, { signal: new AbortController().signal });
-    const lagging = makeNonKeyframeFragment(0xAC, { baseMediaDecodeTime: 77_777, sequenceNumber: 7, trackId: 1 });
+    const lagging = makeNonKeyframeFragment(0xAC, { baseMediaDecodeTime: 77777, sequenceNumber: 7, trackId: 1 });
 
     await consumeLiveStreamSegments(() => proc as never, feedState,
       makeMediaSubscription([
@@ -190,7 +194,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.ok(proc.stdinWrites.some((buf) => buf.equals(untimed.data)));
-    assert.equal(feedState.primeMediaFloor?.trackDecodeTimes[1], 77_777);
+    assert.equal(feedState.primeMediaFloor?.trackDecodeTimes[1], 77777);
     assert.equal(proc.stdinWrites.some((buf) => buf.equals(lagging.data)), false);
   });
 
@@ -250,17 +254,17 @@ describe("consumeLiveStreamSegments prime dedup", () => {
   test("mfhd-only floor skips lagging pooled duplicate by sequence", async () => {
 
     const proc = new TestLiveStreamingFfmpegProcess("dedup-mfhd");
-    const lagging = makeStreamMultiTrafFragment(9, [ { trackId: 1 } ], 0x11);
-    const equal = makeStreamMultiTrafFragment(10, [ { trackId: 1 } ], 0x12);
-    const ahead = makeStreamMultiTrafFragment(11, [ { trackId: 1 } ], 0x13);
+    const lagging = makeStreamMultiTrafFragment(9, [{ trackId: 1 }], 0x11);
+    const equal = makeStreamMultiTrafFragment(10, [{ trackId: 1 }], 0x12);
+    const ahead = makeStreamMultiTrafFragment(11, [{ trackId: 1 }], 0x13);
     const feedState: LiveTsbFeedState = {
 
       allowTimeshiftPrefix: false,
       headerWritten: true,
-      primeMediaFloor: parsePrimeMediaFloorFromPrimingBuffer(makeStreamMultiTrafFragment(10, [ { trackId: 1 } ]))
+      primeMediaFloor: parsePrimeMediaFloorFromPrimingBuffer(makeStreamMultiTrafFragment(10, [{ trackId: 1 }]))
     };
     const writer = new BackpressureWriter(() => proc.stdin, { signal: new AbortController().signal });
-    const replayLow = makeStreamMultiTrafFragment(8, [ { trackId: 1 } ], 0x14);
+    const replayLow = makeStreamMultiTrafFragment(8, [{ trackId: 1 }], 0x14);
 
     feedState.primeMediaFloorWrittenLiveMoofs = 0;
 
@@ -375,15 +379,16 @@ describe("consumeLiveStreamSegments prime dedup", () => {
 
     const proc = new TestLiveStreamingFfmpegProcess("prime-dual-traf");
     const init = Buffer.from("init-segment");
-    const dual = makeStreamMultiTrafFragment(101, [ { trackId: 1, baseMediaDecodeTime: 900_000 }, { trackId: 2 } ]);
-    const priming = Buffer.concat([ dual ]);
+    const dual = makeStreamMultiTrafFragment(101, [ { trackId: 1, baseMediaDecodeTime: 900000 }, { trackId: 2 } ]);
+    const priming = Buffer.concat([dual]);
     const feedState: LiveTsbFeedState = { allowTimeshiftPrefix: true, headerWritten: false, primeMediaFloor: null };
 
     primeLiveFfmpegStdinAfterRespawn(feedState, { initSegment: { data: init } } as never, proc as never, priming);
 
-    assert.equal(feedState.primeMediaFloor?.trackDecodeTimes[1], 900_000);
-    assert.equal(feedState.primeMediaFloor?.trackMfhdOnly[2], true);
-    assert.equal(feedState.primeMediaFloor?.trackDecodeTimes[2], undefined);
+    assert.ok(feedState.primeMediaFloor);
+    assert.equal(feedState.primeMediaFloor.trackDecodeTimes[1], 900000);
+    assert.equal(feedState.primeMediaFloor.trackMfhdOnly[2], true);
+    assert.equal(feedState.primeMediaFloor.trackDecodeTimes[2], undefined);
   });
 
   test("does not skip audio with tfdt when that track was not primed (dual-traf pairing repro)", async () => {
@@ -396,11 +401,11 @@ describe("consumeLiveStreamSegments prime dedup", () => {
       primeMediaFloor: {
 
         sequenceNumber: 101,
-        trackDecodeTimes: { 1: 900_000 },
+        trackDecodeTimes: { 1: 900000 },
         trackMfhdOnly: {}
       }
     };
-    const liveAudio = makeStreamMultiTrafFragment(102, [ { trackId: 2, baseMediaDecodeTime: 480_000 } ], 0x52);
+    const liveAudio = makeStreamMultiTrafFragment(102, [{ trackId: 2, baseMediaDecodeTime: 480000 }], 0x52);
     const writer = new BackpressureWriter(() => proc.stdin, { signal: new AbortController().signal });
 
     await consumeLiveStreamSegments(() => proc as never, feedState,
@@ -477,7 +482,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
 
       allowTimeshiftPrefix: false,
       headerWritten: true,
-      primeMediaFloor: livePrimeMediaFloorFromIdentity({ baseMediaDecodeTime: 1_000, sequenceNumber: floorSeq, trackId: 1 }),
+      primeMediaFloor: livePrimeMediaFloorFromIdentity({ baseMediaDecodeTime: 1000, sequenceNumber: floorSeq, trackId: 1 }),
       primeMediaFloorWrittenLiveMoofs: 0
     };
     const writer = new BackpressureWriter(() => proc.stdin, { signal: new AbortController().signal });
@@ -486,7 +491,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
 
       return makeNonKeyframeFragment(idx, {
 
-        baseMediaDecodeTime: 2_000 + idx,
+        baseMediaDecodeTime: 2000 + idx,
         sequenceNumber: floorSeq + 1 + idx,
         trackId: 1
       });
@@ -527,7 +532,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
     assert.ok(feedState.primeMediaFloor);
     assert.equal(feedState.primeMediaFloorWrittenLiveMoofs, P4_WRITTEN_CAP_LITERAL);
 
-    const oneMore = makeNonKeyframeFragment(99, { baseMediaDecodeTime: 9_999, sequenceNumber: 99, trackId: 1 });
+    const oneMore = makeNonKeyframeFragment(99, { baseMediaDecodeTime: 9999, sequenceNumber: 99, trackId: 1 });
 
     await consumeLiveStreamSegments(() => proc as never, feedState,
       makeMediaSubscription([{ data: oneMore.data, type: "media" }]), () => writer, null, stubLog);
@@ -544,7 +549,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
 
       allowTimeshiftPrefix: false,
       headerWritten: true,
-      primeMediaFloor: livePrimeMediaFloorFromIdentity({ baseMediaDecodeTime: 1_000, sequenceNumber: floorSeq, trackId: 1 }),
+      primeMediaFloor: livePrimeMediaFloorFromIdentity({ baseMediaDecodeTime: 1000, sequenceNumber: floorSeq, trackId: 1 }),
       primeMediaFloorWrittenLiveMoofs: 0
     };
     const writer = new BackpressureWriter(() => proc.stdin, { signal: new AbortController().signal });
@@ -558,7 +563,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
 
         data: makeNonKeyframeFragment(idx, {
 
-          baseMediaDecodeTime: 5_000 + idx,
+          baseMediaDecodeTime: 5000 + idx,
           sequenceNumber: 30 + idx,
           trackId: 2
         }).data,
@@ -624,7 +629,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
 
     assert.ok(feedState.primeMediaFloor);
 
-    const oneMore = makeNonKeyframeFragment(99, { baseMediaDecodeTime: 9_999, sequenceNumber: 99, trackId: 1 });
+    const oneMore = makeNonKeyframeFragment(99, { baseMediaDecodeTime: 9999, sequenceNumber: 99, trackId: 1 });
 
     await consumeLiveStreamSegments(() => proc as never, feedState,
       makeMediaSubscription([{ data: oneMore.data, type: "media" }]), () => writer, null, stubLog);
@@ -636,7 +641,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
   test("resets written-moof counter when the prime floor empties on clear (M16)", async () => {
 
     const proc = new TestLiveStreamingFfmpegProcess("dedup-p4-counter-reset");
-    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeStreamMultiTrafFragment(10, [ { trackId: 1 } ]));
+    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeStreamMultiTrafFragment(10, [{ trackId: 1 }]));
 
     assert.ok(floor);
     const feedState: LiveTsbFeedState = {
@@ -647,7 +652,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
       primeMediaFloorWrittenLiveMoofs: 50
     };
     const writer = new BackpressureWriter(() => proc.stdin, { signal: new AbortController().signal });
-    const ahead = makeStreamMultiTrafFragment(11, [ { trackId: 1 } ]);
+    const ahead = makeStreamMultiTrafFragment(11, [{ trackId: 1 }]);
 
     await consumeLiveStreamSegments(() => proc as never, feedState,
       makeMediaSubscription([{ data: ahead, type: "media" }]), () => writer, null, stubLog);

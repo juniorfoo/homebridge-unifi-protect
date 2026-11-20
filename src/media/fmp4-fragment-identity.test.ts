@@ -136,11 +136,11 @@ describe("fmp4 fragment identity", () => {
 
   test("reads tfdt baseMediaDecodeTime from test harness fragments", () => {
 
-    const fragment = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 12_345, sequenceNumber: 9 });
+    const fragment = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 12345, sequenceNumber: 9 });
     const identity = parseFmp4MediaFragmentIdentity(fragment.data);
 
     assert.ok(identity);
-    assert.equal(identity.baseMediaDecodeTime, 12_345);
+    assert.equal(identity.baseMediaDecodeTime, 12345);
     assert.equal(identity.sequenceNumber, 9);
   });
 
@@ -175,7 +175,7 @@ describe("fmp4 fragment identity", () => {
     const floor = { sequenceNumber: 10, trackDecodeTimes: { 1: 100, 2: 200 }, trackMfhdOnly: {} };
     const laggingBoth = makeMultiTrafFragment(9, [ { trackId: 1, baseMediaDecodeTime: 100 }, { trackId: 2, baseMediaDecodeTime: 200 } ]);
     const mixed = makeMultiTrafFragment(11, [ { trackId: 1, baseMediaDecodeTime: 100 }, { trackId: 2, baseMediaDecodeTime: 250 } ]);
-    const unknownTrack = makeMultiTrafFragment(11, [ { trackId: 3, baseMediaDecodeTime: 50 } ]);
+    const unknownTrack = makeMultiTrafFragment(11, [{ trackId: 3, baseMediaDecodeTime: 50 }]);
 
     assert.equal(shouldSkipLiveSegmentAfterCopyPrime(floor, laggingBoth, { atOrBefore: true }), true);
     assert.equal(shouldSkipLiveSegmentAfterCopyPrime(floor, mixed, { atOrBefore: true }), false);
@@ -184,11 +184,11 @@ describe("fmp4 fragment identity", () => {
 
   test("prime floor records each traf tfdt separately (video+audio without audio tfdt)", () => {
 
-    const dual = makeMultiTrafFragment(101, [ { trackId: 1, baseMediaDecodeTime: 900_000 }, { trackId: 2 } ]);
+    const dual = makeMultiTrafFragment(101, [ { trackId: 1, baseMediaDecodeTime: 900000 }, { trackId: 2 } ]);
     const floor = parsePrimeMediaFloorFromPrimingBuffer(dual);
 
     assert.ok(floor);
-    assert.equal(floor.trackDecodeTimes[1], 900_000);
+    assert.equal(floor.trackDecodeTimes[1], 900000);
     assert.equal(floor.trackMfhdOnly[2], true);
     assert.equal(floor.trackDecodeTimes[2], undefined);
     assert.equal(floor.sequenceNumber, 101);
@@ -196,24 +196,24 @@ describe("fmp4 fragment identity", () => {
 
   test("prime floor keeps both tracks when a moof carries timed video and audio trafs", () => {
 
-    const moof = makeMultiTrafFragment(101, [ { trackId: 2, baseMediaDecodeTime: 903_000 }, { trackId: 1, baseMediaDecodeTime: 900_000 } ]);
+    const moof = makeMultiTrafFragment(101, [ { trackId: 2, baseMediaDecodeTime: 903000 }, { trackId: 1, baseMediaDecodeTime: 900000 } ]);
     const floor = parsePrimeMediaFloorFromPrimingBuffer(moof);
 
     assert.ok(floor);
-    assert.equal(floor.trackDecodeTimes[1], 900_000);
-    assert.equal(floor.trackDecodeTimes[2], 903_000);
+    assert.equal(floor.trackDecodeTimes[1], 900000);
+    assert.equal(floor.trackDecodeTimes[2], 903000);
   });
 
   test("prime floor across dual-traf moofs never pairs orphan tfdt onto audio track 2", () => {
 
     const prime = Buffer.concat([
-      makeMultiTrafFragment(101, [ { trackId: 1, baseMediaDecodeTime: 900_000 }, { trackId: 2 } ]),
-      makeMultiTrafFragment(102, [ { trackId: 1, baseMediaDecodeTime: 903_000 }, { trackId: 2 } ])
+      makeMultiTrafFragment(101, [ { trackId: 1, baseMediaDecodeTime: 900000 }, { trackId: 2 } ]),
+      makeMultiTrafFragment(102, [ { trackId: 1, baseMediaDecodeTime: 903000 }, { trackId: 2 } ])
     ]);
     const floor = parsePrimeMediaFloorFromPrimingBuffer(prime);
 
     assert.ok(floor);
-    assert.equal(floor.trackDecodeTimes[1], 903_000);
+    assert.equal(floor.trackDecodeTimes[1], 903000);
     assert.equal(floor.trackMfhdOnly[2], true);
     assert.equal(floor.trackDecodeTimes[2], undefined);
   });
@@ -233,11 +233,11 @@ describe("fmp4 fragment identity", () => {
 
   test("primed video tfdt plus mfhd-only audio skips a full replay moof", () => {
 
-    const prime = makeMultiTrafFragment(101, [ { trackId: 1, baseMediaDecodeTime: 900_000 }, { trackId: 2 } ]);
+    const prime = makeMultiTrafFragment(101, [ { trackId: 1, baseMediaDecodeTime: 900000 }, { trackId: 2 } ]);
     const floor = parsePrimeMediaFloorFromPrimingBuffer(prime);
 
     assert.ok(floor);
-    const replay = makeMultiTrafFragment(101, [ { trackId: 1, baseMediaDecodeTime: 900_000 }, { trackId: 2 } ]);
+    const replay = makeMultiTrafFragment(101, [ { trackId: 1, baseMediaDecodeTime: 900000 }, { trackId: 2 } ]);
 
     assert.equal(shouldSkipLiveSegmentAfterCopyPrime(floor, replay, { atOrBefore: true }), true);
   });
@@ -255,7 +255,7 @@ describe("fmp4 fragment identity", () => {
   test("tfdt-ahead live moof is not skipped when mfhd is still at or before floor", () => {
 
     const floor = { sequenceNumber: 20, trackDecodeTimes: { 1: 100 }, trackMfhdOnly: {} };
-    const aheadTfdtLaggingMfhd = makeMultiTrafFragment(20, [ { trackId: 1, baseMediaDecodeTime: 200 } ]);
+    const aheadTfdtLaggingMfhd = makeMultiTrafFragment(20, [{ trackId: 1, baseMediaDecodeTime: 200 }]);
 
     assert.equal(shouldSkipLiveSegmentAfterCopyPrime(floor, aheadTfdtLaggingMfhd, { atOrBefore: true }), false);
   });
@@ -263,7 +263,7 @@ describe("fmp4 fragment identity", () => {
   test("applyPrime clears mfhd sequence when tracks are empty and live moof has no mfhd", () => {
 
     const floor = { sequenceNumber: 10, trackDecodeTimes: { 1: 100 }, trackMfhdOnly: {} };
-    const moofNoMfhd = makeContainer("moof", [ makeContainer("traf", [ makeTfhdBox(1), makeTfdtVersion0Box(200), makeTrunStub() ]) ]);
+    const moofNoMfhd = makeContainer("moof", [makeContainer("traf", [ makeTfhdBox(1), makeTfdtVersion0Box(200), makeTrunStub() ])]);
     const fragment = Buffer.concat([ moofNoMfhd, makeBox("mdat", Buffer.alloc(0)) ]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, fragment), true);
@@ -281,10 +281,10 @@ describe("fmp4 fragment identity", () => {
 
   test("applyPrime clears mfhd-only track on strictly-ahead sequence", () => {
 
-    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [ { trackId: 2 } ]));
+    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [{ trackId: 2 }]));
 
     assert.ok(floor);
-    const ahead = makeMultiTrafFragment(11, [ { trackId: 2 } ]);
+    const ahead = makeMultiTrafFragment(11, [{ trackId: 2 }]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, ahead), true);
     assert.equal(floor.trackMfhdOnly[2], undefined);
@@ -293,7 +293,7 @@ describe("fmp4 fragment identity", () => {
   test("applyPrime keeps mfhd sequence on equal live mfhd when track maps are empty", () => {
 
     const floor = { sequenceNumber: 10, trackDecodeTimes: {}, trackMfhdOnly: {} };
-    const mfhdOnlyMoof = makeContainer("moof", [ makeMfhdBox(10) ]);
+    const mfhdOnlyMoof = makeContainer("moof", [makeMfhdBox(10)]);
     const fragment = Buffer.concat([ mfhdOnlyMoof, makeBox("mdat", Buffer.alloc(0)) ]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, fragment), false);
@@ -303,7 +303,7 @@ describe("fmp4 fragment identity", () => {
   test("applyPrime keeps mfhd sequence on lagging live mfhd when track maps are empty", () => {
 
     const floor = { sequenceNumber: 10, trackDecodeTimes: {}, trackMfhdOnly: {} };
-    const mfhdOnlyMoof = makeContainer("moof", [ makeMfhdBox(9) ]);
+    const mfhdOnlyMoof = makeContainer("moof", [makeMfhdBox(9)]);
     const fragment = Buffer.concat([ mfhdOnlyMoof, makeBox("mdat", Buffer.alloc(0)) ]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, fragment), false);
@@ -369,13 +369,14 @@ describe("fmp4 fragment identity", () => {
     const prime = Buffer.concat([ init, first.data, last.data ]);
     const identity = parseLastMediaFragmentIdentityInPrimingBuffer(prime);
 
-    assert.equal(identity?.baseMediaDecodeTime, 777);
-    assert.equal(identity?.sequenceNumber, 88);
+    assert.ok(identity);
+    assert.equal(identity.baseMediaDecodeTime, 777);
+    assert.equal(identity.sequenceNumber, 88);
   });
 
   test("parseLastMediaFragmentIdentityInPrimingBuffer returns null when only embedded moof bytes exist", () => {
 
-    const embedded = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 55_555, sequenceNumber: 7 });
+    const embedded = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 55555, sequenceNumber: 7 });
     const prime = Buffer.concat([ Buffer.alloc(0), makeBox("mdat", embedded.moof) ]);
 
     assert.equal(parseLastMediaFragmentIdentityInPrimingBuffer(prime), null);
@@ -383,15 +384,16 @@ describe("fmp4 fragment identity", () => {
 
   test("parseLastMediaFragmentIdentityInPrimingBuffer ignores moof magic inside mdat payload", () => {
 
-    const decoyTiming = { baseMediaDecodeTime: 9_999_999, sequenceNumber: 1 };
+    const decoyTiming = { baseMediaDecodeTime: 9999999, sequenceNumber: 1 };
     const decoyBody = Buffer.concat([ Buffer.from("moof"), makeNonKeyframeFragment(undefined, decoyTiming).moof ]);
     const decoyMdat = makeBox("mdat", decoyBody);
-    const realLast = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 12_345, sequenceNumber: 42 });
+    const realLast = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 12345, sequenceNumber: 42 });
     const prime = Buffer.concat([ Buffer.alloc(0), decoyMdat, realLast.data ]);
     const identity = parseLastMediaFragmentIdentityInPrimingBuffer(prime);
 
-    assert.equal(identity?.baseMediaDecodeTime, 12_345);
-    assert.equal(identity?.sequenceNumber, 42);
+    assert.ok(identity);
+    assert.equal(identity.baseMediaDecodeTime, 12345);
+    assert.equal(identity.sequenceNumber, 42);
   });
 
   test("parseLastMediaFragmentIdentityInPrimingBuffer returns null when trailing box is truncated", () => {
@@ -405,7 +407,7 @@ describe("fmp4 fragment identity", () => {
 
   test("parseLastMediaFragmentIdentityInPrimingBuffer walks 64-bit largesize moof boxes", () => {
 
-    const innerMoof = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 55_555, sequenceNumber: 7 }).moof;
+    const innerMoof = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 55555, sequenceNumber: 7 }).moof;
     const moofPayload = innerMoof.subarray(8);
     const largesizeMoof = Buffer.alloc(16 + moofPayload.length);
 
@@ -419,14 +421,15 @@ describe("fmp4 fragment identity", () => {
     const prime = Buffer.concat([ Buffer.alloc(0), fragment ]);
     const identity = parseLastMediaFragmentIdentityInPrimingBuffer(prime);
 
-    assert.equal(identity?.baseMediaDecodeTime, 55_555);
-    assert.equal(identity?.sequenceNumber, 7);
+    assert.ok(identity);
+    assert.equal(identity.baseMediaDecodeTime, 55555);
+    assert.equal(identity.sequenceNumber, 7);
   });
 
   test("parse returns null when a child box claims more bytes than its parent", () => {
 
     const base = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 100, sequenceNumber: 5 });
-    const decoy = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 99_999, sequenceNumber: 88 });
+    const decoy = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 99999, sequenceNumber: 88 });
     const decoyTfdtAt = findNestedBoxOffset(decoy.moof, 0, decoy.moof.length, "tfdt");
     const decoyTfdtSize = decoy.moof.readUInt32BE(decoyTfdtAt);
     const decoyTfdt = decoy.moof.subarray(decoyTfdtAt, decoyTfdtAt + decoyTfdtSize);
@@ -506,10 +509,10 @@ describe("fmp4 fragment identity", () => {
 
   test("applyPrime clear drops mfhd fallback after a strictly-ahead mfhd-only fragment", () => {
 
-    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [ { trackId: 1 } ]));
+    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [{ trackId: 1 }]));
 
     assert.ok(floor);
-    const ahead = makeMultiTrafFragment(11, [ { trackId: 1 } ]);
+    const ahead = makeMultiTrafFragment(11, [{ trackId: 1 }]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, ahead), true);
     assert.equal(isPrimeMediaFloorEmpty(floor), true);
@@ -517,10 +520,10 @@ describe("fmp4 fragment identity", () => {
 
   test("mfhd-only clear does not fire on equal sequence (M1)", () => {
 
-    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [ { trackId: 1 } ]));
+    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [{ trackId: 1 }]));
 
     assert.ok(floor);
-    const equal = makeMultiTrafFragment(10, [ { trackId: 1 } ]);
+    const equal = makeMultiTrafFragment(10, [{ trackId: 1 }]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, equal), false);
     assert.equal(isPrimeMediaFloorEmpty(floor), false);
@@ -528,13 +531,13 @@ describe("fmp4 fragment identity", () => {
 
   test("mfhd-only clear ignores live moof with null mfhd sequence (M2)", () => {
 
-    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [ { trackId: 1 } ]));
+    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [{ trackId: 1 }]));
 
     assert.ok(floor);
     const tfhd = makeTfhdBox(1);
     const trun = makeTrunStub();
     const traf = makeContainer("traf", [ tfhd, trun ]);
-    const moof = makeContainer("moof", [ traf ]);
+    const moof = makeContainer("moof", [traf]);
     const live = Buffer.concat([ moof, makeBox("mdat", Buffer.alloc(0)) ]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, live), false);
@@ -545,13 +548,13 @@ describe("fmp4 fragment identity", () => {
 
   test("prime floor mfhd uses max across moofs not last only (M3)", () => {
 
-    const early = makeMultiTrafFragment(15, [ { trackId: 1 } ]);
-    const late = makeMultiTrafFragment(5, [ { trackId: 1 } ]);
+    const early = makeMultiTrafFragment(15, [{ trackId: 1 }]);
+    const late = makeMultiTrafFragment(5, [{ trackId: 1 }]);
     const floor = parsePrimeMediaFloorFromPrimingBuffer(Buffer.concat([ early, late ]));
 
     assert.ok(floor);
     assert.equal(floor.sequenceNumber, 15);
-    const between = makeMultiTrafFragment(12, [ { trackId: 1 } ]);
+    const between = makeMultiTrafFragment(12, [{ trackId: 1 }]);
 
     assert.equal(shouldSkipLiveSegmentAfterCopyPrime(floor, between, { atOrBefore: true }), true);
   });
@@ -559,8 +562,8 @@ describe("fmp4 fragment identity", () => {
   test("tfdt on primed track clears stale mfhd-only bookkeeping (M4 M5)", () => {
 
     const merged = parsePrimeMediaFloorFromPrimingBuffer(Buffer.concat([
-      makeMultiTrafFragment(10, [ { trackId: 1 } ]),
-      makeMultiTrafFragment(11, [ { trackId: 1, baseMediaDecodeTime: 200 } ])
+      makeMultiTrafFragment(10, [{ trackId: 1 }]),
+      makeMultiTrafFragment(11, [{ trackId: 1, baseMediaDecodeTime: 200 }])
     ]));
 
     assert.ok(merged);
@@ -578,7 +581,7 @@ describe("fmp4 fragment identity", () => {
       trackDecodeTimes: {},
       trackMfhdOnly: { 1: true as const, 2: true as const }
     };
-    const ahead = makeMultiTrafFragment(11, [ { trackId: 1 } ]);
+    const ahead = makeMultiTrafFragment(11, [{ trackId: 1 }]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, ahead), true);
     assert.equal(floor.trackMfhdOnly[1], undefined);
@@ -587,36 +590,36 @@ describe("fmp4 fragment identity", () => {
 
   test("shouldSkip false when mfhd missing on tfdt traf with mfhd-only floor (M9)", () => {
 
-    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [ { trackId: 1 } ]));
+    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [{ trackId: 1 }]));
 
     assert.ok(floor);
     const tfhd = makeTfhdBox(1);
     const tfdt = makeTfdtVersion0Box(500);
     const trun = makeTrunStub();
     const traf = makeContainer("traf", [ tfhd, tfdt, trun ]);
-    const live = Buffer.concat([ makeContainer("moof", [ traf ]), makeBox("mdat", Buffer.alloc(0)) ]);
+    const live = Buffer.concat([ makeContainer("moof", [traf]), makeBox("mdat", Buffer.alloc(0)) ]);
 
     assert.equal(shouldSkipLiveSegmentAfterCopyPrime(floor, live, { atOrBefore: true }), false);
   });
 
   test("shouldSkip false when mfhd missing on tfdt-less traf (M10)", () => {
 
-    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [ { trackId: 1 } ]));
+    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [{ trackId: 1 }]));
 
     assert.ok(floor);
     const tfhd = makeTfhdBox(1);
     const trun = makeTrunStub();
-    const live = Buffer.concat([ makeContainer("moof", [ makeContainer("traf", [ tfhd, trun ]) ]), makeBox("mdat", Buffer.alloc(0)) ]);
+    const live = Buffer.concat([ makeContainer("moof", [makeContainer("traf", [ tfhd, trun ])]), makeBox("mdat", Buffer.alloc(0)) ]);
 
     assert.equal(shouldSkipLiveSegmentAfterCopyPrime(floor, live, { atOrBefore: true }), false);
   });
 
   test("does not skip ahead mfhd when floor track is mfhd-only but live traf has tfdt (M11)", () => {
 
-    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [ { trackId: 1 } ]));
+    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [{ trackId: 1 }]));
 
     assert.ok(floor);
-    const ahead = makeMultiTrafFragment(11, [ { trackId: 1, baseMediaDecodeTime: 9_000 } ]);
+    const ahead = makeMultiTrafFragment(11, [{ trackId: 1, baseMediaDecodeTime: 9000 }]);
 
     assert.equal(shouldSkipLiveSegmentAfterCopyPrime(floor, ahead, { atOrBefore: true }), false);
   });
@@ -628,7 +631,7 @@ describe("fmp4 fragment identity", () => {
 
     mfhdPayload.writeUInt32BE(0, 0);
     mfhdPayload.writeUInt32BE(5, 4);
-    const emptyMoof = Buffer.concat([ makeContainer("moof", [ makeBox("mfhd", mfhdPayload) ]), makeBox("mdat", Buffer.alloc(0)) ]);
+    const emptyMoof = Buffer.concat([ makeContainer("moof", [makeBox("mfhd", mfhdPayload)]), makeBox("mdat", Buffer.alloc(0)) ]);
 
     assert.equal(shouldSkipLiveSegmentAfterCopyPrime(floor, emptyMoof, { atOrBefore: true }), false);
   });
@@ -636,7 +639,7 @@ describe("fmp4 fragment identity", () => {
   test("G2 clears tfdt floor when live traf lacks tfdt but mfhd is ahead (M19)", () => {
 
     const floor = livePrimeMediaFloorFromIdentity({ baseMediaDecodeTime: 100, sequenceNumber: 10, trackId: 1 });
-    const aheadMfhdOnlyTraf = makeMultiTrafFragment(12, [ { trackId: 1 } ]);
+    const aheadMfhdOnlyTraf = makeMultiTrafFragment(12, [{ trackId: 1 }]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, aheadMfhdOnlyTraf), true);
     assert.equal(floor.trackDecodeTimes[1], undefined);
@@ -645,7 +648,7 @@ describe("fmp4 fragment identity", () => {
   test("G2a does not clear tfdt floor on equal mfhd without tfdt", () => {
 
     const floor = livePrimeMediaFloorFromIdentity({ baseMediaDecodeTime: 100, sequenceNumber: 10, trackId: 1 });
-    const equalMfhdOnly = makeMultiTrafFragment(10, [ { trackId: 1 } ]);
+    const equalMfhdOnly = makeMultiTrafFragment(10, [{ trackId: 1 }]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, equalMfhdOnly), false);
     assert.equal(floor.trackDecodeTimes[1], 100);
@@ -654,7 +657,7 @@ describe("fmp4 fragment identity", () => {
   test("G2b null live mfhd does not clear tfdt floor (tfdt-less traf)", () => {
 
     const floor = livePrimeMediaFloorFromIdentity({ baseMediaDecodeTime: 100, sequenceNumber: 10, trackId: 1 });
-    const moofNoMfhd = makeContainer("moof", [ makeContainer("traf", [ makeTfhdBox(1), makeTrunStub() ]) ]);
+    const moofNoMfhd = makeContainer("moof", [makeContainer("traf", [ makeTfhdBox(1), makeTrunStub() ])]);
     const fragment = Buffer.concat([ moofNoMfhd, makeBox("mdat", Buffer.alloc(0)) ]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, fragment), false);
@@ -664,7 +667,7 @@ describe("fmp4 fragment identity", () => {
   test("G2c does not clear tfdt floor on lagging decode time", () => {
 
     const floor = livePrimeMediaFloorFromIdentity({ baseMediaDecodeTime: 200, sequenceNumber: 10, trackId: 1 });
-    const lagging = makeMultiTrafFragment(11, [ { trackId: 1, baseMediaDecodeTime: 100 } ]);
+    const lagging = makeMultiTrafFragment(11, [{ trackId: 1, baseMediaDecodeTime: 100 }]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, lagging), false);
     assert.equal(floor.trackDecodeTimes[1], 200);
@@ -678,7 +681,7 @@ describe("fmp4 fragment identity", () => {
     ]));
 
     assert.ok(floor);
-    const live = makeMultiTrafFragment(12, [ { trackId: 1 } ]);
+    const live = makeMultiTrafFragment(12, [{ trackId: 1 }]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, live), true);
     assert.equal(floor.trackDecodeTimes[1], undefined);
@@ -688,7 +691,7 @@ describe("fmp4 fragment identity", () => {
   test("G2e null floor mfhd blocks mfhd-only clear until ahead seq (G2e)", () => {
 
     const floor = { sequenceNumber: null, trackDecodeTimes: {}, trackMfhdOnly: { 1: true as const } };
-    const lagging = makeMultiTrafFragment(5, [ { trackId: 1 } ]);
+    const lagging = makeMultiTrafFragment(5, [{ trackId: 1 }]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, lagging), false);
     assert.equal(floor.trackMfhdOnly[1], true);
@@ -696,10 +699,10 @@ describe("fmp4 fragment identity", () => {
 
   test("G2f tfdt live traf clears mfhd-only floor entry for that track", () => {
 
-    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [ { trackId: 1 } ]));
+    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [{ trackId: 1 }]));
 
     assert.ok(floor);
-    const tfdtAhead = makeMultiTrafFragment(11, [ { trackId: 1, baseMediaDecodeTime: 9_000 } ]);
+    const tfdtAhead = makeMultiTrafFragment(11, [{ trackId: 1, baseMediaDecodeTime: 9000 }]);
 
     assert.equal(applyPrimeMediaFloorClearAfterComparableAheadLiveWrite(floor, tfdtAhead), true);
     assert.equal(floor.trackMfhdOnly[1], undefined);
@@ -707,12 +710,12 @@ describe("fmp4 fragment identity", () => {
 
   test("shouldSkip mfhd-only floor: lagging and equal sequence skipped, ahead written", () => {
 
-    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [ { trackId: 1 } ]));
+    const floor = parsePrimeMediaFloorFromPrimingBuffer(makeMultiTrafFragment(10, [{ trackId: 1 }]));
 
     assert.ok(floor);
-    const lagging = makeMultiTrafFragment(9, [ { trackId: 1 } ]);
-    const equal = makeMultiTrafFragment(10, [ { trackId: 1 } ]);
-    const ahead = makeMultiTrafFragment(11, [ { trackId: 1 } ]);
+    const lagging = makeMultiTrafFragment(9, [{ trackId: 1 }]);
+    const equal = makeMultiTrafFragment(10, [{ trackId: 1 }]);
+    const ahead = makeMultiTrafFragment(11, [{ trackId: 1 }]);
 
     assert.equal(shouldSkipLiveSegmentAfterCopyPrime(floor, lagging, { atOrBefore: true }), true);
     assert.equal(shouldSkipLiveSegmentAfterCopyPrime(floor, equal, { atOrBefore: true }), true);
@@ -721,15 +724,16 @@ describe("fmp4 fragment identity", () => {
 
   test("parseLastMediaFragmentIdentityInPrimingBuffer ignores moof inside last fragment mdat", () => {
 
-    const real = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 12_345, sequenceNumber: 42 });
-    const decoy = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 9_999_999, sequenceNumber: 1 });
+    const real = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 12345, sequenceNumber: 42 });
+    const decoy = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 9999999, sequenceNumber: 1 });
     const mdatBody = Buffer.concat([ real.mdat.subarray(8), decoy.moof ]);
     const lastFragment = Buffer.concat([ real.moof, makeBox("mdat", mdatBody) ]);
     const prime = Buffer.concat([ Buffer.alloc(0), makeKeyframeFragment().data, lastFragment ]);
     const identity = parseLastMediaFragmentIdentityInPrimingBuffer(prime);
 
-    assert.equal(identity?.baseMediaDecodeTime, 12_345);
-    assert.equal(identity?.sequenceNumber, 42);
+    assert.ok(identity);
+    assert.equal(identity.baseMediaDecodeTime, 12345);
+    assert.equal(identity.sequenceNumber, 42);
   });
 
   test("parse returns null on truncated mfhd and tfhd payloads", () => {
@@ -766,17 +770,17 @@ describe("fmp4 fragment identity", () => {
     assert.ok(v0Identity);
     assert.equal(v0Identity.baseMediaDecodeTime, 42);
 
-    const v1Moof = makeMoofWithTfdtVersion1(9_876_543_210, 11);
+    const v1Moof = makeMoofWithTfdtVersion1(9876543210, 11);
     const v1Identity = parseFmp4MediaFragmentIdentity(Buffer.concat([ v1Moof, makeBox("mdat", Buffer.alloc(0)) ]));
 
     assert.ok(v1Identity);
-    assert.equal(v1Identity.baseMediaDecodeTime, 9_876_543_210);
+    assert.equal(v1Identity.baseMediaDecodeTime, 9876543210);
     assert.equal(v1Identity.sequenceNumber, 11);
   });
 
   test("parse reads largesize mfhd tfdt and tfhd leaf boxes", () => {
 
-    const baseTime = 33_003;
+    const baseTime = 33003;
     const mfhdPayload = Buffer.alloc(8);
 
     mfhdPayload.writeUInt32BE(0, 0);
@@ -816,7 +820,7 @@ describe("fmp4 fragment identity", () => {
 
   test("parse and prime walk never throw on random truncation", () => {
 
-    const whole = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 12_345, sequenceNumber: 42 }).data;
+    const whole = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 12345, sequenceNumber: 42 }).data;
 
     for(let end = 0; end <= whole.length; end++) {
 
@@ -837,7 +841,7 @@ describe("fmp4 fragment identity", () => {
     const evil = Buffer.from(makeNonKeyframeFragment().data);
 
     Object.defineProperty(evil, "length", { value: evil.length });
-    evil.readUInt32BE = () => {
+    evil.readUInt32BE = (): number => {
 
       throw new Error("hostile read");
     };

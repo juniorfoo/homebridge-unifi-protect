@@ -792,31 +792,25 @@ export class TestConnection {
   // The state transitions the root's connection loop reads, each one a row delivers, until the loop's signal aborts.
   public async *observe({ signal }: { signal: AbortSignal }): AsyncGenerator<TestConnectionTransition> {
 
-    const release = onAbort(signal, () => this.#wake?.());
+    using _release = onAbort(signal, () => this.#wake?.());
 
-    try {
+    while(!signal.aborted) {
 
-      while(!signal.aborted) {
+      const next = this.#transitions.shift();
 
-        const next = this.#transitions.shift();
+      if(next) {
 
-        if(next) {
+        yield next;
 
-          yield next;
-
-          continue;
-        }
-
-        const { promise, resolve }: PromiseWithResolvers<void> = Promise.withResolvers();
-
-        this.#wake = resolve;
-
-        // eslint-disable-next-line no-await-in-loop -- The loop waits for one delivery at a time, as a live monitor's stream does.
-        await promise;
+        continue;
       }
-    } finally {
 
-      release[Symbol.dispose]();
+      const { promise, resolve }: PromiseWithResolvers<void> = Promise.withResolvers();
+
+      this.#wake = resolve;
+
+      // eslint-disable-next-line no-await-in-loop -- The loop waits for one delivery at a time, as a live monitor's stream does.
+      await promise;
     }
   }
 

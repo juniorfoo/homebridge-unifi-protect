@@ -4,8 +4,9 @@
  *
  * This module is heavily inspired by the homebridge and homebridge-camera-ffmpeg source code. Thank you for your contributions to the HomeKit world.
  */
+/* eslint-disable sort-imports -- production import block; order mirrors teardown coupling, not strict alphabetical sort. */
 import type { ControllerIdentity, StreamingDelegate, StreamingDelegateFactory } from "./stream-delegate.ts";
-import { AudioRecordingCodecType, AudioRecordingSamplerate, AudioStreamingCodecType, AudioStreamingSamplerate, FfmpegOptions,
+import { AudioRecordingCodecType, AudioStreamingCodecType, AudioStreamingSamplerate, FfmpegOptions,
   FfmpegStreamingProcess, H264Level, H264Profile, HKSV_FRAGMENT_LENGTH, HbpuAbortError, MediaContainerType, RtpDemuxer, SRTPCryptoSuites,
   StreamRequestTypes, VideoCodecType, formatBps, formatErrorMessage, formatUrlHost, guardedDispatch, isHbpuAbortReason, mqttTopic } from "homebridge-plugin-utils";
 import type { BackpressureWriter, Clock, HomebridgePluginLogging, IpFamily, Nullable, PortReservation } from "homebridge-plugin-utils";
@@ -30,9 +31,7 @@ import { ProtectTimeshiftSupervisor } from "./timeshift-supervisor.ts";
 import type { TalkbackSession } from "unifi-protect";
 import { resolveSessionSource } from "./stream-source-policy.ts";
 import { controllerIdentityOf, recordingAdvertisementOf, streamingSamplerates } from "./stream-delegate.ts";
-/* eslint-disable sort-imports -- multi-member telemetry import must follow single-member neighbor imports without reordering paths. */
-import type { LiveVideoEncodeDecision } from "./stream-transcode-policy.ts";
-import type { LiveStreamSessionSource } from "./stream-transcode-policy.ts";
+import type { LiveStreamSessionSource, LiveVideoEncodeDecision } from "./stream-transcode-policy.ts";
 import { resolveLiveTranscodeBitrate, shouldRegisterOngoingSessionEntry, shouldRemoveOngoingSessionEntry,
   shouldRemovePendingSessionEntry } from "./stream-transcode-policy.ts";
 import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, establishmentFailureStopReason, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart,
@@ -139,7 +138,7 @@ export interface ProtectStreamingDelegateTestOptions {
 function isProtectStreamingDelegateTestOptions(value: Pick<AdvertisedStreams, "audioFormat" | "probe"> | ProtectStreamingDelegateTestOptions):
   value is ProtectStreamingDelegateTestOptions {
 
-  return (value !== null) && (typeof value === "object") &&
+  return (typeof value === "object") &&
     (("onRotateSegmentWriter" in value) || ("recordCreateTsbResumeInvocation" in value));
 }
 
@@ -544,8 +543,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         audioIncomingRtpPort = (await reservePort(request.addressVersion, 2)).port;
 
         // Setup the RTP demuxer for two-way audio scenarios. The talkback URL is no longer fetched here - camera.talkback() negotiates it in startStream.
-        rtpDemuxer = new RtpDemuxer({ clock: this.platform.clock, inputPort: audioIncomingPort, ipFamily: request.addressVersion, log: this.log, rtcpPort: audioIncomingRtcpPort,
-          rtpPort: audioIncomingRtpPort, signal: abortController.signal });
+        rtpDemuxer = new RtpDemuxer({ clock: this.platform.clock, inputPort: audioIncomingPort, ipFamily: request.addressVersion, log: this.log,
+          rtcpPort: audioIncomingRtcpPort, rtpPort: audioIncomingRtpPort, signal: abortController.signal });
       }
 
       // Setup our video plumbing.

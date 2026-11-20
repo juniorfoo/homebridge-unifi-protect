@@ -253,18 +253,32 @@ export class ProtectCamera extends ProtectDevice<Camera> implements ProtectCamer
 
     const smartDetect = this.ufp.featureFlags.hasSmartDetect && this.hasFeature("Motion.SmartDetect");
 
-    // A regular camera stream is dense and continuous, so a modest probe is enough for FFmpeg to lock onto its format reliably without adding noticeable startup
-    // latency; the package camera's sparser stream needs a deeper probe of its own (see its own probesize override).
-    this.hints.probesize = 16384;
-    this.hints.smartDetect = smartDetect;
-    this.hints.smartDetectSensors = smartDetect && this.hasFeature("Motion.SmartDetect.ObjectSensors");
-    this.hints.transcode = this.hasFeature("Video.Transcode");
-    this.hints.transcodeBitrate = this.getFeatureNumber("Video.Transcode.Bitrate") ?? -1;
-    this.hints.transcodeHighLatency = this.hasFeature("Video.Transcode.HighLatency");
-    this.hints.transcodeHighLatencyBitrate = this.getFeatureNumber("Video.Transcode.HighLatency.Bitrate") ?? -1;
-    this.hints.tsbStreaming = this.hasFeature("Video.Timeshift.Livestream");
-    this.hints.twoWayAudio = this.ufp.featureFlags.hasSpeaker && this.hasFeature("Audio") && this.hasFeature("Audio.TwoWay");
-    this.hints.twoWayAudioDirect = this.ufp.featureFlags.hasSpeaker && this.hasFeature("Audio") && this.hasFeature("Audio.TwoWay.Direct");
+    this.hints = {
+
+      ...this.hints,
+      crop: this.hasFeature("Video.Crop"),
+      hardwareDecoding: true,
+      hardwareTranscoding: this.hasFeature("Video.Transcode.Hardware"),
+      highResSnapshots: this.hasFeature("Video.HighResSnapshots"),
+      hksvRecordingIndicator: this.hasFeature("Video.HKSV.StatusLedIndicator"),
+      ledStatus: this.ufp.featureFlags.hasLedStatus && this.hasFeature("Device.StatusLed"),
+      logDoorbell: this.hasFeature("Log.Doorbell"),
+      logHksv: this.hasFeature("Log.HKSV"),
+      nightVision: this.ufp.featureFlags.hasInfrared && this.hasFeature("Device.NightVision"),
+
+      // A regular camera stream is dense and continuous, so a modest probe is enough for FFmpeg to lock onto its format reliably without adding noticeable startup
+      // latency; the package camera's sparser stream needs a deeper probe of its own (see its own probesize override).
+      probesize: 16384,
+      smartDetect: smartDetect,
+      smartDetectSensors: smartDetect && this.hasFeature("Motion.SmartDetect.ObjectSensors"),
+      transcode: this.hasFeature("Video.Transcode"),
+      transcodeBitrate: this.getFeatureNumber("Video.Transcode.Bitrate") ?? -1,
+      transcodeHighLatency: this.hasFeature("Video.Transcode.HighLatency"),
+      transcodeHighLatencyBitrate: this.getFeatureNumber("Video.Transcode.HighLatency.Bitrate") ?? -1,
+      tsbStreaming: this.hasFeature("Video.Timeshift.Livestream"),
+      twoWayAudio: this.ufp.featureFlags.hasSpeaker && this.hasFeature("Audio") && this.hasFeature("Audio.TwoWay"),
+      twoWayAudioDirect: this.ufp.featureFlags.hasSpeaker && this.hasFeature("Audio") && this.hasFeature("Audio.TwoWay.Direct")
+    };
 
     // Sanity check our target transcoding bitrates, if defined.
     if(!this.hints.transcodeBitrate || (this.hints.transcodeBitrate <= 0)) {

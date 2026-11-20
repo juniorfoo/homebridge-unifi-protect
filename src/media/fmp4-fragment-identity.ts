@@ -85,7 +85,7 @@ interface ParsedBox {
 
 const readBoxType = (data: Buffer, offset: number): string => data.subarray(offset + 4, offset + 8).toString("ascii");
 
-const payloadSlice = (data: Buffer, box: ParsedBox): { end: number; start: number } => ({
+const payloadSlice = (_data: Buffer, box: ParsedBox): { end: number; start: number } => ({
 
   end: box.end,
   start: box.start + box.headerSize
