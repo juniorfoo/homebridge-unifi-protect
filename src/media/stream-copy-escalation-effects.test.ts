@@ -102,9 +102,22 @@ function makeDiagnostics(sessionInfo: SessionInfoStub): CopyEscalationSessionDia
     hardwareTranscode: false,
     liveEncodeRebuild: {
 
+      bufferForcedTranscodeReason: null,
       channelProfile: stubChannel,
       ffmpegArgsThroughVideoMap: [ "-f", "mp4", "-i", "pipe:0" ],
+      fmp4InitSegmentData: null,
+      forceTranscodeDueToUserOption: false,
+      homeKitVideo: {
+
+        fps: 15,
+        h264Level: H264Level.LEVEL3_1,
+        h264Profile: H264Profile.MAIN,
+        height: 1080,
+        maxBitRateKbps: 800,
+        width: 1920
+      },
       isHighLatency: false,
+      preferCopyChannel: true,
       request: {
 
         audio: { channel: 1, max_bit_rate: 64, pt: 110, sample_rate: 16, type: 0 },
@@ -112,6 +125,7 @@ function makeDiagnostics(sessionInfo: SessionInfoStub): CopyEscalationSessionDia
         video: { fps: 15, height: 1080, level: H264Level.LEVEL3_1, max_bit_rate: 800, profile: H264Profile.MAIN, pt: 96, type: 0, width: 1920 }
       } as unknown as StreamLiveEncodeRebuild["request"],
       sessionInfo: sessionInfo,
+      sessionSource: "buffer" as const,
       transcodeTargetBitrate: 800,
       useInterpolationFilter: false,
       useTsb: true

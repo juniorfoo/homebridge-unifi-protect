@@ -1964,6 +1964,64 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     await stopActiveSession(ctx, startRequest.sessionID);
   });
 
+  test("RECONFIGURE immaterial bitrate on an H.264 copy session does not replan the encoder", async () => {
+
+    const ctx = createHarness();
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    const startRequest = makeStartRequest();
+
+    await prepareAndStart(ctx, startRequest);
+    assert.equal(ctx.spawnedArgs.length, 1);
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({
+
+        ...startRequest,
+        type: StreamRequestTypes.RECONFIGURE,
+        video: { ...startRequest.video, max_bit_rate: startRequest.video.max_bit_rate + 50 }
+      }, (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(ctx.spawnedArgs.length, 1, "immaterial copy bitrate must not spawn a replacement encoder");
+    assert.ok(!ctx.logEntries.some((entry) => entry.message.includes("Replanning live view")));
+
+    await stopActiveSession(ctx, startRequest.sessionID);
+  });
+
+  test("RECONFIGURE material fps change replans the live encoder in place", async () => {
+
+    const ctx = createHarness();
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    const startRequest = makeStartRequest();
+
+    await prepareAndStart(ctx, startRequest);
+    assert.equal(ctx.spawnedArgs.length, 1);
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({
+
+        ...startRequest,
+        type: StreamRequestTypes.RECONFIGURE,
+        video: { ...startRequest.video, fps: 10 }
+      }, (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    await waitFor(() => ctx.spawnedArgs.length > 1, "replan spawn");
+    assert.ok(ctx.logEntries.some((entry) => entry.message.includes("Replanning live view")));
+    await stopActiveSession(ctx, startRequest.sessionID);
+  });
+
   test("IPv6 zone refusal on start disposes prepared session without spawning video ffmpeg", async () => {
 
     let disposeCalls = 0;

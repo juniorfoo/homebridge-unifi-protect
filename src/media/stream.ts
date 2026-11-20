@@ -37,7 +37,9 @@ import { resolveLiveTranscodeBitrate, shouldRegisterOngoingSessionEntry, shouldR
 import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, establishmentFailureStopReason, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart,
   formatStreamSessionStop, recordStreamMediaActivityIfOwner } from "./stream-telemetry.ts";
 import type { LiveTsbFeedState } from "./stream-live-feed.ts";
-import { consumeLiveStreamSegments, createTsbSegmentWriterRail } from "./stream-live-feed.ts";
+import { consumeLiveStreamSegments, createTsbSegmentWriterRail, primeLiveFfmpegStdinAfterRespawn } from "./stream-live-feed.ts";
+import { homeKitStreamVideoSnapshotFromRequest, isMaterialLiveStreamReconfigure } from "./stream-reconfigure.ts";
+import type { HomeKitStreamVideoSnapshot } from "./stream-reconfigure.ts";
 import { appendLiveVideoEncodeToFfmpegArgs, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge, formatLiveEncodeDecisionLog,
   resolveCopyEscalationKeyframePrimingBuffer, resolveFmp4InitForLiveDeclaredCheck, resolveStartStreamEncodePlan, resolveStartStreamForceTranscodeDueToUserOption,
   resolveLiveStreamTranscodePipelineOptions, resolveStreamEgressBitrateBps, resolveTimeshiftBufferLiveChannel,
@@ -48,15 +50,25 @@ import type { CopyEscalationTsbResume, StreamLiveEncodeRebuild } from "./stream-
 import { spawnLiveVideoFfmpegProcess } from "./stream-live-ffmpeg-spawn.ts";
 /* eslint-enable sort-imports */
 
+interface StreamReconfigureHandles {
+
+  copyEscalationInFlightRef: { current: boolean };
+  createTsbResume: () => CopyEscalationTsbResume | undefined;
+  wireFfmpegExitBridge: (process: ProtectStreamingFfmpegProcess) => void;
+}
+
 interface StreamSessionDiagnostics {
 
   escalatedFromCopy: boolean;
   firstFrameMs?: number | null;
   hardwareTranscode: boolean;
+  homeKitVideo?: HomeKitStreamVideoSnapshot;
   liveEncodeRebuild?: StreamLiveEncodeRebuild;
   outputWatchdog: StreamOutputWatchdog;
   path: string;
   profile: string;
+  reconfigureHandles?: StreamReconfigureHandles;
+  reconfigureInFlight?: boolean;
   segmentsFed: number;
   sessionStartedAt: number;
   stopLogged: boolean;
@@ -1286,13 +1298,22 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     sessionInfo.abortController.signal.addEventListener("abort", () => ffmpegAbort.abort(sessionInfo.abortController.signal.reason), { once: true });
 
+    const homeKitVideo = homeKitStreamVideoSnapshotFromRequest(request.video);
+
+    sessionDiagnostics.homeKitVideo = homeKitVideo;
     sessionDiagnostics.liveEncodeRebuild = {
 
+      bufferForcedTranscodeReason: bufferForcedTranscodeReason,
       channelProfile: channelProfile,
       ffmpegArgsThroughVideoMap: ffmpegArgsBeforeVideoEncode,
+      fmp4InitSegmentData: fmp4InitForDeclared,
+      forceTranscodeDueToUserOption: forceTranscodeDueToUserOption,
+      homeKitVideo: homeKitVideo,
       isHighLatency: isHighLatency,
+      preferCopyChannel: preferCopyChannel,
       request: request,
       sessionInfo: sessionInfo,
+      sessionSource: sessionSource,
       transcodeTargetBitrate: transcodeTargetBitrate,
       useInterpolationFilter: useInterpolationFilter,
       useTsb: useTsb
@@ -1406,6 +1427,33 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     });
 
     wireFfmpegExitBridge(activeFfmpeg);
+
+    sessionDiagnostics.reconfigureHandles = {
+
+      copyEscalationInFlightRef: copyEscalationInFlightRef,
+      createTsbResume: (): CopyEscalationTsbResume | undefined => {
+
+        if(!(useTsb && tsbWriterRail && subscription)) {
+
+          return undefined;
+        }
+
+        const bufferProfile = this.timeshift?.buffer.channelProfile;
+        const pooledLiveAndBuffer = !this.protectCamera.hasFeature("Debug.Video.Timeshift.UseRtsp");
+        const liveProfile = subscriptionChannelProfile ?? channelProfile;
+        const keyframePrimingBuffer = resolveCopyEscalationKeyframePrimingBuffer(bufferProfile, liveProfile,
+          this.timeshift?.buffer.getInitPlusTrailingFromLastKeyframe() ?? null, pooledLiveAndBuffer);
+
+        return createCopyEscalationTsbResume({
+
+          feedState: tsbFeedState,
+          keyframePrimingBuffer: keyframePrimingBuffer,
+          rail: tsbWriterRail,
+          subscription: subscription
+        });
+      },
+      wireFfmpegExitBridge: wireFfmpegExitBridge
+    };
 
     // Register the video FFmpeg before pooled livestream establishment completes so an eligible copy failure can escalate instead of disposing the subscription.
     if(shouldRegisterOngoingSessionEntry(this.ongoingSessions.get(request.sessionID), sessionInfo)) {
@@ -1711,6 +1759,171 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     }
   }
 
+  private reselectRtspChannelForLiveReconfigure(request: StartStreamRequest, preferCopyChannel: boolean): ChannelProfile | null {
+
+    const usesHardwareEncoder = this.ffmpegOptions.hardwareEncodes("stream");
+
+    if(preferCopyChannel) {
+
+      return this.protectCamera.selectChannel(request.video.width, request.video.height, { bias: "nearest" });
+    }
+
+    return this.protectCamera.selectChannel(
+      usesHardwareEncoder ? 3840 : request.video.width,
+      usesHardwareEncoder ? 2160 : request.video.height,
+      { bias: "higher", maxPixels: this.ffmpegOptions.maxSourcePixels("stream") }
+    );
+  }
+
+  private resolveEncodePlanAfterHomeKitReconfigure(updatedRequest: StartStreamRequest,
+    rebuild: StreamLiveEncodeRebuild): ReturnType<typeof resolveStartStreamEncodePlan> | null {
+
+    let channelProfile = rebuild.channelProfile;
+    let bufferForcedTranscodeReason = rebuild.bufferForcedTranscodeReason;
+
+    if(rebuild.useTsb) {
+
+      const bufferProfile = this.timeshift?.buffer.channelProfile;
+
+      if(bufferProfile) {
+
+        const resolved = resolveTimeshiftBufferLiveChannel(bufferProfile, this.protectCamera);
+
+        channelProfile = resolved.encodeProfile;
+        bufferForcedTranscodeReason = resolved.forcedTranscodeReason;
+      }
+    } else {
+
+      const reselected = this.reselectRtspChannelForLiveReconfigure(updatedRequest, rebuild.preferCopyChannel);
+
+      if(reselected) {
+
+        channelProfile = reselected;
+      }
+    }
+
+    const encodePlan = resolveStartStreamEncodePlan({
+
+      bufferForcedTranscodeReason: bufferForcedTranscodeReason, channelProfile: channelProfile, ffmpegOptions: this.ffmpegOptions,
+      fmp4InitSegmentData: rebuild.fmp4InitSegmentData, forceTranscodeDueToUserOption: rebuild.forceTranscodeDueToUserOption,
+      homeKitBitrateKbps: updatedRequest.video.max_bit_rate, isHighLatency: rebuild.isHighLatency, preferCopyChannel: rebuild.preferCopyChannel,
+      protectCamera: this.protectCamera, request: updatedRequest, sessionSource: rebuild.sessionSource, useTsb: rebuild.useTsb
+    });
+
+    if(encodePlan.transcodeReselectMissing) {
+
+      this.log.warn("HomeKit RECONFIGURE left no valid RTSP stream profile for the new request; keeping the running encoder.");
+
+      return null;
+    }
+
+    return encodePlan;
+  }
+
+  private async replanLiveStreamForHomeKitReconfigure(sessionId: string, updatedRequest: StartStreamRequest,
+    encodePlan: ReturnType<typeof resolveStartStreamEncodePlan>, reason: string): Promise<void> {
+
+    const owner = this.sessionDiagnosticsById.get(sessionId);
+    const ongoing = this.ongoingSessions.get(sessionId);
+    const rebuild = owner?.liveEncodeRebuild;
+    const handles = owner?.reconfigureHandles;
+
+    if(!owner || !ongoing || !rebuild || !handles || owner.reconfigureInFlight) {
+
+      return;
+    }
+
+    const priorFfmpeg = ongoing.ffmpeg[0];
+
+    if(!priorFfmpeg) {
+
+      return;
+    }
+
+    owner.reconfigureInFlight = true;
+    handles.copyEscalationInFlightRef.current = true;
+
+    const ffmpegAbort = new AbortController();
+    const sessionSignal = rebuild.sessionInfo.abortController.signal;
+    const linkSessionAbort = (): void => {
+
+      if(!ffmpegAbort.signal.aborted) {
+
+        ffmpegAbort.abort(sessionSignal.reason);
+      }
+    };
+
+    const unlinkSessionAbort = (): void => {
+
+      sessionSignal.removeEventListener("abort", linkSessionAbort);
+    };
+
+    if(sessionSignal.aborted) {
+
+      linkSessionAbort();
+    } else {
+
+      sessionSignal.addEventListener("abort", linkSessionAbort);
+    }
+
+    try {
+
+      const { channelProfile, encodeDecision, encoderBitrate, isTranscoding, transcodeTargetBitrate } = encodePlan;
+      const nextSnapshot = homeKitStreamVideoSnapshotFromRequest(updatedRequest.video);
+      const livePipelineOptions = resolveLiveStreamTranscodePipelineOptions(this.protectCamera, encodeDecision, channelProfile, updatedRequest, encoderBitrate,
+        rebuild.useInterpolationFilter);
+      const sessionInfo = rebuild.sessionInfo as SessionInfo;
+      const ffmpegArgsThroughVideoMap = this.buildLiveFfmpegArgsThroughVideoMap(channelProfile, updatedRequest, sessionInfo, rebuild.useTsb,
+        encodeDecision, livePipelineOptions);
+
+      rebuild.channelProfile = channelProfile;
+      rebuild.ffmpegArgsThroughVideoMap = ffmpegArgsThroughVideoMap;
+      rebuild.request = updatedRequest;
+      rebuild.transcodeTargetBitrate = transcodeTargetBitrate;
+      rebuild.homeKitVideo = nextSnapshot;
+
+      this.log.info("Replanning live view stream for HomeKit RECONFIGURE (%s).", reason);
+      priorFfmpeg.abort(new HbpuAbortError("replaced"));
+
+      const respawned = this.spawnLiveVideoFfmpeg(ffmpegArgsThroughVideoMap, encodeDecision, channelProfile, updatedRequest, sessionInfo,
+        encoderBitrate, rebuild.useInterpolationFilter, rebuild.useTsb, ffmpegAbort, livePipelineOptions);
+
+      if(this.sessionDiagnosticsById.get(sessionId) !== owner) {
+
+        respawned.abort(new HbpuAbortError("replaced"));
+
+        return;
+      }
+
+      ongoing.ffmpeg[0] = respawned;
+      owner.transcode = isTranscoding;
+      owner.videoCopy = !isTranscoding;
+      owner.hardwareTranscode = isTranscoding && this.ffmpegOptions.hardwareEncodes("stream");
+      owner.profile = channelProfile.name;
+      owner.homeKitVideo = nextSnapshot;
+
+      const tsbResume = handles.createTsbResume();
+
+      if(tsbResume) {
+
+        tsbResume.rotateSegmentWriter(respawned);
+        primeLiveFfmpegStdinAfterRespawn(tsbResume.feedState, tsbResume.subscription, respawned, tsbResume.keyframePrimingBuffer, this.log);
+      }
+
+      handles.wireFfmpegExitBridge(respawned);
+
+      await respawned.ready;
+    } catch(error) {
+
+      this.log.error("Unable to replan the live view stream after HomeKit RECONFIGURE: %s.", formatErrorMessage(error));
+    } finally {
+
+      unlinkSessionAbort();
+      handles.copyEscalationInFlightRef.current = false;
+      owner.reconfigureInFlight = false;
+    }
+  }
+
   // Process incoming stream requests. HomeKit invokes this without awaiting; the START case is async (startStream), so the whole dispatch is routed through
   // guardedDispatch to keep a fault from floating and to answer the callback exactly once. The RECONFIGURE and STOP cases are synchronous and answer immediately.
   public handleStreamRequest(request: StreamingRequest, callback: StreamRequestCallback): void {
@@ -1732,10 +1945,44 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
       case StreamRequestTypes.RECONFIGURE:
 
-        // HomeKit's reconfigure request has no effect on the running FFmpeg process: there is no way to adjust an already-spawned FFmpeg's encoding parameters
-        // mid-stream, so we log the request and acknowledge it without acting on it.
         this.log.debug("Streaming parameters adjustment requested by HomeKit: %sx%s, %s fps, %s.",
           request.video.width, request.video.height, request.video.fps, formatBps(request.video.max_bit_rate * 1000));
+
+        {
+
+          const sessionOwner = this.sessionDiagnosticsById.get(request.sessionID);
+          const rebuild = sessionOwner?.liveEncodeRebuild;
+
+          if(sessionOwner && rebuild) {
+
+            const owner = sessionOwner;
+
+            const updatedRequest = { ...rebuild.request, video: { ...rebuild.request.video, ...request.video } };
+            const nextSnapshot = homeKitStreamVideoSnapshotFromRequest(updatedRequest.video);
+            const encodePlan = this.resolveEncodePlanAfterHomeKitReconfigure(updatedRequest, rebuild);
+
+            if(encodePlan) {
+
+              const decision = isMaterialLiveStreamReconfigure({
+
+                next: nextSnapshot,
+                nextEncode: encodePlan.encodeDecision.mode,
+                previous: owner.homeKitVideo,
+                previousEncode: owner.videoCopy ? "copy" : "transcode"
+              });
+
+              if(decision.material) {
+
+                void this.replanLiveStreamForHomeKitReconfigure(request.sessionID, updatedRequest, encodePlan, decision.reason);
+              } else {
+
+                owner.homeKitVideo = nextSnapshot;
+                rebuild.request = updatedRequest;
+                rebuild.homeKitVideo = nextSnapshot;
+              }
+            }
+          }
+        }
 
         callback();
 
