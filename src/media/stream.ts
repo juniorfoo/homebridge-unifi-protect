@@ -103,7 +103,7 @@ interface SessionInfo {
   // RTP port reservations.
   rtpPortReservations: PortReservation[];
 
-  // The package-camera flashlight this session lit, if any, recorded so the single prepared-session disposal path (and a normal stop) can turn it back off. It is set at
+  // Whether this session lit the package-camera flashlight, recorded so the single prepared-session disposal path (and a normal stop) can turn it back off. It is set at
   // the toggle site in startStream, after the session survives channel selection but before the establishment wait - the one window a failed start could otherwise leave
   // it latched on with no ongoing entry to reach it.
   toggleLight?: boolean;
@@ -122,9 +122,8 @@ interface SessionInfo {
 
 // Classify a talkback teardown as a clean stop rather than a fault: either the session's own AbortController fired (our own teardown), or the shipped typed caller-abort
 // surfaced. Three talkback-adjacent failure sites in startStream - the RTP-demuxer mediaReady wait, the open-call catch, and the in-flight send catch - consume this one
-// definition, so the clean-versus-fault
-// decision lives in a single place. The signal.aborted arm is required, not the error type alone: a clean send-stop rejects with ProtectNetworkError rather than
-// ProtectAbortedError, because the shared signal's abort listener races ahead of send's own onAbort.
+// definition, so the clean-versus-fault decision lives in a single place. The signal.aborted arm is required, not the error type alone: a clean send-stop rejects with
+// ProtectNetworkError rather than ProtectAbortedError, because the shared signal's abort listener races ahead of send's own onAbort.
 function isCleanTalkbackStop(error: unknown, signal: AbortSignal): boolean {
 
   return signal.aborted || (error instanceof ProtectAbortedError);
@@ -135,17 +134,18 @@ export interface ProtectStreamingDelegateTestOptions {
 
   onRotateSegmentWriter?: (event: { poisoned: BackpressureWriter; replacement: BackpressureWriter }) => void;
   recordCreateTsbResumeInvocation?: () => void;
+  recordDisposePreparedSession?: () => void;
   recordReturnAudioFfmpegArgs?: (args: string[]) => void;
-  /** When set, skip awaiting rtpDemuxer.mediaReady before spawning return-audio FFmpeg (harness only). */
-  skipTalkbackMediaReadyWait?: boolean;
+  /** Replace the live RTP demuxer with a harness double (start-path integration tests only). */
+  substituteRtpDemuxer?: (init: { signal: AbortSignal }) => RtpDemuxer;
 }
 
 function isProtectStreamingDelegateTestOptions(value: Pick<AdvertisedStreams, "audioFormat" | "probe"> | ProtectStreamingDelegateTestOptions):
   value is ProtectStreamingDelegateTestOptions {
 
   return (typeof value === "object") &&
-    (("onRotateSegmentWriter" in value) || ("recordCreateTsbResumeInvocation" in value) || ("recordReturnAudioFfmpegArgs" in value) ||
-    ("skipTalkbackMediaReadyWait" in value));
+    (("onRotateSegmentWriter" in value) || ("recordCreateTsbResumeInvocation" in value) || ("recordDisposePreparedSession" in value) ||
+    ("recordReturnAudioFfmpegArgs" in value) || ("substituteRtpDemuxer" in value));
 }
 
 /* One camera's probesize self-tuning: how many bytes FFmpeg is told to analyze before it may act on a stream, raised whenever FFmpeg gives up trying to make sense of
@@ -260,7 +260,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
   private abTest = false;
   private readonly streamTestOptions: ProtectStreamingDelegateTestOptions | undefined;
 
-  // Create an instance of a HomeKit streaming delegate.
+  // Create an instance of a HomeKit streaming delegate. The derived audio half - the recording audio format the camera's derivation read from its livestream and the
+  // probe subscription that read it - defaults to nothing read, which advertises the stand-in and hands the supervisor nothing to adopt.
   constructor(protectCamera: ProtectCameraHost, resolutions: Resolution[],
     derivedOrTest: Pick<AdvertisedStreams, "audioFormat" | "probe"> | ProtectStreamingDelegateTestOptions = { audioFormat: null, probe: null }) {
 
@@ -544,9 +545,10 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         // The audioIncomingRtpPort reservation owns port and port + 1 (FFmpeg's "RTP port N implies RTCP port N+1" convention), so we only read its first port.
         audioIncomingRtpPort = (await reservePort(request.addressVersion, 2)).port;
 
-        // Setup the RTP demuxer for two-way audio scenarios. The talkback URL is no longer fetched here - camera.talkback() negotiates it in startStream.
-        rtpDemuxer = new RtpDemuxer({ clock: this.platform.clock, inputPort: audioIncomingPort, ipFamily: request.addressVersion, log: this.log,
-          rtcpPort: audioIncomingRtcpPort, rtpPort: audioIncomingRtpPort, signal: abortController.signal });
+        // Setup the RTP demuxer for two-way audio scenarios. The talkback URL is negotiated separately: camera.talkback() resolves it in startStream.
+        rtpDemuxer = this.streamTestOptions?.substituteRtpDemuxer?.({ signal: abortController.signal }) ??
+          new RtpDemuxer({ clock: this.platform.clock, inputPort: audioIncomingPort, ipFamily: request.addressVersion, log: this.log,
+            rtcpPort: audioIncomingRtcpPort, rtpPort: audioIncomingRtpPort, signal: abortController.signal });
       }
 
       // Setup our video plumbing.
@@ -603,9 +605,9 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       audio: {
 
         port: (hasAudioSupport && this.protectCamera.hints.twoWayAudio) ? audioIncomingPort : audioIncomingRtcpPort,
-        // eslint-disable-next-line camelcase
+        // eslint-disable-next-line camelcase -- The property name is the one the HomeKit streaming response type defines.
         srtp_key: request.audio.srtp_key,
-        // eslint-disable-next-line camelcase
+        // eslint-disable-next-line camelcase -- The property name is the one the HomeKit streaming response type defines.
         srtp_salt: request.audio.srtp_salt,
         ssrc: audioSSRC
       },
@@ -613,9 +615,9 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       video: {
 
         port: videoReturnPort,
-        // eslint-disable-next-line camelcase
+        // eslint-disable-next-line camelcase -- The property name is the one the HomeKit streaming response type defines.
         srtp_key: request.video.srtp_key,
-        // eslint-disable-next-line camelcase
+        // eslint-disable-next-line camelcase -- The property name is the one the HomeKit streaming response type defines.
         srtp_salt: request.video.srtp_salt,
         ssrc: videoSSRC
       }
@@ -738,7 +740,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     // Select the streams our single tee-muxed output carries. Protect actually maps audio and video tracks in opposite locations from where FFmpeg typically expects
     // them, so we name the track locations generally rather than positionally in case Protect changes this in the future. The video map always binds, and a bound
-    // explicit map disables FFmpeg's automatic stream selection for the whole output...that is load-bearing for the audio map's optionality: when the input carries no
+    // explicit map disables FFmpeg's automatic stream selection for the whole output...which is why the audio map must stay optional: when the input carries no
     // audio track (the livestream API can transiently deliver an fMP4 without one, and an RTSP stream can carry a track layout the index-specific map misses), the
     // audio map simply matches nothing rather than inviting automatic selection to improvise a substitute into the audio sink.
     //
@@ -763,8 +765,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     // -codec:a                         Encode using the codecs available to us on given platforms.
     // -profile:a 38                    Specify enhanced, low-delay AAC for HomeKit.
     // -flags:a +global_header          Sets the global header in the audio bitstream. Needed for FDK-AAC to correctly initialize. For encoders like aac_at it becomes a
-    //                                  no-op. The :a specifier is load-bearing: with a single output, an unqualified option binds to every stream it can apply to, and
-    //                                  a global header on the video encoder would strip the in-band SPS and PPS that HomeKit requires from RTP video.
+    //                                  no-op. The :a specifier is required, not incidental: with a single output, an unqualified option binds to every stream it can
+    //                                  apply to, and a global header on the video encoder would strip the in-band SPS and PPS that HomeKit requires from RTP video.
     // -ar samplerate                   Sample rate to use for this audio. This is specified by HomeKit.
     // -b:a bitrate                     Bitrate to use for this audio stream. This is specified by HomeKit.
     // -ac number                       Set the number of audio channels.
@@ -781,10 +783,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         "-ac", request.audio.channel.toString()
       );
 
-      // If we are audio filtering, address it here.
-      // The input sample rate FFmpeg's audio filters operate on is the camera's livestream (fMP4) audio rate that livestreamAudioSampleRate owns, independent of the
-      // output rate HomeKit requests. getAudioFilters checks each filter's frequency against that rate's Nyquist limit, so a doorbell's higher source rate lifts the
-      // ceiling far enough that a user's 8-24 kHz highpass/lowpass passes through on a doorbell.
+      // If we are audio filtering, address it here, at the output rate HomeKit requested for this stream.
       ffmpegArgs.push(...liveAudioFilterArgs(this.protectCamera, request.audio.sample_rate));
     }
 
@@ -842,12 +841,12 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
   private appendLiveSrtpTeeSinks(ffmpegArgs: string[], request: StartStreamRequest, sessionInfo: SessionInfo): void {
 
-    // Send the stream to HomeKit through a single tee-muxed output rather than two top-level outputs. The distinction is load-bearing: a top-level output that ends up
+    // Send the stream to HomeKit through a single tee-muxed output rather than two top-level outputs. The distinction matters: a top-level output that ends up
     // with no streams is a fatal error for the entire command, while a tee sink is isolable...this is the shape that lets a session survive its optional audio map
     // matching nothing. Video and audio are routed to their negotiated SRTP destinations with per-sink select filters, and only the audio sink carries onfail=ignore:
     // an input without an audio track costs us that sink alone, degrading the session to video-only - the truth of the input - while a failure on the video sink
     // keeps tee's default behavior and ends the session loudly. Because no input to this command is synthetic or unbounded, every output stream ends when the camera
-    // input does, and FFmpeg's organic exit on input EOF is a design invariant here...the teardown in consumeStreamSegments depends on it.
+    // input does, and FFmpeg's organic exit on input EOF is a rule this design relies on here...the teardown in consumeStreamSegments depends on it.
     //
     // The options inside each sink's brackets combine tee's own per-sink directives - format, stream routing, and failure policy - with options that pass through to
     // that sink's RTP muxer and SRTP protocol:
@@ -994,7 +993,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       return;
     }
 
-    // High-latency live views (HomeKit audio packet_time >= 60ms) bias toward transcode unless the user opts out via Video.Transcode / Video.Transcode.HighLatency.
+    // Decide whether this session re-encodes the video, and read the connection's latency from the negotiated audio packet time. Both are a pure policy over the user's
+    // configured hints and the camera's codec - stream-encode-policy.ts carries the full rationale for each circumstance that forces a transcode.
     const isHighLatency = request.audio.packet_time >= 60;
 
     // Copy vs transcode is decided in resolveStartStreamEncodePlan / decideLiveVideoEncode (user options, crop, codec, RTSP, avcC prefix, geometry).
@@ -1002,12 +1002,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     const forceTranscodePipeline = this.protectCamera.hints.crop || (this.protectCamera.ufp.videoCodec !== "h264") || forceTranscodeDueToUserOption;
     const preferCopyChannel = !forceTranscodePipeline;
 
-    // Set the initial bitrate we should use for this request based on what HomeKit is requesting.
     let targetBitrate = request.video.max_bit_rate;
 
     // Resolve which transport this live view draws from: the standing timeshift buffer's pooled socket, or a direct RTSP session. The decision is a pure policy over the
-    // camera's current facts (the buffer-backed-livestreaming toggle, the recording demand, the buffer's liveness, the package preference, the AV1 constraint, and the
-    // internal A/B test). The A/B test flip is captured and the toggle advanced here so the policy itself stays pure.
+    // camera's current facts (the buffer-backed-livestreaming toggle, the recording demand, the buffer's liveness, the package preference, the AV1 constraint, whether
+    // an RTSP-enabled stream exists to dial, and the internal A/B test). The A/B test flip is captured and the toggle advanced here so the policy itself stays pure.
     const abTestFlip = this.abTest && this.protectCamera.hasFeature("Debug.Video.Stream.ABTest");
 
     this.abTest = !this.abTest;
@@ -1102,9 +1101,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         channelProfile ??= this.protectCamera.selectChannel(request.video.width, request.video.height, { bias: "nearest" });
       } else {
 
-        // When the live encode runs on the host's hardware encoder we bias toward the highest-quality source the pipeline can ingest, because fixed-function encoders
-        // perform better with higher-bitrate sources; a software encode is fed a source matched to the requested resolution instead, so the CPU cost tracks what HomeKit
-        // actually asked for.
+        // Whether this host encodes live video on hardware is frozen when the FFmpeg options are constructed, so one read serves both the source-dimension bias below and
+        // the hardware-acceleration hint in the streaming-request log further down.
         const usesHardwareEncoder = this.ffmpegOptions.hardwareEncodes("stream");
 
         const transcodeChannel = channelProfile ??= this.protectCamera.selectChannel(
@@ -1115,8 +1113,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         if(transcodeChannel) {
 
-          // If we have specified the bitrates we want to use when transcoding, let's honor those here.
-          // If we're targeting a bitrate that's beyond the capabilities of our input channel, match the bitrate of the input channel.
           targetBitrate = resolveLiveTranscodeBitrate({
 
             homeKitBitrateKbps: request.video.max_bit_rate,
@@ -1177,7 +1173,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       this.log.info("Streaming live video with H.264 copy (no transcode).");
     }
 
-    // If we are streaming the package camera, and it's dark outside, activate the flashlight on the camera. We record the lit service on the session itself so the single
+    // If we are streaming the package camera, and it's dark outside, activate the flashlight on the camera. We record that on the session itself so the single
     // prepared-session disposal path can turn it back off on any failed start, and stopStream can turn it off on a normal stop - the session field is the one record of
     // the toggle.
     if(isPackageCameraContext(this.protectCamera.accessory.context)) {
@@ -1187,6 +1183,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       // If we're already on, we assume the user's activated it and we'll leave it untouched. Otherwise, we'll toggle it on and off when we begin and end streaming.
       if(this.protectCamera.ufp.isDark && flashlightService && !flashlightService.getCharacteristic(this.hap.Characteristic.On).value) {
 
+        // The camera runs the flashlight's own set body, past the refusal a HomeKit write meets.
         this.protectCamera.driveFlashlight(true);
         sessionInfo.toggleLight = true;
       }
@@ -1336,9 +1333,9 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     // Force-stop bridge: when FFmpeg exits, reclaim the subscription and writer, and (when the session is still live and the exit was organic, not a self-initiated
     // shutdown) force HomeKit to reclaim the streaming slot. We observe BOTH settlements of exited - it rejects on the never-spawned/ENOENT path, and a never-spawned
-    // FFmpeg still needs its subscription/writer reclaimed - so the same cleanup runs on either branch. The organic discriminator reads signal.reason: stopStream
-    // aborts with an explicit HbpuAbortError("shutdown"), so isHbpuAbortReason(reason, "shutdown") suppresses the self-stop double-fire; the entry-existence guard is
-    // defense-in-depth. This is the started-then-died force-stop, and the returnPort watchdog timeout flows through the same path.
+    // FFmpeg still needs its subscription/writer reclaimed - so the same cleanup runs on either branch. The check that tells the two apart reads signal.reason:
+    // stopStream aborts with an explicit HbpuAbortError("shutdown"), so isHbpuAbortReason(reason, "shutdown") suppresses the self-stop double-fire; the entry-existence
+    // guard is defense-in-depth. This is the started-then-died force-stop, and the returnPort watchdog timeout flows through the same path.
     const copyEscalationInFlightRef = { current: false };
 
     const sessionStillOwned = (): boolean => this.sessionDiagnosticsById.get(request.sessionID) === sessionDiagnostics;
@@ -1429,14 +1426,14 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       tsbWriterRail = createTsbSegmentWriterRail({ feedState: tsbFeedState, getStdin: () => activeFfmpeg.stdin,
         onRotateSegmentWriter: this.streamTestOptions?.onRotateSegmentWriter, signal: sessionInfo.abortController.signal });
 
-      // Subscribe to the pooled livestream via the camera seam. This call is synchronous and returns the subscription handle immediately; the underlying connection
+      // Subscribe to the pooled livestream via the camera interface. This call is synchronous and returns the subscription handle immediately; the underlying connection
       // begins establishing in the background. We start consuming segments below within the same synchronous frame, before any asynchronous segment can be delivered.
       //
       // A live view is always active (no idle phase, unlike the timeshift's transmit toggle), so the recovery urgency closure is the constant active tolerance: the
       // pool reconnects immediately on a stall because a HomeKit live view is latency-sensitive. The value only matters when the controller is unhealthy.
       //
-      // POOL-SHARING INVARIANT: the unifi-protect library's pool sharing key includes segmentLength/chunkSize/timestamps. The live and HKSV-timeshift subscribers
-      // share ONE pooled session only because BOTH go through this same seam with the same defaults - the live call OMITS segmentLength, so the seam default
+      // POOL-SHARING RULE: the unifi-protect library's pool sharing key includes segmentLength/chunkSize/timestamps. The live and HKSV-timeshift subscribers share
+      // ONE pooled session only because BOTH go through this same interface with the same defaults - the live call OMITS segmentLength, so the interface default
       // (PROTECT_SEGMENT_RESOLUTION = 100) matches the timeshift's explicit 100. If either consumer's opts ever diverge, the session silently splits into two sockets
       // (double controller load, broken self-heal/discontinuity coupling).
       const livestreamChannelProfile = subscriptionChannelProfile ?? channelProfile;
@@ -1627,7 +1624,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     // aborts before any RTP arrives. That rejection has two reachable causes: our own session tearing down (the session signal aborted - a clean stop with nothing to
     // say), or the demuxer's socket faulting beneath a session that lives on (return audio is lost for the rest of the session, and the catch narrates it). The
     // null-narrow mirrors prepareStream: rtpDemuxer is non-null whenever two-way audio is active, which is the only path that reaches here.
-    if(sessionInfo.rtpDemuxer && !this.streamTestOptions?.skipTalkbackMediaReadyWait) {
+    if(sessionInfo.rtpDemuxer) {
 
       try {
 
@@ -1684,7 +1681,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         // Drain the return-audio FFmpeg's ADTS stdout into the talkback session. send() resolves only when stdout is exhausted (the return-audio lifetime), so it is
         // detached, not awaited. A Node Readable is an AsyncIterable<Buffer>, so stdout feeds in with no adapter. We dispose the session when send settles (the
-        // return-audio FFmpeg ended or faulted), proactively closing on return-audio exit; it is idempotent with the stopStream abort backstop.
+        // return-audio FFmpeg ended or faulted), proactively closing on return-audio exit; it is safe to run again alongside the stopStream abort backstop.
         void tb.send(ffmpegReturnAudio.stdout, { signal: sessionInfo.abortController.signal }).catch((error: unknown) => {
 
           // A clean in-flight stop is the normal end of every two-way-audio session, so we note it at debug and stay quiet. A genuine mid-stream fault still surfaces as
@@ -1754,17 +1751,18 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     }
   }
 
-  // Dispose a prepared (pending) session. This is the single teardown body for a session that was prepared but never became a registered ongoing session: every failed
-  // start in startStream and stopStream's own pending branch route through it. Aborting the umbrella AbortController is the convergence point - it fans out through the
-  // shared signal to the demuxer and any FFmpeg, backpressure writer, and livestream subscription hung off it - while the port reservations and the pending-map entry
-  // are released explicitly (the abort alone does not free them), and a package-camera flashlight this session lit is turned back off. It is safe to call more than once:
+  // Dispose a prepared (pending) session. This is the single teardown body for a session that was prepared but never became a registered ongoing session: every path
+  // that ends a never-registered session routes through it. Aborting the umbrella AbortController is the convergence point - it fans out through the shared signal to
+  // the demuxer and any FFmpeg, backpressure writer, and livestream subscription hung off it - while the port reservations and the pending-map entry are released
+  // explicitly (the abort alone does not free them), and a package-camera flashlight this session lit is turned back off. It is safe to call more than once:
   // AbortController.abort and PortReservation disposal are both safe to repeat, so routing several paths (including one that may already have partially torn down in a
   // race) through this one body never double-releases.
   private disposePreparedSession(sessionId: string, sessionInfo: SessionInfo): void {
 
+    this.streamTestOptions?.recordDisposePreparedSession?.();
     sessionInfo.abortController.abort(new HbpuAbortError("shutdown"));
 
-    // Turn the package-camera flashlight back off if this session lit it.
+    // Turn the package-camera flashlight back off if this session lit it. The camera runs the flashlight's own set body, so a session that fails in an outage still does.
     if(sessionInfo.toggleLight) {
 
       this.protectCamera.driveFlashlight(false);
@@ -1806,16 +1804,17 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       if(ongoingSession) {
 
         // Single-abort teardown. The per-session AbortController is the SOLE teardown trigger: it fans out (via its signal) to the demuxer, every FFmpeg, the
-        // backpressure writer, the talkback session, and the livestream subscription. The explicit HbpuAbortError("shutdown") reason is load-bearing - the .exited
-        // force-stop bridge reads isHbpuAbortReason(reason, "shutdown") to suppress the self-stop double-fire; a bare abort() would set the reason to a DOMException
-        // the discriminator never matches.
+        // backpressure writer, the talkback session, and the livestream subscription. The explicit HbpuAbortError("shutdown") reason is required, not incidental - the
+        // .exited force-stop bridge reads isHbpuAbortReason(reason, "shutdown") to suppress the self-stop double-fire; a bare abort() would set the reason to a
+        // DOMException the check never matches.
         ongoingSession.abortController.abort(new HbpuAbortError("shutdown"));
 
-        // Dispose the talkback session as a backstop. The abort above already closed it through the shared signal, so this is an idempotent no-op (no double error).
+        // Dispose the talkback session as a backstop. The abort above already closed it through the shared signal, so this is safe to call again as a no-op (no
+        // double error).
         void ongoingSession.talkback?.[Symbol.asyncDispose]();
 
-        // Turn off the flashlight on package cameras, if enabled. This HomeKit-state side effect cannot fold into the abort, so it stays explicit. We explicitly want
-        // to call the set handler for the flashlight.
+        // Turn off the flashlight on package cameras, if enabled. This HomeKit-state side effect cannot fold into the abort, so it stays explicit. The camera runs the
+        // flashlight's own set body, so a session that stops in an outage still does.
         if(ongoingSession.toggleLight) {
 
           this.protectCamera.driveFlashlight(false);

@@ -5,7 +5,8 @@
 /* eslint-disable camelcase, sort-imports */
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import type { PrepareStreamRequest, StartStreamRequest } from "homebridge";
+import type { PrepareStreamRequest, StartStreamRequest, StreamingRequest } from "homebridge";
+import type { BackpressureWriter, FfmpegOptions } from "homebridge-plugin-utils";
 import { H264Level, H264Profile, HOMEKIT_IDR_INTERVAL, RtpPortAllocator, StreamRequestTypes, formatBps } from "homebridge-plugin-utils";
 import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import { formatLogEntry, settle } from "homebridge-plugin-utils/testing";
@@ -20,7 +21,6 @@ import { parseH264AvcCFromFmp4Init } from "./h264-fmp4-avcc.ts";
 import { TEST_H264_MAIN_PPS, testH264SpsForProfileLevel } from "./h264-test-bytes.ts";
 import { ProtectStreamingDelegate } from "./stream.ts";
 import type { ProtectStreamingDelegateTestOptions } from "./stream.ts";
-import type { BackpressureWriter } from "homebridge-plugin-utils";
 import type { ChannelProfile, SelectChannelOptions } from "./resolution.ts";
 import { setLiveVideoFfmpegSpawnerForTests } from "./stream-live-ffmpeg-spawn.ts";
 import { TestLiveStreamingFfmpegProcess } from "./test-live-ffmpeg-process.ts";
@@ -29,6 +29,7 @@ import { VIDEO_COPY_FAILURE_PATTERNS } from "./stream-transcode-policy.ts";
 import { resolveLiveStreamTranscodePipelineOptions, shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
 import type { LiveVideoEncodeDecision } from "./stream-transcode-policy.ts";
 import type { LiveStreamEncoderPipelineOptions } from "./stream-live-wiring.ts";
+import { makeHarnessRtpDemuxer } from "./stream-test-rtp-double.ts";
 
 const SESSION_ID = "sess-start-integration";
 
@@ -105,16 +106,65 @@ function makeStartRequest(overrides?: { packetTime?: number }): StartStreamReque
   } as unknown as StartStreamRequest;
 }
 
-function makePrepareRequest(overrides?: { addressVersion?: "ipv4" | "ipv6"; targetAddress?: string }): PrepareStreamRequest {
+function makePrepareRequest(overrides?: { addressVersion?: "ipv4" | "ipv6"; session?: string; targetAddress?: string }): PrepareStreamRequest {
 
   return {
 
     addressVersion: overrides?.addressVersion ?? "ipv4",
     audio: { port: 12345, srtpCryptoSuite: 0, srtp_key: Buffer.alloc(16), srtp_salt: Buffer.alloc(14) },
-    sessionID: SESSION_ID,
+    sessionID: overrides?.session ?? SESSION_ID,
     targetAddress: overrides?.targetAddress ?? "127.0.0.1",
     video: { port: 12347, srtpCryptoSuite: 0, srtp_key: Buffer.alloc(16), srtp_salt: Buffer.alloc(14) }
   } as unknown as PrepareStreamRequest;
+}
+
+const APPLE_TRANSCODE_DECODER_ARGS = [ "-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld" ];
+const APPLE_INPUT_CODEC_DECODER_ARGS = [ "-hwaccel", "videotoolbox" ];
+
+function patchCodecSupportRecord(platform: { codecSupport: unknown }, patch: Record<string, unknown>): void {
+
+  Object.assign(platform.codecSupport as Record<string, unknown>, patch);
+}
+
+function patchFfmpegAudioEncoder(ffmpegOptions: FfmpegOptions): void {
+
+  ffmpegOptions.audioEncoder = (): string[] => [ "-c:a", "libfdk_aac" ];
+}
+
+function isLiveStreamEncoderPipelineOptions(opts: Parameters<FfmpegOptions["videoDecoder"]>[0]): opts is LiveStreamEncoderPipelineOptions {
+
+  return (typeof opts === "object") && ("bitrate" in opts);
+}
+
+function patchAppleHwVideoDecoderProbe(ffmpegOptions: FfmpegOptions): void {
+
+  const realVideoDecoder = ffmpegOptions.videoDecoder.bind(ffmpegOptions);
+
+  ffmpegOptions.videoDecoder = (opts): string[] => {
+
+    if(isLiveStreamEncoderPipelineOptions(opts)) {
+
+      return APPLE_TRANSCODE_DECODER_ARGS;
+    }
+
+    if((typeof opts === "object") && ("inputCodec" in opts) && !("bitrate" in opts)) {
+
+      return APPLE_INPUT_CODEC_DECODER_ARGS;
+    }
+
+    return realVideoDecoder(opts);
+  };
+}
+
+async function stopActiveSession(ctx: HarnessContext, sessionId: string = SESSION_ID): Promise<void> {
+
+  await new Promise<void>((resolve, reject) => {
+
+    const stopRequest = { sessionID: sessionId, type: StreamRequestTypes.STOP } satisfies StreamingRequest;
+
+    ctx.delegate.handleStreamRequest(stopRequest,
+      (error) => ((error instanceof Error) ? reject(error) : resolve()));
+  });
 }
 
 function installProtectStreamingHarness(host: TestCameraHost): void {
@@ -158,7 +208,7 @@ function installProtectStreamingHarness(host: TestCameraHost): void {
     }
   });
 
-  (host.platform as { rtpPorts: RtpPortAllocator }).rtpPorts = new RtpPortAllocator();
+  (host.platform as unknown as { rtpPorts: RtpPortAllocator }).rtpPorts = new RtpPortAllocator();
 }
 
 function argsUseVideoCopy(args: string[]): boolean {
@@ -211,18 +261,8 @@ function assertSpawnedDecoderMatchesTranscodePipeline(delegate: ProtectStreaming
   const expectedDecoder = delegate.ffmpegOptions.videoDecoder(pipeline);
 
   assert.deepEqual(decoderPrefix, expectedDecoder, "spawned decoder argv must match videoDecoder(transcode pipeline)");
-
-  const decoderMatchesInputCodecOnly = (decoderPrefix.length === inputCodecOnly.length) &&
-    decoderPrefix.every((value, index) => value === inputCodecOnly[index]);
-
-  if(decoderMatchesInputCodecOnly) {
-
-    assert.match(spawnedArgs.join(" "), /minterpolate=|fps=/,
-      "when decoder argv matches inputCodec-only on this host, spawned encoder chain must still carry interpolation filters");
-  } else {
-
-    assert.notDeepEqual(decoderPrefix, inputCodecOnly, "spawned decoder argv must not be inputCodec-only on Apple interpolating transcode");
-  }
+  assert.notDeepEqual(decoderPrefix, inputCodecOnly, "spawned decoder argv must not be inputCodec-only on Apple interpolating transcode");
+  assert.deepEqual(decoderPrefix, APPLE_TRANSCODE_DECODER_ARGS, "Apple interpolating transcode must use videotoolbox_vld decoder argv");
 }
 
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 8000): Promise<void> {
@@ -326,8 +366,11 @@ function syncLiveUfpChannelsForStubBuffer(host: TestCameraHost): void {
   host.ufp = { ...host.ufp, channels };
 }
 
-function createHarness(options?: { appleSilicon?: boolean; delegateTestOptions?: ProtectStreamingDelegateTestOptions; enableHardwareTranscodeFeature?: boolean;
-  hardwareTranscodingHint?: boolean; livestreamSegments?: number; transcodeBitrateKbps?: number; videoCodec?: string; }): HarnessContext {
+function createHarness(options?: {
+
+  appleSilicon?: boolean; delegateTestOptions?: ProtectStreamingDelegateTestOptions; enableHardwareTranscodeFeature?: boolean;
+  hardwareTranscodingHint?: boolean; livestreamSegments?: number; patchAppleDecoderProbe?: boolean; transcodeBitrateKbps?: number; videoCodec?: string;
+}): HarnessContext {
 
   const { host, logEntries } = makeTestCameraHost();
 
@@ -341,9 +384,7 @@ function createHarness(options?: { appleSilicon?: boolean; delegateTestOptions?:
 
   if(options?.appleSilicon) {
 
-    const platform = host.platform as { codecSupport: Record<string, unknown> };
-
-    Object.assign(platform.codecSupport, {
+    patchCodecSupportRecord(host.platform, {
 
       cpuGeneration: 3,
       ffmpegAtLeast: (): boolean => true,
@@ -377,6 +418,11 @@ function createHarness(options?: { appleSilicon?: boolean; delegateTestOptions?:
 
   delegate.timeshift = timeshift as unknown as ProtectStreamingDelegate["timeshift"];
   host.stream = delegate;
+
+  if(options?.appleSilicon || options?.patchAppleDecoderProbe) {
+
+    patchAppleHwVideoDecoderProbe(delegate.ffmpegOptions);
+  }
 
   const spawnedArgs: string[][] = [];
   const spawnedProcesses: TestLiveStreamingFfmpegProcess[] = [];
@@ -739,7 +785,8 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
           createTsbResumeCalls += 1;
         }
-      }
+      },
+      patchAppleDecoderProbe: true
     });
     const bufferSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
     const streamSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
@@ -816,6 +863,8 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     assert.equal(createTsbResumeCalls, 1, "copy escalation must invoke createTsbResume exactly once");
 
     assertSpawnedDecoderMatchesTranscodePipeline(ctx.delegate, stubChannel, makeStartRequest(), true, ctx.spawnedArgs[1] ?? [], "h264");
+    assert.notDeepEqual(videoDecoderArgvPrefix(ctx.spawnedArgs[0] ?? []), videoDecoderArgvPrefix(ctx.spawnedArgs[1] ?? []),
+      "copy-escalation replacement decoder must differ from copy-time decoder argv");
 
     const copyProcess = ctx.spawnedProcesses[0];
     const replacement = ctx.spawnedProcesses[1];
@@ -1800,9 +1849,8 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
   test("tee audio sink uses srtpDestination (not raw host concatenation)", async () => {
 
     const ctx = createHarness();
-    const platform = ctx.host.platform as { codecSupport: Record<string, unknown> };
 
-    Object.assign(platform.codecSupport, { hasEncoder: (): boolean => true });
+    patchCodecSupportRecord(ctx.host.platform, { hasEncoder: (): boolean => true });
     ctx.host.hasFeature = (option: string): boolean => (option === "Audio") ? true : false;
     ctx.host.ufp = { ...ctx.host.ufp, featureFlags: { ...ctx.host.ufp.featureFlags, hasMic: true } };
 
@@ -1830,22 +1878,35 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
       delegateTestOptions: {
 
         recordReturnAudioFfmpegArgs: (args: string[]) => returnAudioArgs.push(args),
-        skipTalkbackMediaReadyWait: true
+        substituteRtpDemuxer: makeHarnessRtpDemuxer
       }
     });
 
     const defaultHasFeature = ctx.host.hasFeature.bind(ctx.host);
-    const platform = ctx.host.platform as { codecSupport: Record<string, unknown> };
 
-    Object.assign(platform.codecSupport, { hasEncoder: (): boolean => true });
+    patchCodecSupportRecord(ctx.host.platform, { hasEncoder: (): boolean => true });
+    patchFfmpegAudioEncoder(ctx.delegate.ffmpegOptions);
     ctx.host.hasFeature = (option: string): boolean => (option === "Audio") ? true : defaultHasFeature(option);
     ctx.host.hints = { ...ctx.host.hints, twoWayAudio: true, twoWayAudioDirect: true };
     ctx.host.ufp = {
 
       ...ctx.host.ufp,
-      featureFlags: { ...ctx.host.ufp.featureFlags, hasMic: true },
+      featureFlags: { ...ctx.host.ufp.featureFlags, hasMic: true, hasSpeaker: true },
       host: "fd00::1:2",
-      talkbackSettings: { bindPort: 7000, channels: 1, samplingRate: 16000 }
+      talkbackSettings: {
+
+        bindAddr: "0.0.0.0",
+        bindPort: 7000,
+        bitsPerSample: 16,
+        channels: 1,
+        filterAddr: null,
+        filterPort: null,
+        quality: 1,
+        samplingRate: 22050,
+        typeFmt: "aac",
+        typeIn: "aac",
+        url: ""
+      }
     };
 
     ctx.timeshift.buffer.isStarted = true;
@@ -1854,11 +1915,18 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     await prepareAndStart(ctx);
 
+    const teeHasAudio = teeSinkArgument(ctx.spawnedArgs[0] ?? []).includes("select=a");
+
+    assert.ok(teeHasAudio, "live ffmpeg must include HomeKit audio sink when two-way is enabled");
+    await waitFor(() => returnAudioArgs.length > 0, "return-audio ffmpeg");
+
     assert.equal(returnAudioArgs.length, 1);
     const destination = returnAudioArgs[0]?.at(-1) ?? "";
 
     assert.equal(destination, "udp://[fd00::1:2]:7000", "return audio must use talkbackDestination (M9)");
     assert.doesNotMatch(destination, /^udp:\/\/fd00::/);
+
+    await stopActiveSession(ctx);
   });
 
   test("RECONFIGURE debug log formats HomeKit bitrate in bps (times 1000)", async () => {
@@ -1869,33 +1937,57 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.timeshift.buffer.channelProfile = stubChannel;
     ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
 
-    await prepareAndStart(ctx);
+    const startRequest = makeStartRequest();
 
-    const request = makeStartRequest();
+    startRequest.video.max_bit_rate = 400;
+
+    await prepareAndStart(ctx, startRequest);
+
+    const reconfigureRequest = { ...startRequest, video: { ...startRequest.video, max_bit_rate: 1200 } };
 
     await new Promise<void>((resolve, reject) => {
 
-      ctx.delegate.handleStreamRequest({ ...request, type: StreamRequestTypes.RECONFIGURE },
+      ctx.delegate.handleStreamRequest({ ...reconfigureRequest, type: StreamRequestTypes.RECONFIGURE },
         (error) => ((error instanceof Error) ? reject(error) : resolve()));
     });
 
-    const expected = formatBps(request.video.max_bit_rate * 1000);
+    const expectedReconfigure = formatBps(1200 * 1000);
+    const expectedStartOnly = formatBps(400 * 1000);
+    const adjustmentLines = ctx.logEntries.filter((entry) => entry.message.includes("Streaming parameters adjustment requested by HomeKit")).map(formatLogEntry);
 
-    assert.ok(logLineIncludes(ctx.logEntries, "Streaming parameters adjustment requested by HomeKit") &&
-      logLineIncludes(ctx.logEntries, expected), "RECONFIGURE must log HomeKit max bitrate via formatBps(kbps*1000) (M11)");
+    assert.equal(adjustmentLines.length, 1, "RECONFIGURE must emit exactly one adjustment line (M11)");
+    assert.ok(adjustmentLines[0]?.includes(expectedReconfigure),
+      "RECONFIGURE line must use formatBps(HomeKit kbps×1000) for the new request");
+    assert.ok(!adjustmentLines[0]?.includes(expectedStartOnly),
+      "RECONFIGURE line must not repeat the prior start-session bitrate without ×1000");
+
+    await stopActiveSession(ctx, startRequest.sessionID);
   });
 
   test("IPv6 zone refusal on start disposes prepared session without spawning video ffmpeg", async () => {
 
-    const ctx = createHarness();
+    let disposeCalls = 0;
+    const ctx = createHarness({
+
+      delegateTestOptions: { recordDisposePreparedSession: () => { disposeCalls += 1; } }
+    });
 
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
     ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
 
-    await assert.rejects(() => prepareAndStart(ctx, makeStartRequest(), makePrepareRequest({ addressVersion: "ipv6", targetAddress: "fe80::1%en0" })),
-      /zone/);
+    const sessionId = SESSION_ID + "-ipv6-zone";
+
+    await assert.rejects(() => prepareAndStart(ctx, { ...makeStartRequest(), sessionID: sessionId },
+      makePrepareRequest({ addressVersion: "ipv6", session: sessionId, targetAddress: "fe80::1%en0" })), /zone/);
     assert.equal(ctx.spawnedArgs.length, 0, "SRTP refusal must dispose prepared session before spawn (M12)");
+    assert.equal(disposeCalls, 1, "zone refusal must call disposePreparedSession (M12)");
+
+    await prepareAndStart(ctx, { ...makeStartRequest(), sessionID: sessionId },
+      makePrepareRequest({ session: sessionId, targetAddress: "127.0.0.1" }));
+
+    assert.equal(ctx.spawnedArgs.length, 1, "re-prepare after zone refusal must release reservations and allow a normal start (M12)");
+    await stopActiveSession(ctx, sessionId);
   });
 
 });
