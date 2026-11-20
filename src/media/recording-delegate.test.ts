@@ -14,19 +14,19 @@
  * on a field-by-field source trace, not on this net; this net's value is the real-but-narrow one of pinning the observable decline contract green before and after.
  *
  * The segment-producing recording path (which exercises the pacing/reserve telemetry) now lives in recording-transmit.test.ts: it fills the timeshift buffer with the
- * harness's segment-yielding livestream double and constructs the FFmpeg process through the platform's recording-process factory seam, so it drives the transmit path
- * FFmpeg-free with deterministic injected-clock pacing.
+ * harness's segment-yielding livestream double and constructs the FFmpeg process through the platform's recording-process factory interface, so it drives the transmit
+ * path FFmpeg-free with deterministic injected-clock pacing.
  */
-import { Characteristic, Service, TestStreamingDelegate, makeTestCameraHost, settle } from "../testing.helpers.ts";
+import type { CameraRecordingConfiguration, RecordingPacket } from "homebridge";
+import { Characteristic, Service, TestStreamingDelegate } from "../testing.helpers.ts";
 import { PROTECT_SEGMENT_RESOLUTION, PROTECT_TIMESHIFT_BUFFER_MAXDURATION } from "../settings.ts";
 import { after, describe, test } from "node:test";
-import type { CameraRecordingConfiguration } from "homebridge";
+import { makeChannelProfile, makeControllableLivestreamDouble, makeTestCameraHost } from "./testing.helpers.ts";
 import type { ChannelProfile } from "./resolution.ts";
 import { ProtectRecordingDelegate } from "./record.ts";
 import { ProtectTimeshiftSupervisor } from "./timeshift-supervisor.ts";
-import type { RecordingPacket } from "homebridge";
-import type { TestCameraHost } from "../testing.helpers.ts";
 import assert from "node:assert/strict";
+import { settle } from "homebridge-plugin-utils/testing";
 
 // Every host this suite builds shares the one makeTestNvr AbortController. Aborting it in teardown releases the harness signal so a leaked observer (none here, the
 // recording delegate spawns none at construction) could never outlive the suite.
@@ -46,7 +46,7 @@ async function drainRecordingStream(delegate: ProtectRecordingDelegate, streamId
 
   const packets: RecordingPacket[] = [];
 
-  for await (const packet of delegate.handleRecordingStreamRequest(streamId, signal)) {
+  for await(const packet of delegate.handleRecordingStreamRequest(streamId, signal)) {
 
     packets.push(packet);
   }
@@ -54,25 +54,11 @@ async function drainRecordingStream(delegate: ProtectRecordingDelegate, streamId
   return packets;
 }
 
-// A minimal-but-truthy recording configuration cast to the HAP type at this confined seam. The supervisor reads only videoCodec.parameters.bitRate (the enable-ack
-// config log) off it now that channel selection is HKSV-state-independent.
+// A minimal-but-truthy recording configuration cast to the HAP type at this confined boundary. The supervisor reads only videoCodec.parameters.bitRate (the enable-ack
+// config log) off it, since channel selection does not depend on HKSV recording state.
 function makeRecordingConfig(): CameraRecordingConfiguration {
 
   return { prebufferLength: 4000, videoCodec: { parameters: { bitRate: 2000 } } } as unknown as CameraRecordingConfiguration;
-}
-
-// A ChannelProfile resolved from the host's first real channel, so the buffer starts against a genuine profile. Guarded because host.ufp.channels[0] widens to
-// ProtectCameraChannelConfig | undefined under noUncheckedIndexedAccess.
-function makeChannelProfile(host: TestCameraHost): ChannelProfile {
-
-  const channel = host.ufp.channels[0];
-
-  if(!channel) {
-
-    throw new Error("The camera channel fixture is missing its first channel.");
-  }
-
-  return { channel, name: channel.name, resolution: [ 1920, 1080, 30 ], url: "rtsps://test" };
 }
 
 describe("recording delegate decline-path behavior", () => {
@@ -98,7 +84,7 @@ describe("recording delegate decline-path behavior", () => {
     // Exactly one packet, marked as the last, carrying a single byte - the end-of-stream marker's observable shape.
     assert.equal(packets.length, 1);
     assert.equal(packets[0]?.isLast, true);
-    assert.equal(packets[0]?.data.length, 1);
+    assert.equal(packets[0].data.length, 1);
   });
 
   // A reused delegate declines a second event without crashing. This proves the generator/decline path survives re-entry on the same delegate instance - the lifecycle a
@@ -121,6 +107,54 @@ describe("recording delegate decline-path behavior", () => {
     assert.equal(second.length, 1);
     assert.equal(second[0]?.isLast, true);
   });
+
+  /* A recording request that arrives while the buffer's start is still establishing declines at once rather than waiting for that start.
+   *
+   * The livestream holds its establishment open, so the reconcile pass that arming recording began stays in flight. The request finds the buffer not running, kicks the
+   * supervisor once and yields its single end-of-stream marker while the establishment is still held...waiting on the pass instead would hold HomeKit's recording stream
+   * open until the livestream established or gave up. Releasing the establishment afterwards shows the start the request left running still commits, so the next event
+   * finds the buffer up.
+   */
+  test("a request while the buffer is still establishing declines at once and leaves the start running", async (t) => {
+
+    const { controller, host } = makeTestCameraHost();
+
+    controllers.push(controller);
+
+    const livestream = makeControllableLivestreamDouble({ deferEstablishment: true });
+
+    host.stream = new TestStreamingDelegate();
+    host.selectSubstrateChannel = (): ChannelProfile => makeChannelProfile(host);
+    host.livestreamSubscriptions = [livestream];
+
+    const supervisor = new ProtectTimeshiftSupervisor(host);
+    const delegate = new ProtectRecordingDelegate(host, supervisor);
+
+    delegate.updateRecordingConfiguration(makeRecordingConfig());
+    delegate.updateRecordingActive(true);
+
+    await settle();
+
+    assert.equal(supervisor.buffer.isStarted, false, "the buffer's start is held at its establishment");
+
+    const reconcileSpy = t.mock.method(supervisor, "reconcile");
+    const drained: { packets?: RecordingPacket[] } = {};
+
+    void drainRecordingStream(delegate, 1, new AbortController().signal).then((packets): void => { drained.packets = packets; });
+
+    await settle();
+
+    assert.ok(drained.packets, "the request completed while the establishment was still held");
+    assert.equal(drained.packets.length, 1);
+    assert.equal(drained.packets[0]?.isLast, true);
+    assert.equal(reconcileSpy.mock.callCount(), 1, "the request kicked the supervisor once");
+
+    livestream.releaseEstablishment();
+
+    await settle();
+
+    assert.equal(supervisor.buffer.isStarted, true, "the start the request left running committed");
+  });
 });
 
 describe("recording delegate synchronous configuration observables", () => {
@@ -135,7 +169,7 @@ describe("recording delegate synchronous configuration observables", () => {
 
     controllers.push(controller);
 
-    // Wire the success-path seams so an armed reconcile genuinely starts the buffer in its production shape: the streaming delegate the HKSV acknowledgment reads, a
+    // Wire the success-path interfaces so an armed reconcile genuinely starts the buffer in its production shape: the streaming delegate the HKSV acknowledgment reads, a
     // substrate channel to select, and enough buffered segments for whenEstablished.
     host.stream = new TestStreamingDelegate();
     host.selectSubstrateChannel = (): ChannelProfile => makeChannelProfile(host);
@@ -189,8 +223,8 @@ describe("recording delegate synchronous configuration observables", () => {
 
   // guardedDispatch owns updateRecordingActive's async reconcile: HomeKit calls the void-returning method fire-and-forget, so a rejecting reconcile must be caught and
   // logged rather than surfacing as an unhandled rejection. We force setRecordingDemand to reject and prove both halves of the contract - the fault is logged and nothing
-  // floats - with a test-scoped unhandledRejection listener, since the suites carry no ready-made float-detection seam. Pre-fix, when the method was a bare async whose
-  // rejected promise HomeKit discarded, the same throw floated instead.
+  // floats - with a test-scoped unhandledRejection listener, since the suites carry no ready-made float-detection helper. HomeKit invokes the void-returning method
+  // fire-and-forget, so a rejecting reconcile must be caught and logged rather than left to float.
   test("a throwing recording activation is logged and never floats an unhandled rejection", async () => {
 
     const { controller, host, logEntries } = makeTestCameraHost();
@@ -201,7 +235,7 @@ describe("recording delegate synchronous configuration observables", () => {
     const delegate = new ProtectRecordingDelegate(host, supervisor);
 
     // Force the reconcile to reject so the void-returning handler must absorb the fault.
-    supervisor.setRecordingDemand = async (): Promise<boolean> => { throw new Error("reconcile boom"); };
+    supervisor.setRecordingDemand = async (): Promise<void> => { throw new Error("reconcile boom"); };
 
     // Install a test-scoped listener to capture any unhandled rejection that escapes the delegate during the drive, then remove it immediately after.
     const floats: unknown[] = [];
@@ -222,7 +256,7 @@ describe("recording delegate synchronous configuration observables", () => {
     }
 
     assert.equal(floats.length, 0, "the throwing activation did not float an unhandled rejection");
-    assert.ok(logEntries.some((entry) => (entry.level === "error") && (entry.parameters[1] === "recording activation")),
+    assert.ok(logEntries.some((entry) => (entry.level === "error") && (entry.params[0] === "recording activation")),
       "the throwing activation surfaced through the guardedDispatch failure log");
   });
 

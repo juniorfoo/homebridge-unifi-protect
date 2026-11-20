@@ -2,7 +2,7 @@
  *
  * timeshift.test.ts: Behavior coverage of the HKSV timeshift buffer - the first standalone net over ProtectTimeshiftBuffer.
  *
- * The timeshift buffer's public surface (the segment/discontinuity/terminated events, the start/stop/transmit lifecycle, the buffer/getLast/snapshotSource/
+ * The timeshift buffer's public surface (the segment/discontinuity/firstKeyframe/terminated events, the start/stop/transmit lifecycle, the buffer/getLast/snapshotSource/
  * getKeyframeAlignedStart read helpers, and the selfHeal reboot) has only ever been exercised indirectly through the recording-delegate suites. This suite drives it as a
  * STANDALONE unit - there is no recording delegate in the loop, so the timeshift's own emission decisions are asserted directly rather than conflated with a consumer's.
  *
@@ -13,21 +13,23 @@
  * virtual-time 0 is indistinguishable from "no keyframe" - every snapshotSource-fresh (and staleness-boundary) test advances the clock to a nonzero base BEFORE pushing
  * its keyframe, or the staleness compare is never reached and the test is vacuous.
  *
- * All assertions are behavior-first: emitted events, returned buffers, recorded seam calls (livestreamCalls, rebootCalls, the double's reassessCalls/disposed), and the
- * public getters - never a private field (_segments, _pendingDiscontinuity, _isTransmitting, _lastKeyframeTime, subscription). Because both the per-push forward and
+ * All assertions are behavior-first: emitted events, returned buffers, recorded interface calls (livestreamCalls, rebootCalls, the double's reassessCalls/disposed), and
+ * the public getters - never a private field (_segments, _pendingDiscontinuity, _isTransmitting, _lastKeyframeTime, subscription). Because both the per-push forward and
  * transmitStart's own concat emit the "segment" event, forwarding tests assert on the forwarded PAYLOAD (which fragment's data), never the event count.
  */
-import type { ControllableLivestreamDouble, TestCameraHost, TestLogEntry, TestProtectNvr } from "../testing.helpers.ts";
+import type { ControllableLivestreamDouble, TestCameraHost } from "./testing.helpers.ts";
+import { ProtectClient, ProtectLivestreamUnavailableError } from "unifi-protect";
+import type { SegmentRole, SnapshotSource } from "./timeshift.ts";
+import type { TestClock, TestLogEntry } from "homebridge-plugin-utils/testing";
 import { after, describe, test } from "node:test";
-import { makeControllableLivestreamDouble, makeKeyframeFragment, makeNonKeyframeFragment, makeTestCameraHost, settle } from "../testing.helpers.ts";
-import type { ChannelProfile } from "./resolution.ts";
+import { makeChannelProfile, makeControllableLivestreamDouble, makeKeyframeFragment, makeNonKeyframeFragment, makeTestCameraHost } from "./testing.helpers.ts";
+import { AMCREST_INIT_SEGMENT } from "../camera.fixtures.ts";
 import { PROTECT_LIVESTREAM_API_IDR_INTERVAL } from "../settings.ts";
-import { ProtectLivestreamUnavailableError } from "unifi-protect";
 import { ProtectTimeshiftBuffer } from "./timeshift.ts";
 import type { Segment } from "unifi-protect";
-import type { SegmentRole } from "./timeshift.ts";
-import type { TestClock } from "homebridge-plugin-utils";
+import type { TestProtectNvr } from "../nvr/testing.helpers.ts";
 import assert from "node:assert/strict";
+import { settle } from "homebridge-plugin-utils/testing";
 
 // The keyframe-staleness threshold the timeshift compares against: PROTECT_LIVESTREAM_API_IDR_INTERVAL (5s) doubled, in milliseconds. A keyframe older than this makes
 // snapshotSource read "stale"; younger reads "fresh". The suite drives the boundary deterministically by advancing the TestClock across exactly this much.
@@ -45,21 +47,6 @@ after(() => {
   }
 });
 
-// Build a minimal-but-truthy ChannelProfile from the host's first G2 Pro channel. start() only forwards this to the host's livestream() seam (which the controllable
-// double ignores), so the profile needs only to type-check. We guard the indexed access because host.ufp.channels[0] widens to ProtectCameraChannelConfig | undefined
-// under noUncheckedIndexedAccess.
-function makeChannelProfile(host: TestCameraHost): ChannelProfile {
-
-  const channel = host.ufp.channels[0];
-
-  if(!channel) {
-
-    throw new Error("The G2 Pro channel fixture is missing its first channel.");
-  }
-
-  return { channel, name: channel.name, resolution: [ 1920, 1080, 30 ], url: "rtsps://test" };
-}
-
 // Build one media Segment around a fragment's bytes. processSegment reads only type, discontinuity, and data; moof/mdat are type-required, so we supply the fragment's
 // own. The optional discontinuity flag marks the first media after a reconnect (the unifi-protect discontinuity:true), which the timeshift's discontinuity gate keys on.
 function makeMediaSegment(fragment: { data: Buffer; mdat: Buffer; moof: Buffer }, options: { discontinuity?: boolean } = {}): Segment {
@@ -74,15 +61,15 @@ function makeMediaSegment(fragment: { data: Buffer; mdat: Buffer; moof: Buffer }
 
 // The arranged, started timeshift plus the handles a test asserts against. clock is the controllable TestClock the timeshift reads via platform.clock (advance it to
 // drive the staleness gate); double is the controllable livestream the test pushes segments into; events captures every emitted segment/discontinuity/terminated; host
-// exposes the seam call logs (livestreamCalls, rebootCalls, the settable hasFeature/isReachable); nvr is the settable TestProtectNvr (set nvr.phase for the shuttingDown
-// variant); timeshift is the SUT.
+// exposes the interface call logs (livestreamCalls, rebootCalls, the settable hasFeature/isReachable); nvr is the settable TestProtectNvr (set nvr.phase for the
+// shuttingDown variant); timeshift is the SUT.
 interface StartedTimeshift {
 
   clock: TestClock;
   double: ControllableLivestreamDouble;
   events: { discontinuity: number; segment: Buffer[]; terminated: number };
   host: TestCameraHost;
-  logEntries: TestLogEntry[];
+  logEntries: readonly TestLogEntry[];
   nvr: TestProtectNvr;
   timeshift: ProtectTimeshiftBuffer;
 }
@@ -175,11 +162,128 @@ describe("timeshift buffer behavior", () => {
     assert.equal(double.disposed, true, "the local subscription is disposed");
   });
 
+  // The owner's commit-point check. A deferred establishment holds the start in flight; the owner's signal aborts in that window, so the start reaches its commit point
+  // with its owner's lifetime already over and declines instead of committing, disposing the subscription it opened. The decline is SILENT - no "stopped" emit, exactly
+  // like the establishment-failure paths, which never reach finalizeSubscription either. Against a buffer that commits regardless, this start resolves true with
+  // isStarted true. The controllable double ignores the signal, so its establishment answers true after the abort, which is the one case this check exists for.
+  test("start declines at the commit point when its owner's signal aborts mid-establishment", async () => {
+
+    const double = makeControllableLivestreamDouble({ deferEstablishment: true });
+    const { controller, host } = makeTestCameraHost();
+
+    controllers.push(controller);
+    host.livestreamSubscriptions = [double];
+
+    // The owner's lifetime, aborted while the establishment is held so the start meets the aborted signal at the commit point.
+    const owner = new AbortController();
+
+    let stoppedEmits = 0;
+
+    const timeshift = new ProtectTimeshiftBuffer(host, { signal: owner.signal });
+
+    timeshift.on("stopped", (): void => { stoppedEmits++; });
+
+    const startPromise = timeshift.start(makeChannelProfile(host));
+
+    await settle();
+
+    assert.equal(timeshift.isStarted, false, "the start is held in flight, not yet committed");
+
+    owner.abort();
+    double.releaseEstablishment();
+
+    assert.equal(await startPromise, false, "the start whose owner's signal aborted declines rather than committing");
+
+    await settle();
+
+    assert.equal(timeshift.isStarted, false, "isStarted stays false");
+    assert.equal(timeshift.channelProfile, null, "no channel profile committed");
+    assert.equal(double.disposed, true, "the local subscription is disposed");
+    assert.equal(stoppedEmits, 0, "the decline is silent, like the establishment-failure paths");
+  });
+
+  // The other side of the check: an owner's signal left unaborted throughout must leave the commit path exactly as it is. This is the wiring guard for the owner's
+  // signal rather than a behavioral value - what it catches is a signal read with the wrong sense or at the wrong moment.
+  test("an owner signal that never aborts leaves the commit path undisturbed", async () => {
+
+    const double = makeControllableLivestreamDouble({ deferEstablishment: true });
+    const { controller, host } = makeTestCameraHost();
+
+    controllers.push(controller);
+    host.livestreamSubscriptions = [double];
+
+    // The owner's lifetime, left unaborted for the whole of this start's life.
+    const owner = new AbortController();
+    const timeshift = new ProtectTimeshiftBuffer(host, { signal: owner.signal });
+    const profile = makeChannelProfile(host);
+    const startPromise = timeshift.start(profile);
+
+    await settle();
+
+    double.releaseEstablishment();
+
+    assert.equal(await startPromise, true, "the start whose owner's signal never aborted commits");
+
+    await settle();
+
+    assert.equal(timeshift.isStarted, true, "isStarted is true");
+    assert.equal(timeshift.channelProfile, profile, "the channel profile committed alongside the subscription");
+    assert.equal(double.disposed, false, "the committed subscription is not disposed");
+  });
+
+  // The owner's signal reaches the livestream call, which is what lets the owner's abort end the subscription. The read is by identity: the
+  // options the host recorded carry the very signal the buffer was built with, rather than merely some signal, and a buffer built with no owner passes none.
+  test("start hands its owner's signal to the livestream call, and an ownerless buffer passes none", async () => {
+
+    const { controller, host } = makeTestCameraHost();
+
+    controllers.push(controller);
+    host.livestreamSubscriptions = [ makeControllableLivestreamDouble(), makeControllableLivestreamDouble() ];
+
+    const owner = new AbortController();
+
+    assert.equal(await new ProtectTimeshiftBuffer(host, { signal: owner.signal }).start(makeChannelProfile(host)), true, "the owned buffer started");
+    assert.equal(await new ProtectTimeshiftBuffer(host).start(makeChannelProfile(host)), true, "the ownerless buffer started");
+
+    assert.equal(host.livestreamCalls[0]?.opts?.signal, owner.signal, "the owned buffer's livestream call carries the very signal the buffer was built with");
+    assert.equal(host.livestreamCalls[1]?.opts?.signal, undefined, "the ownerless buffer's livestream call carries no signal");
+  });
+
+  // The teardown report is honest: "stopped" reports every genuine teardown and only those. A stop on a buffer that never started tore nothing down, so it reports
+  // nothing - while still answering true, so callers may stop unconditionally without checking first. The committed side is what proves the gate narrowed the report
+  // rather than silencing the event: the same buffer, once started, reports its teardown exactly once.
+  test("stop reports a teardown only when there was one to report", async () => {
+
+    const double = makeControllableLivestreamDouble();
+    const { controller, host } = makeTestCameraHost();
+
+    controllers.push(controller);
+    host.livestreamSubscriptions = [double];
+
+    const timeshift = new ProtectTimeshiftBuffer(host);
+
+    let stoppedEmits = 0;
+
+    timeshift.on("stopped", (): void => { stoppedEmits++; });
+
+    // Side one: a buffer that never started. The stop resets state already at rest, reports nothing, and still answers true.
+    assert.equal(timeshift.stop(), true, "a stop on a never-started buffer still answers true");
+    assert.equal(stoppedEmits, 0, "a teardown that never happened is not reported");
+
+    // Side two: the same buffer after a committed start. Now there IS a teardown, and it is reported exactly once.
+    assert.equal(await timeshift.start(makeChannelProfile(host)), true, "the start committed");
+
+    await settle();
+
+    assert.equal(timeshift.stop(), true, "the committed buffer stops");
+    assert.equal(stoppedEmits, 1, "the genuine teardown was reported exactly once");
+  });
+
   // Target (d): starting an already-started timeshift disposes the prior subscription and commits the new one. Two DISTINCT-id doubles are supplied via the queue; the
-  // second start runs start's if(isStarted) stop() path, disposing doubleA, then commits doubleB. This is ALSO the genuine discriminator of the consumeSegments
+  // second start runs start's if(isStarted) stop() path, disposing doubleA, then commits doubleB. This is ALSO the genuine distinguishing case of the consumeSegments
   // id-identity guard (the finally's this.subscription?.id === subscription.id): start() commits doubleB BEFORE doubleA's iterator finally runs, so that finally reaches
   // the distinct-id arm (this.subscription is doubleB, doubleB.id !== doubleA.id) and no-ops. A guard-removed timeshift instead tears doubleB down here, flipping
-  // isStarted false - so the isStarted assertion below is what pins the guard.
+  // isStarted false - so the isStarted assertion below is what fails when the guard is removed.
   test("starting again disposes the prior subscription and commits the new one", async () => {
 
     const doubleA = makeControllableLivestreamDouble();
@@ -196,7 +300,7 @@ describe("timeshift buffer behavior", () => {
     assert.equal(host.livestreamCalls.length, 2, "the second start opened a second livestream");
   });
 
-  // #22: a segment still draining from a REPLACED subscription must not contaminate the restarted buffer. We queue a segment on doubleA, then restart WITHOUT settling -
+  // A segment still draining from a REPLACED subscription must not contaminate the restarted buffer. We queue a segment on doubleA, then restart WITHOUT settling -
   // start() disposes doubleA (which drains its queued segment before honoring disposal) and commits doubleB, so doubleA's stale segment reaches consumeSegments' loop
   // body while doubleA is no longer this.subscription. The loop-body identity guard skips it (continue), so it never enters doubleB's buffer. This is the double-restart
   // interleaving the finally-only guard does not cover: the naive single-restart is already saved by the finally, so it would not turn red.
@@ -243,7 +347,7 @@ describe("timeshift buffer behavior", () => {
 
     const { double, timeshift } = await buildStartedTimeshift();
 
-    double.push({ codec: "h264", data: Buffer.from("init"), type: "init" });
+    double.push({ codec: "h264", data: Buffer.from("init"), description: { tracks: [] }, type: "init" });
 
     await settle();
 
@@ -289,7 +393,7 @@ describe("timeshift buffer behavior", () => {
     const { double, events, timeshift } = await buildStartedTimeshift();
     const keyframe = makeKeyframeFragment();
 
-    // Capture each emission's role directly, pinning the producer side of the tagging contract: transmitStart's prebuffer concat must carry "blob" and a per-fragment
+    // Capture each emission's role directly, locking in the producer side of the tagging contract: transmitStart's prebuffer concat must carry "blob" and a per-fragment
     // forward must carry "live". The recording delegate's counting split branches on these tags - the mutation that turns this red is flipping processSegment's forward
     // to "blob" (or transmitStart's emit to "live"), which would silently corrupt the transmitted-video tally.
     const roles: SegmentRole[] = [];
@@ -326,9 +430,10 @@ describe("timeshift buffer behavior", () => {
     assert.equal(events.segment.some((payload) => payload.equals(pushed.data)), false, "no segment event carries the pushed fragment while not transmitting");
   });
 
-  // Target (k): the LOAD-BEARING discontinuity keyframe-gate. While transmitting, a discontinuity-marked NON-keyframe segment defers the discontinuity emit and
-  // suppresses forwarding until a clean keyframe arrives. We settle after EACH push so the intermediate deferred state is observable (multiple pushes + one settle would
-  // drain all in one macrotask and hide the defer). The non-keyframe choice is deliberate: a discontinuity-marked keyframe emits immediately and the gate is untested.
+  // Target (k): the discontinuity keyframe-gate, required for correctness. While transmitting, a discontinuity-marked NON-keyframe segment defers the discontinuity
+  // emit and suppresses forwarding until a clean keyframe arrives. We settle after EACH push so the intermediate deferred state is observable (multiple pushes + one
+  // settle would drain all in one macrotask and hide the defer). The non-keyframe choice is deliberate: a discontinuity-marked keyframe emits immediately and the gate
+  // is untested.
   test("the discontinuity emit is deferred until a clean keyframe after a discontinuity-marked non-keyframe", async () => {
 
     const { double, events, timeshift } = await buildStartedTimeshift();
@@ -389,7 +494,7 @@ describe("timeshift buffer behavior", () => {
     assert.equal(events.discontinuity, 0, "no discontinuity event fires off-transmit");
   });
 
-  // Buffer hygiene (#4/#21) runs on EVERY reconnect: a non-empty IDLE buffer is cleared on a discontinuity, and admission is suppressed until the recovery keyframe, so
+  // Buffer hygiene runs on EVERY reconnect: a non-empty IDLE buffer is cleared on a discontinuity, and admission is suppressed until the recovery keyframe, so
   // the standing buffer never holds mixed-timeline or pre-keyframe data even when no HKSV session is transmitting. A NON-empty buffer is used deliberately - clearing an
   // already-empty one is observationally vacuous.
   test("an idle reconnect clears the standing buffer and suppresses admission until the recovery keyframe", async () => {
@@ -429,7 +534,7 @@ describe("timeshift buffer behavior", () => {
     assert.ok(timeshift.buffer, "the recovery keyframe is admitted and the buffer resumes");
   });
 
-  // Admission suppression (#4/#21) survives a mid-window HKSV session close: transmitStop does not clear the pending discontinuity, so a session ending between the
+  // Admission suppression survives a mid-window HKSV session close: transmitStop does not clear the pending discontinuity, so a session ending between the
   // reconnect and the recovery keyframe leaves suppression in force and the standing buffer timeline-clean for the next consumer.
   test("admission suppression survives a mid-window HKSV session close", async () => {
 
@@ -520,7 +625,7 @@ describe("timeshift buffer behavior", () => {
   // terminated. This is the explicit-stop teardown path - the first of the consumeSegments teardown identities: stop() synchronously clears the subscription and
   // fires the one terminated, and doubleA's iterator finally then runs while the subscription is undefined, so it no-ops via the undefined short-circuit. (The
   // id-identity guard's distinct-id arm - a prior subscription's finally running while a NEW subscription is committed - is the SEPARATE path that target (d) genuinely
-  // discriminates; here doubleA's teardown completes before doubleB starts, so this test exercises the explicit-stop path, not the distinct-id arm.)
+  // tells apart; here doubleA's teardown completes before doubleB starts, so this test exercises the explicit-stop path, not the distinct-id arm.)
   test("an explicit stop while transmitting emits one terminated and the restart commits cleanly", async () => {
 
     const doubleA = makeControllableLivestreamDouble();
@@ -571,7 +676,7 @@ describe("timeshift buffer behavior", () => {
     const result = timeshift.transmitStart();
 
     assert.equal(result, null, "transmitStart returns null (declines) when not started");
-    assert.ok(logEntries.some((entry) => (entry.level === "error") && String(entry.parameters[0]).includes("HKSV event recording unavailable")),
+    assert.ok(logEntries.some((entry) => (entry.level === "error") && entry.message.includes("HKSV event recording unavailable")),
       "transmitStart logs the not-ready error");
   });
 
@@ -745,8 +850,8 @@ describe("timeshift buffer behavior", () => {
     const source = timeshift.snapshotSource();
 
     assert.equal(source.kind, "fresh", "snapshotSource reads fresh with a keyframe at a nonzero clock base");
-    assert.ok((source.kind === "fresh") && (source.data.length > 0), "the fresh answer carries the init + keyframe buffer content");
-    assert.ok((source.kind === "fresh") && (source.fps > 0), "the fresh answer carries the capture fps");
+    assert.ok(source.data.length > 0, "the fresh answer carries the init + keyframe buffer content");
+    assert.ok(source.fps > 0, "the fresh answer carries the capture fps");
   });
 
   // Target (y): the staleness gate (the Clock payoff). Advance the clock to a nonzero base T, push a keyframe (_lastKeyframeTime = T, nonzero), then advance so
@@ -801,10 +906,92 @@ describe("timeshift buffer behavior", () => {
     assert.equal(timeshift.snapshotSource().kind, "empty", "snapshotSource reads empty once its only keyframe has been trimmed out, despite a fresh keyframe time");
   });
 
+  // firstKeyframe.
+
+  // The event keys on the first keyframe a start admits, not on the first segment, and fires once: a non-keyframe admitted ahead of it fires nothing, and a later
+  // keyframe on the same start fires nothing more.
+  test("firstKeyframe fires once at the first keyframe a start admits, and not for a later keyframe", async () => {
+
+    const { clock, double, timeshift } = await buildStartedTimeshift();
+
+    let fired = 0;
+
+    timeshift.on("firstKeyframe", (): void => { fired++; });
+    clock.advance(1000);
+    double.push(makeMediaSegment(makeNonKeyframeFragment()));
+
+    await settle();
+
+    assert.equal(fired, 0, "a non-keyframe admitted first fires nothing");
+
+    double.push(makeMediaSegment(makeKeyframeFragment()));
+
+    await settle();
+
+    assert.equal(fired, 1, "the first keyframe the start admits fires the event");
+
+    double.push(makeMediaSegment(makeKeyframeFragment()));
+
+    await settle();
+
+    assert.equal(fired, 1, "a later keyframe on the same start fires nothing more");
+  });
+
+  // Each start announces its own first keyframe, so a stop and a new start fire the event again at the new subscription's first keyframe.
+  test("firstKeyframe fires again at the first keyframe after a stop and a new start", async () => {
+
+    const doubleA = makeControllableLivestreamDouble();
+    const doubleB = makeControllableLivestreamDouble();
+    const { clock, host, timeshift } = await buildStartedTimeshift({ double: doubleA, subscriptions: [ doubleA, doubleB ] });
+
+    let fired = 0;
+
+    timeshift.on("firstKeyframe", (): void => { fired++; });
+    clock.advance(1000);
+    doubleA.push(makeMediaSegment(makeKeyframeFragment()));
+
+    await settle();
+
+    assert.equal(fired, 1, "the first start's first keyframe fired the event");
+
+    timeshift.stop();
+
+    await settle();
+
+    assert.equal(await timeshift.start(makeChannelProfile(host)), true, "the new start committed");
+
+    doubleB.push(makeMediaSegment(makeKeyframeFragment()));
+
+    await settle();
+
+    assert.equal(fired, 2, "the new start's first keyframe fired the event again");
+  });
+
+  // The event fires once the keyframe is in the buffer, so a listener reading snapshotSource() inside it is served that keyframe fresh: the init segment followed by the
+  // keyframe fragment's own bytes. An event fired ahead of the admission would read empty here.
+  test("a firstKeyframe listener reads the keyframe through a fresh snapshotSource", async () => {
+
+    const { clock, double, timeshift } = await buildStartedTimeshift();
+    const fragment = makeKeyframeFragment();
+    const sources: SnapshotSource[] = [];
+
+    timeshift.on("firstKeyframe", (): void => { sources.push(timeshift.snapshotSource()); });
+    clock.advance(1000);
+    double.push(makeMediaSegment(fragment));
+
+    await settle();
+
+    const [source] = sources;
+
+    assert.equal(sources.length, 1, "the listener ran once");
+    assert.equal(source?.kind, "fresh", "the listener's snapshotSource reads fresh");
+    assert.ok(source.data.subarray(-fragment.data.length).equals(fragment.data), "the fresh source ends with the admitted keyframe's bytes");
+  });
+
   // getters.
 
-  // Target (z): isRestarting reflects the double's state (recovering -> true, live -> false); the configuredDuration round-trip is discriminating (set 250 -> get 300 via
-  // Math.ceil(250/100)=3 segments; set 0 -> get 100, floored at one segment); segmentLength is 100; time is 0 on a started-but-empty buffer.
+  // Target (z): isRestarting reflects the double's state (recovering -> true, live -> false); the configuredDuration round-trip is what tells the two arms apart (set
+  // 250 -> get 300 via Math.ceil(250/100)=3 segments; set 0 -> get 100, floored at one segment); segmentLength is 100; time is 0 on a started-but-empty buffer.
   test("the getters reflect state, configured duration, segment length, and empty time", async () => {
 
     const recovering = await buildStartedTimeshift({ double: makeControllableLivestreamDouble({ state: "recovering" }) });
@@ -841,13 +1028,13 @@ describe("timeshift buffer behavior", () => {
     await settle();
 
     assert.equal(host.rebootCalls.length, 1, "the camera was rebooted exactly once");
-    assert.ok(logEntries.some((entry) => (entry.level === "warn") && String(entry.parameters[0]).includes("Rebooting the camera to recover its livestream") &&
-      (entry.parameters[1] === "10")), "the reboot is announced with a warn carrying the failed-attempt count");
+    assert.ok(logEntries.some((entry) => (entry.level === "warn") && entry.message.includes("Rebooting the camera to recover its livestream") &&
+      (entry.params[0] === "10")), "the reboot is announced with a warn carrying the failed-attempt count");
   });
 
   // Target (bb): reboot does NOT fire on the recovery give-up's negatives. attempts below the threshold takes the first early return; the second early-return guard's
   // disjuncts - self-healing disabled, the camera unreachable, and the nvr shutting down - each independently suppress the reboot. Each leaves rebootCalls empty.
-  // (The reboot().catch rejection path is a deeper defensive branch not exercised here; the host's reboot stub does not reject - acknowledged as a gap.)
+  // (The reboot().catch rejection path is exercised separately below, by the test that sets rebootError.)
   test("selfHeal does not reboot below the threshold, with self-healing off, when unreachable, or while shutting down", async () => {
 
     const belowThreshold = await buildStartedTimeshift();
@@ -896,7 +1083,7 @@ describe("timeshift buffer behavior", () => {
 
   // Target (cc): selfHeal ignores an iterator error that is NOT the recovery give-up. A plain error thrown into the iterator is classified and logged by the shared
   // handler but takes selfHeal's first early return (the !instanceof ProtectLivestreamUnavailableError arm), so no reboot is attempted even with self-healing enabled and
-  // the camera reachable. This pins the give-up-only gating of the reboot.
+  // the camera reachable. This locks in the give-up-only gating of the reboot.
   test("selfHeal does not reboot on an iterator error that is not the recovery give-up", async () => {
 
     const { double, host } = await buildStartedTimeshift();
@@ -925,7 +1112,80 @@ describe("timeshift buffer behavior", () => {
     await settle();
 
     assert.equal(host.rebootCalls.length, 1, "the reboot was attempted before it failed");
-    assert.ok(logEntries.some((entry) => (entry.level === "error") && String(entry.parameters[0]).includes("could not be rebooted")), "the failed reboot is logged");
+    assert.ok(logEntries.some((entry) => (entry.level === "error") && entry.message.includes("could not be rebooted")), "the failed reboot is logged");
+  });
+});
+
+describe("the timeshift buffer's stream formats and its adopted subscription", () => {
+
+  // The Amcrest's init, described by unifi-protect: the description a started buffer reports its audio and video formats from.
+  const AMCREST_DESCRIPTION = ProtectClient.describeInitSegment(AMCREST_INIT_SEGMENT);
+
+  test("audioFormat reads the started subscription's init description, and nothing before a start", async () => {
+
+    const { controller, host } = makeTestCameraHost();
+
+    controllers.push(controller);
+
+    const timeshift = new ProtectTimeshiftBuffer(host);
+
+    assert.equal(timeshift.audioFormat, null, "a buffer that never started reports no audio format");
+
+    host.livestreamSubscriptions = [makeControllableLivestreamDouble({ description: AMCREST_DESCRIPTION })];
+
+    assert.equal(await timeshift.start(makeChannelProfile(host)), true, "the buffer started");
+    assert.deepEqual(timeshift.audioFormat, { channels: 1, codec: "aac", sampleRate: 8000 }, "the started buffer reports the Amcrest's audio format");
+
+    timeshift.stop();
+
+    assert.equal(timeshift.audioFormat, null, "a stopped buffer reports no audio format");
+  });
+
+  test("videoFormat reads the started subscription's init description, and nothing before a start or after a stop", async () => {
+
+    const { controller, host } = makeTestCameraHost();
+
+    controllers.push(controller);
+
+    const timeshift = new ProtectTimeshiftBuffer(host);
+
+    assert.equal(timeshift.videoFormat, null, "a buffer that never started reports no video format");
+
+    host.livestreamSubscriptions = [makeControllableLivestreamDouble({ description: AMCREST_DESCRIPTION })];
+
+    assert.equal(await timeshift.start(makeChannelProfile(host)), true, "the buffer started");
+    assert.deepEqual(timeshift.videoFormat, { codec: "h264", height: 1944, width: 2592 }, "the started buffer reports the Amcrest's video format");
+
+    timeshift.stop();
+
+    assert.equal(timeshift.videoFormat, null, "a stopped buffer reports no video format");
+  });
+
+  // The subscription the camera's derivation opened is handed to the start, which commits it in place of a fresh one, so no second subscribe reaches the host.
+  test("a start with an adopted subscription commits it without subscribing, and declines one whose init is null", async () => {
+
+    const { controller, host } = makeTestCameraHost();
+
+    controllers.push(controller);
+
+    const timeshift = new ProtectTimeshiftBuffer(host);
+    const adopted = makeControllableLivestreamDouble({ description: AMCREST_DESCRIPTION });
+
+    assert.equal(await timeshift.start(makeChannelProfile(host), adopted), true, "the adopted subscription committed");
+    assert.equal(host.livestreamCalls.length, 0, "the start opened no subscription of its own");
+    assert.equal(timeshift.isStarted, true, "the buffer runs on the adopted subscription");
+    assert.deepEqual(timeshift.audioFormat, { channels: 1, codec: "aac", sampleRate: 8000 }, "the buffer reads its format from the adopted subscription");
+
+    timeshift.stop();
+
+    assert.equal(adopted.disposed, true, "a stop disposes the adopted subscription it committed");
+
+    const initless = makeControllableLivestreamDouble({ initSegment: null });
+
+    assert.equal(await timeshift.start(makeChannelProfile(host), initless), false, "an adopted subscription with no init declines, as a fresh one does");
+    assert.equal(host.livestreamCalls.length, 0, "the declined start opened no subscription of its own either");
+    assert.equal(initless.disposed, true, "the declined adopted subscription is disposed");
+    assert.equal(timeshift.isStarted, false, "the buffer stays stopped");
   });
 
   describe("getInitPlusTrailingFromLastKeyframe", () => {

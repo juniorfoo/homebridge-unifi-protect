@@ -5,7 +5,8 @@
  * recording-delegate.test.ts proved the decline contract but could not reach the transmit path: against a segment-less livestream stub the timeshift buffer never fills,
  * so the gate always declines, and reaching transmit at all would spawn a real FFmpeg child. This suite clears both blockers FFmpeg-free. It fills the timeshift buffer
  * with the harness's segment-yielding livestream double (real keyframe-bearing fMP4 the production isKeyframe parse accepts), and it constructs the FFmpeg process
- * through the platform's recording-process factory seam - injecting an FFmpeg-free TestRecordingProcess - so the delegate runs its full accept-path logic with no child.
+ * through the platform's recording-process factory interface - injecting an FFmpeg-free TestRecordingProcess - so the delegate runs its full accept-path logic
+ * with no child.
  *
  * Pacing is made deterministic by the injected clock, not by node:test mock timers (which cannot reach the production node:timers/promises delay) and not by mocking
  * Date: the delegate reads platform.clock for both its delay() and its now(), and the test holds that exact TestClock instance (returned by makeTestCameraHost). The
@@ -13,16 +14,22 @@
  * assertable. The assertions are behavior-first throughout: yielded RecordingPackets, the factory's createCalls, the host's livestreamCalls, the process's stdinWrites,
  * and captured log telemetry - never a private session field.
  */
+import { AudioRecordingCodecType, AudioRecordingSamplerate, HDSProtocolSpecificErrorReason, HKSV_TIMEOUT } from "homebridge-plugin-utils";
 import type { CameraRecordingConfiguration, RecordingPacket } from "homebridge";
-import { HDSProtocolSpecificErrorReason, HKSV_TIMEOUT, TestRecordingProcess, TestRecordingProcessFactory } from "homebridge-plugin-utils";
+import type { LivestreamDescription, LivestreamInit, LivestreamSubscriptionState, Segment } from "unifi-protect";
+import type { Nullable, RecordingProcessFactory } from "homebridge-plugin-utils";
 import { PROTECT_SEGMENT_RESOLUTION, PROTECT_TIMESHIFT_BUFFER_MAXDURATION } from "../settings.ts";
-import type { RecordingProcessFactory, TestClock, TestRecordingProcessInit } from "homebridge-plugin-utils";
-import type { TestCameraHost, TestLogEntry, TestProtectNvr } from "../testing.helpers.ts";
-import { TestStreamingDelegate, makeTestCameraHost, settle } from "../testing.helpers.ts";
+import type { TestClock, TestLogEntry, TestRecordingProcessInit } from "homebridge-plugin-utils/testing";
+import { TestRecordingProcess, TestRecordingProcessFactory, formatLogEntry, logCount, present, settle } from "homebridge-plugin-utils/testing";
 import { after, describe, test } from "node:test";
+import { makeChannelProfile, makeLivestreamSubscriptionDouble, makeTestCameraHost } from "./testing.helpers.ts";
 import type { ChannelProfile } from "./resolution.ts";
+import type { LivestreamSubscription } from "./livestream.ts";
 import { ProtectRecordingDelegate } from "./record.ts";
 import { ProtectTimeshiftSupervisor } from "./timeshift-supervisor.ts";
+import type { TestCameraHost } from "./testing.helpers.ts";
+import type { TestProtectNvr } from "../nvr/testing.helpers.ts";
+import { TestStreamingDelegate } from "../testing.helpers.ts";
 import assert from "node:assert/strict";
 
 // The exact pacing interval the delegate computes between yields: HKSV_TIMEOUT minus the 500ms HomeKit-timeout safety margin. Because the injected clock is
@@ -41,35 +48,25 @@ after(() => {
   }
 });
 
-// The count of INFO/WARN log lines whose first format string contains the given fragment - the harness records the raw parameters, so we match the message template. The
-// enable-ack re-acknowledgment test counts occurrences (not a boolean .some()), because a boolean would pass after the FIRST enable regardless of whether the second
-// re-acknowledged - the count discriminates the per-enable acknowledgment behavior.
-function countLogs(entries: TestLogEntry[], level: TestLogEntry["level"], fragment: string): number {
+// The audio codec HomeKit selects for a recording: AAC-LC, one channel, at the rate this suite's default recording selects. A row about the copy-or-transcode
+// decision passes its own.
+const SELECTED_AUDIO = { audioChannels: 1, bitrate: 0, samplerate: AudioRecordingSamplerate.KHZ_16, type: AudioRecordingCodecType.AAC_LC };
 
-  return entries.filter((entry) => (entry.level === level) && (typeof entry.parameters[0] === "string") && entry.parameters[0].includes(fragment)).length;
+// A minimal-but-truthy recording configuration cast to the HAP type at this confined boundary - the same harness discipline the decline suite uses. The transmit path
+// reads videoCodec.parameters.bitRate (the enable-ack config log), prebufferLength, and the selected audio codec (the filter rate and the copy-or-transcode decision);
+// videoCodec.resolution is present solely to satisfy the CameraRecordingConfiguration shape and is not consumed by the code under test. prebufferLength is well below
+// the filled buffer time (10000ms) so the early-end telemetry gate's time >= prebufferLength conjunct stays satisfied.
+function makeRecordingConfig(audioCodec: { audioChannels?: number; bitrate: number; samplerate: AudioRecordingSamplerate; type: AudioRecordingCodecType } =
+  SELECTED_AUDIO): CameraRecordingConfiguration {
+
+  return { audioCodec, prebufferLength: 4000, videoCodec: { parameters: { bitRate: 2000 }, resolution: [ 1920, 1080, 30 ] } } as unknown as
+    CameraRecordingConfiguration;
 }
 
-// A minimal-but-truthy recording configuration cast to the HAP type at this confined seam - the same harness discipline the decline suite uses. The transmit path reads
-// only videoCodec.parameters.bitRate (the enable-ack config log) and prebufferLength; videoCodec.resolution is present solely to satisfy the
-// CameraRecordingConfiguration shape and is not consumed by the code under test. prebufferLength is well below the filled buffer time (10000ms) so the
-// early-end telemetry gate's time >= prebufferLength conjunct stays satisfied.
-function makeRecordingConfig(): CameraRecordingConfiguration {
+// An init description carrying one video track and the given audio track, the shape the library reads from a camera's livestream init.
+function describedWith(audio: { channels: number; codec: "aac" | "opus"; sampleRate: number }): LivestreamDescription {
 
-  return { prebufferLength: 4000, videoCodec: { parameters: { bitRate: 2000 }, resolution: [ 1920, 1080, 30 ] } } as unknown as CameraRecordingConfiguration;
-}
-
-// A ChannelProfile resolved from a real G2 Pro channel, so the channel's id and fps reach the recording-process init exactly as production composes them. We guard the
-// indexed access because host.ufp.channels[0] widens to ProtectCameraChannelConfig | undefined under noUncheckedIndexedAccess.
-function makeChannelProfile(host: TestCameraHost): ChannelProfile {
-
-  const channel = host.ufp.channels[0];
-
-  if(!channel) {
-
-    throw new Error("The G2 Pro channel fixture is missing its first channel.");
-  }
-
-  return { channel, name: channel.name, resolution: [ 1920, 1080, 30 ], url: "rtsps://test" };
+  return { tracks: [ { codec: "h264", height: 1080, id: 1, kind: "video", level: 40, profile: 77, width: 1920 }, { ...audio, id: 2, kind: "audio" } ] };
 }
 
 // A test-local recording-process factory that hands back a FRESH configured TestRecordingProcess per create call, in sequence, recording every create.
@@ -127,21 +124,61 @@ async function drainPaced(gen: AsyncGenerator<RecordingPacket>, clock: TestClock
   return packets;
 }
 
+/* A livestream subscription that establishes and delivers media normally, and can then be told its initialization segment is gone.
+ *
+ * That is the state a livestream which dies between the buffer's reconcile and the recording delegate's transmit attempt leaves behind: the buffer still holds its
+ * committed channel profile and a full window of media, so every gate ahead of the transmit attempt clears, while the subscription underneath can no longer produce the
+ * initialization segment a fresh transmit needs. It is the one arrangement that reaches transmitStart's own decline rather than one of the earlier gates. Every other
+ * member delegates to the harness's own subscription double, so the initialization segment is the single thing that differs.
+ */
+function makeInitLosingSubscription(mediaSegments: number): { loseInitSegment: () => void; subscription: LivestreamSubscription } {
+
+  const backing = makeLivestreamSubscriptionDouble({ mediaSegments });
+
+  let initLost = false;
+
+  return {
+
+    loseInitSegment: (): void => { initLost = true; },
+    subscription: {
+
+      get id(): string {
+
+        return backing.id;
+      },
+      get initSegment(): LivestreamInit | null {
+
+        return initLost ? null : backing.initSegment;
+      },
+      reassess: (): void => backing.reassess(),
+      get state(): LivestreamSubscriptionState {
+
+        return backing.state;
+      },
+      whenEstablished: (): Promise<boolean> => backing.whenEstablished(),
+      [Symbol.asyncIterator]: (): AsyncIterator<Segment> => backing[Symbol.asyncIterator](),
+      [Symbol.asyncDispose]: async (): Promise<void> => { await backing[Symbol.asyncDispose](); }
+    }
+  };
+}
+
 // The arranged transmitting delegate plus the handles a test asserts against. The clock is the controllable TestClock the delegate's pacing awaits; logEntries captures
-// the telemetry log; host exposes the seam call logs; nvr is the controller double backing the context.
+// the telemetry log; host exposes the interface call logs; nvr is the controller double backing the context.
 interface TransmittingArrange {
 
   clock: TestClock;
   delegate: ProtectRecordingDelegate;
   host: TestCameraHost;
-  logEntries: TestLogEntry[];
+  logEntries: readonly TestLogEntry[];
   nvr: TestProtectNvr;
 }
 
 // Arrange an armed, buffer-filled, transmit-ready delegate from a supplied recording-process factory. Sets the host's stream and channel selector, fills the timeshift
 // buffer past its configured duration with the segment-yielding livestream double, enables the telemetry feature so the reserve sampling and the early-end telemetry
-// fragment run, then arms recording and settles so the consume loop drains the (parking) iterator and timeshift.time reaches the configured duration.
-async function buildTransmittingDelegate(factory: RecordingProcessFactory): Promise<TransmittingArrange> {
+// fragment run, then arms recording and settles so the consume loop drains the (parking) iterator and timeshift.time reaches the configured duration. The options
+// steer the copy-or-transcode decision: the description the buffer's init carries, and the recording configuration HomeKit selected.
+async function buildTransmittingDelegate(factory: RecordingProcessFactory, options: { config?: CameraRecordingConfiguration; description?: LivestreamDescription } = {}):
+Promise<TransmittingArrange> {
 
   const { clock, controller, host, logEntries, nvr } = makeTestCameraHost({ recordingProcessFactory: factory });
 
@@ -152,13 +189,16 @@ async function buildTransmittingDelegate(factory: RecordingProcessFactory): Prom
 
   // Over-fill the buffer: the timeshift caps at its segment count (100), so any value at or above that fills time to exactly the configured duration. We over-fill by a
   // margin so the strict time < configuredDuration gate clears with room to spare.
-  host.livestreamMediaSegments = Math.ceil(PROTECT_TIMESHIFT_BUFFER_MAXDURATION / PROTECT_SEGMENT_RESOLUTION) + 10;
+  const mediaSegments = Math.ceil(PROTECT_TIMESHIFT_BUFFER_MAXDURATION / PROTECT_SEGMENT_RESOLUTION) + 10;
+
+  host.livestreamMediaSegments = mediaSegments;
+  host.livestreamSubscriptions = (options.description === undefined) ? [] : [makeLivestreamSubscriptionDouble({ description: options.description, mediaSegments })];
   host.hasFeature = (option: string): boolean => option === "Debug.Video.HKSV.Telemetry";
 
   const supervisor = new ProtectTimeshiftSupervisor(host);
   const delegate = new ProtectRecordingDelegate(host, supervisor);
 
-  delegate.updateRecordingConfiguration(makeRecordingConfig());
+  delegate.updateRecordingConfiguration(options.config ?? makeRecordingConfig());
   delegate.updateRecordingActive(true);
 
   // Drain the background consume loop up to the iterator's park, so the buffer reaches the configured duration before the first request.
@@ -169,13 +209,13 @@ async function buildTransmittingDelegate(factory: RecordingProcessFactory): Prom
 
 // Find the early-end telemetry log a closeRecordingStream emitted. record.ts logs error("HKSV recording event ended early: %s%s", reasonDescription, telemetry), so the
 // log's first parameter is the format string and the telemetry payload is the THIRD parameter (the %s%s template's second substitution) - never a pre-formatted string.
-function findEndedEarlyTelemetry(logEntries: TestLogEntry[], fromIndex = 0): string {
+function findEndedEarlyTelemetry(logEntries: readonly TestLogEntry[], fromIndex = 0): string {
 
-  const entry = logEntries.slice(fromIndex).find((e) => (e.level === "error") && String(e.parameters[0]).includes("ended early"));
+  const entry = logEntries.slice(fromIndex).find((e) => (e.level === "error") && e.message.includes("ended early"));
 
   assert.ok(entry, "Expected an early-end telemetry log entry.");
 
-  return String(entry.parameters[2]);
+  return String(entry.params[1]);
 }
 
 describe("recording delegate transmit-path behavior", () => {
@@ -246,7 +286,7 @@ describe("recording delegate transmit-path behavior", () => {
 
     const packets: RecordingPacket[] = [];
 
-    for await (const packet of delegate.handleRecordingStreamRequest(1, new AbortController().signal)) {
+    for await(const packet of delegate.handleRecordingStreamRequest(1, new AbortController().signal)) {
 
       packets.push(packet);
     }
@@ -254,14 +294,68 @@ describe("recording delegate transmit-path behavior", () => {
     // Exactly one packet, marked last, one byte - the decline contract. And the factory was never constructed.
     assert.equal(packets.length, 1);
     assert.equal(packets[0]?.isLast, true);
-    assert.equal(packets[0]?.data.length, 1);
+    assert.equal(packets[0].data.length, 1);
     assert.equal(recordingProcessFactory.createCalls.length, 0);
+  });
+
+  /* The transmit path's last gate, and the buffer revival that rides it.
+   *
+   * The buffer holds a committed profile and a full window of media, so every earlier gate clears, but the subscription underneath can no longer produce an
+   * initialization segment and the transmit attempt declines. Reaching this gate at all REQUIRES a committed buffer: the gate ahead of it returns on a null channel
+   * profile, the body between them is synchronous, and the buffer commits and clears its subscription and profile as one pair. So the stop this branch runs is a
+   * genuine teardown, its "stopped" report reaches the supervisor's listener, and that is what asks supervision to re-establish the buffer for the next attempt.
+   *
+   * The pin is therefore two-sided against the emission contract. Exactly one reconcile means the teardown was reported once and revival was requested once; zero would
+   * mean an over-broad emission gate had silenced a report of a teardown that genuinely happened, taking the revival with it, and two would mean the revival was being
+   * requested twice over. The error-log assertion runs first and proves THIS gate was the one reached rather than one of the ones ahead of it, which is what keeps the
+   * reconcile count from being a coincidence.
+   */
+  test("a transmit attempt that finds no usable buffer tears the buffer down and revives supervision exactly once", async (t) => {
+
+    const recordingProcessFactory = new TestRecordingProcessFactory();
+    const { controller, host, logEntries } = makeTestCameraHost({ recordingProcessFactory });
+
+    controllers.push(controller);
+
+    host.stream = new TestStreamingDelegate();
+    host.selectSubstrateChannel = (): ChannelProfile => makeChannelProfile(host);
+
+    // Over-fill the buffer so the time gate clears with room to spare, exactly as the transmitting arrange does.
+    const { loseInitSegment, subscription } = makeInitLosingSubscription(Math.ceil(PROTECT_TIMESHIFT_BUFFER_MAXDURATION / PROTECT_SEGMENT_RESOLUTION) + 10);
+
+    host.livestreamSubscriptions.push(subscription);
+
+    const supervisor = new ProtectTimeshiftSupervisor(host);
+    const delegate = new ProtectRecordingDelegate(host, supervisor);
+
+    delegate.updateRecordingConfiguration(makeRecordingConfig());
+    delegate.updateRecordingActive(true);
+    await settle();
+
+    assert.equal(supervisor.buffer.isStarted, true, "the arrange left the buffer running with its profile committed");
+    assert.equal(host.livestreamCalls.length, 1, "exactly one livestream backs the buffer, so the arranged subscription is the committed one");
+
+    // The livestream underneath dies: the buffer keeps its profile and its media, while a fresh transmit can no longer be initialized.
+    loseInitSegment();
+
+    const reconcileSpy = t.mock.method(supervisor, "reconcile");
+    const packets: RecordingPacket[] = [];
+
+    for await(const packet of delegate.handleRecordingStreamRequest(1, new AbortController().signal)) {
+
+      packets.push(packet);
+    }
+
+    assert.equal(logCount(logEntries, "error", "the livestream connection is not ready"), 1,
+      "the attempt declined at the transmit gate, not at one of the gates ahead of it");
+    assert.equal(reconcileSpy.mock.callCount(), 1, "the genuine teardown was reported once and asked supervision to re-establish the buffer once");
+    assert.equal(packets.length, 1, "the event declined with the single end-of-stream marker");
   });
 
   // Test C - per-event RecordingSession reset. Two successive events on one armed delegate, each create handing back a fresh configured process (3 media for event 1, 1
   // for event 2) via the sequenced factory. The two telemetry logs carry distinct event ids AND distinct yield counts - event 2's count is its own (1, not 3 and not an
   // accumulation of event 1's) - which is the behavior-first proof a fresh RecordingSession is established per request. Event 2's telemetry also carries its own reserve
-  // fragment, re-seeded from POSITIVE_INFINITY to a finite value (here 0, since the sequenced inits set no bufferedSegments) - the load-bearing observable is the
+  // fragment, re-seeded from POSITIVE_INFINITY to a finite value (here 0, since the sequenced inits set no bufferedSegments) - what proves the reset is the
   // per-event re-seed away from the Infinity sentinel, not a positive count.
   test("establishes a fresh per-event session so successive events report independent telemetry", async () => {
 
@@ -349,8 +443,8 @@ describe("recording delegate transmit-path behavior", () => {
     packets.push(...rest);
 
     // The restart fired a second create, and the resumed process's segments reached HomeKit. We assert on rest (the packets drained AFTER the discontinuity) rather than
-    // the running total, so the resume half is genuinely discriminating: packets already held the pre-restart init and in-flight segment, so a total >= 2 would pass even
-    // if the restarted process yielded nothing.
+    // the running total, so the resume half genuinely tells the cases apart: packets already held the pre-restart init and in-flight segment, so a total >= 2 would pass
+    // even if the restarted process yielded nothing.
     assert.equal(factory.createCalls.length, 2);
     assert.ok(rest.length >= 1, "Expected the restarted process to resume yielding segments after the discontinuity.");
   });
@@ -495,13 +589,12 @@ describe("recording delegate transmit-path behavior", () => {
 
     // The summary fires from the session's own counters, and reports transmitted-video seconds exactly (finding #25). The tally is the prebuffer blob's real fragment
     // count plus the two live fragments: the blob is the keyframe-aligned prebuffer window, prebufferLength / segmentLength = 4000 / 100 = 40 fragments, so the tally is
-    // 40 + 2 = 42 fragments at 100ms each = 4.2 seconds, rounded to 4. Pre-fix, the blob was mis-credited as a single segment (then discounted to zero), so this same
-    // event reported 0.2 seconds.
-    const summary = logEntries.find((e) => (e.level === "info") && (String(e.parameters[0]) === "HKSV: transmitted a %s %s recording to HomeKit."));
+    // 40 + 2 = 42 fragments at 100ms each = 4.2 seconds, rounded to 4.
+    const summary = logEntries.find((e) => (e.level === "info") && (e.message === "HKSV: transmitted a %s %s recording to HomeKit."));
 
     assert.ok(summary, "Expected the recorded-event summary log entry.");
-    assert.equal(summary.parameters[1], "4");
-    assert.equal(summary.parameters[2], "second");
+    assert.equal(summary.params[0], "4");
+    assert.equal(summary.params[1], "second");
   });
 
   // Test F - FFmpeg-timeout exit. With a process that yields no media and reports isTimedOut, the segments() generator ends immediately; the init segment is still paced
@@ -535,12 +628,12 @@ describe("recording delegate transmit-path behavior", () => {
     delegate.timeshift.emit("segment", Buffer.from("live"), "live");
     delegate.acknowledgeStream();
 
-    assert.equal(countLogs(logEntries, "warn", "while the camera was still streaming"), 1);
+    assert.equal(logCount(logEntries, "warn", "while the camera was still streaming"), 1);
   });
 
   // Test I - the starved source stays calm. The same timed-out recording, but no fresh segment arrives before the close: the source has gone quiet, so the only
   // arrival was the transmit-start one, now stale after the drain advanced the clock past the watchdog window. The finalization sees a stale arrival under a timeout
-  // and says nothing - the benign starve the offline/deferred path already narrates. The discriminant against Test H is exactly the absence of the fresh arrival.
+  // and says nothing - the benign starve the offline/deferred path already narrates. What tells this apart from Test H is exactly the absence of the fresh arrival.
   test("stays quiet when a recording times out after the source has gone quiet", async () => {
 
     const ffmpegProcess = new TestRecordingProcess({ initSegment: Buffer.from("init"), isTimedOut: true, segments: [Buffer.from("seg1")] });
@@ -552,11 +645,11 @@ describe("recording delegate transmit-path behavior", () => {
     // No fresh segment arrives - the source quieted - so the last arrival is the now-stale transmit-start one.
     delegate.acknowledgeStream();
 
-    assert.equal(countLogs(logEntries, "warn", "while the camera was still streaming"), 0);
+    assert.equal(logCount(logEntries, "warn", "while the camera was still streaming"), 0);
   });
 
   // Test J - a recording that did not time out is unaffected. Even with a fresh arrival right before the close, a recording the watchdog did NOT reap (isTimedOut
-  // false) never warns: the warning is gated on the timeout, since a recent arrival alone is the normal healthy case, not a stall. The discriminant against Test H
+  // false) never warns: the warning is gated on the timeout, since a recent arrival alone is the normal healthy case, not a stall. What tells this apart from Test H
   // is exactly the timeout flag.
   test("stays quiet when the recording did not time out even though the source is still delivering segments", async () => {
 
@@ -570,6 +663,121 @@ describe("recording delegate transmit-path behavior", () => {
     delegate.timeshift.emit("segment", Buffer.from("live"), "live");
     delegate.acknowledgeStream();
 
-    assert.equal(countLogs(logEntries, "warn", "while the camera was still streaming"), 0);
+    assert.equal(logCount(logEntries, "warn", "while the camera was still streaming"), 0);
+  });
+});
+
+describe("the recording's audio: copied when the stream is the selected format, transcoded otherwise", () => {
+
+  // Drive one recording event to its process construction and read what the recording asked of the process: whether it transcodes its audio, and the filters it runs.
+  async function transcodeFor(options: { config?: CameraRecordingConfiguration; description: LivestreamDescription }): Promise<boolean | undefined> {
+
+    const recordingProcessFactory = new TestRecordingProcessFactory(new TestRecordingProcess({ initSegment: Buffer.from("init"), segments: [Buffer.from("seg1")] }));
+    const { clock, delegate } = await buildTransmittingDelegate(recordingProcessFactory, options);
+
+    await drainPaced(delegate.handleRecordingStreamRequest(1, new AbortController().signal), clock);
+
+    assert.equal(recordingProcessFactory.createCalls.length, 1, "the recording constructed its process once");
+
+    return recordingProcessFactory.createCalls[0]?.init.recording?.transcodeAudio;
+  }
+
+  // The first-party camera's case: the stream's audio already is AAC-LC at the rate and channel count HomeKit selected, so the recording copies it untouched.
+  test("a stream whose audio is the selected AAC format is copied, with no transcode", async () => {
+
+    assert.equal(await transcodeFor({ description: describedWith({ channels: 1, codec: "aac", sampleRate: 16000 }) }), false, "a matching stream copies its audio");
+  });
+
+  test("a stream that differs from the selected format by rate, by channels, by codec, or has no audio track transcodes to it", async () => {
+
+    assert.equal(await transcodeFor({ description: describedWith({ channels: 1, codec: "aac", sampleRate: 8000 }) }), true, "an 8000 Hz stream transcodes to 16000 Hz");
+    assert.equal(await transcodeFor({ description: describedWith({ channels: 2, codec: "aac", sampleRate: 16000 }) }), true, "a stereo stream transcodes to mono");
+    assert.equal(await transcodeFor({ description: describedWith({ channels: 1, codec: "opus", sampleRate: 16000 }) }), true,
+      "an Opus stream at the selected rate transcodes to AAC");
+    assert.equal(await transcodeFor({ description: { tracks: [] } }), true, "a stream with no readable audio track transcodes");
+  });
+
+  // The selected rate, not the stream's, decides a match: the same 8000 Hz stream copies once HomeKit selected 8000 Hz.
+  test("an 8000 Hz stream copies when HomeKit selected 8000 Hz", async () => {
+
+    const config = makeRecordingConfig({ ...SELECTED_AUDIO, samplerate: AudioRecordingSamplerate.KHZ_8 });
+
+    assert.equal(await transcodeFor({ config, description: describedWith({ channels: 1, codec: "aac", sampleRate: 8000 }) }), false,
+      "a stream at the selected 8000 Hz copies its audio");
+  });
+
+  // A transcode is the recording doing its job, not an event worth a line: nothing at info or warn names the audio, on the first recording or the next.
+  test("a recording whose audio is transcoded logs no line about it, across two recordings of one camera", async () => {
+
+    const recordingProcessFactory = new TestRecordingProcessFactory(new TestRecordingProcess({ initSegment: Buffer.from("init"), segments: [Buffer.from("seg1")] }));
+    const { clock, delegate, logEntries } = await buildTransmittingDelegate(recordingProcessFactory,
+      { description: describedWith({ channels: 1, codec: "aac", sampleRate: 8000 }) });
+
+    await drainPaced(delegate.handleRecordingStreamRequest(1, new AbortController().signal), clock);
+    delegate.closeRecordingStream(1);
+    await drainPaced(delegate.handleRecordingStreamRequest(2, new AbortController().signal), clock);
+    delegate.closeRecordingStream(2);
+
+    assert.equal(recordingProcessFactory.createCalls.length, 2, "both recordings constructed their process");
+    assert.ok(recordingProcessFactory.createCalls.every((call) => call.init.recording?.transcodeAudio === true), "both recordings transcoded their audio");
+
+    const audioLines = logEntries.filter((entry) => [ "info", "warn" ].includes(entry.level) && /audio/i.test(entry.message));
+
+    assert.deepEqual(audioLines, [], "no line at info or warn names the recording's audio");
+  });
+});
+
+/* The early-end line says why HomeKit ended a recording. Each reason HomeKit defines for an early end carries its own sentence, and a reason outside them reads the
+ * default's, so the line never prints an empty description. The line fires only for a reason HomeKit gave: a close with none is the acknowledgment path, which logs
+ * no early-end line at all, so the default is reached on the line only by a reason HomeKit gives that we do not recognize.
+ */
+describe("the early-end line describes every reason HomeKit gives for ending a recording early", () => {
+
+  // A reason value outside every member HomeKit defines, the shape a reason we do not recognize arrives in. The home hub sends the reason as a number on the wire, so
+  // a value the enum does not name is one the delegate can receive, and the cast is the only way to hand the delegate one.
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-enum-assignment -- A wire value outside the enum is the case under test.
+  const UNRECOGNIZED_REASON = 99 as HDSProtocolSpecificErrorReason;
+
+  // Drive one accepted recording event, close it with the given reason, and return the early-end line as the log renders it, or null when no early-end line fired.
+  async function endedEarlyLine(reason?: HDSProtocolSpecificErrorReason): Promise<Nullable<string>> {
+
+    const recordingProcessFactory = new TestRecordingProcessFactory(new TestRecordingProcess({ initSegment: Buffer.from("init"), segments: [Buffer.from("seg1")] }));
+    const { clock, delegate, logEntries } = await buildTransmittingDelegate(recordingProcessFactory);
+
+    await drainPaced(delegate.handleRecordingStreamRequest(1, new AbortController().signal), clock);
+    delegate.closeRecordingStream(1, reason);
+
+    const entry = logEntries.find((e) => (e.level === "error") && e.message.includes("ended early"));
+
+    return entry ? formatLogEntry(entry) : null;
+  }
+
+  const rows: { name: string; reason: HDSProtocolSpecificErrorReason; sentence: string }[] = [
+
+    { name: "not allowed", reason: HDSProtocolSpecificErrorReason.NOT_ALLOWED,
+      sentence: "HomeKit stopped allowing the camera to record, as it does when the camera is turned off in the Home app." },
+    { name: "busy", reason: HDSProtocolSpecificErrorReason.BUSY, sentence: "HomeKit reported that it was busy." },
+    { name: "unsupported", reason: HDSProtocolSpecificErrorReason.UNSUPPORTED, sentence: "HomeKit reported that the recording request is unsupported." },
+    { name: "bad data", reason: HDSProtocolSpecificErrorReason.BAD_DATA, sentence: "HomeKit could not use the recording data it received." },
+    { name: "protocol error", reason: HDSProtocolSpecificErrorReason.PROTOCOL_ERROR, sentence: "HomeKit reported a protocol error in the recording stream." },
+    { name: "invalid configuration", reason: HDSProtocolSpecificErrorReason.INVALID_CONFIGURATION,
+      sentence: "HomeKit reported that the camera's recording configuration is invalid." },
+    { name: "unrecognized", reason: UNRECOGNIZED_REASON, sentence: "HomeKit did not report a reason we recognize." }
+  ];
+
+  for(const { name, reason, sentence } of rows) {
+
+    test("the " + name + " reason is described by its own sentence, never as undefined", async () => {
+
+      const line = present(await endedEarlyLine(reason), "an early-end line for the " + name + " reason");
+
+      assert.ok(line.startsWith("HKSV recording event ended early: " + sentence), "the early-end line carries the reason's sentence: " + line);
+      assert.ok(!line.includes("undefined"), "the early-end line never reads undefined: " + line);
+    });
+  }
+
+  test("a close with no reason logs no early-end line", async () => {
+
+    assert.equal(await endedEarlyLine(), null, "the acknowledgment path's close is not an early end");
   });
 });

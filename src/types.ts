@@ -5,6 +5,7 @@
 
 import type { Camera, Chime, DeviceCollectionKey, Fob, Light, Relay, Sensor, Viewer } from "unifi-protect";
 import type { CharacteristicValue, PlatformAccessory, PlatformConfig } from "homebridge";
+import type { AcquireServiceOptions } from "homebridge-plugin-utils";
 import type { ProtectCamera } from "./devices/cameras/camera.ts";
 import type { ProtectChime } from "./devices/chime.ts";
 import type { ProtectFob } from "./devices/fob.ts";
@@ -17,7 +18,7 @@ import type { ProtectViewer } from "./devices/viewer.ts";
 // Compile-time exhaustiveness check for discriminated unions. When all cases of a union are handled in a switch statement, TypeScript narrows the remaining type to
 // `never`. Passing it to this function ensures the compiler will flag an error if a new variant is added to the union without a corresponding case. At runtime this is a
 // no-op...the call site is responsible for graceful degradation (logging, returning null, etc.).
-// eslint-disable-next-line @typescript-eslint/no-empty-function
+// eslint-disable-next-line @typescript-eslint/no-empty-function -- The function is empty by design: its parameter's never type is the whole check.
 export function exhaustiveGuard(_value: never): void {}
 
 // The Protect device categories this plugin supports, mapped to the HomeKit device class each becomes. The vocabulary itself is the library's DeviceCollectionKey; this
@@ -72,17 +73,20 @@ type IdentityKeys = "id" | "mac" | "modelKey";
 export type WithoutIdentity<T> = T extends unknown ? { [K in keyof T as K extends IdentityKeys ? never : K]: T[K] } : never;
 
 // The typed view of a Protect accessory's persisted HomeKit context. All keys are optional: the context is reset to {} and repopulated per accessory type (a camera
-// carries mac + detectMotion, a liveview switch carries liveview + liveviewState + nvr, the controller's system-info accessory carries systemInfo + nvr, and so on), so
-// presence is itself meaningful and several code paths test it with the `in` operator. This interface replaces homebridge's UnknownContext (Record<string, any>) index
-// signature so every context.<key> access is a declared-property read, satisfying noPropertyAccessFromIndexSignature without a single cast. The `mac` and
-// `packageCamera` keys are the two mutually exclusive identity forms - a real device carries `mac`, a package camera carries its parent's MAC in `packageCamera`,
-// never both - and isPackageCameraContext is the single predicate that branches on that distinction.
+// carries mac + detectMotion, a liveview switch carries liveview + liveviewDerived + liveviewState + nvr, the security system carries liveviewDerived + nvr, and
+// securityState once the user has set one, the controller's system-info accessory carries systemInfo + nvr, and so on), so presence is itself meaningful and several code
+// paths test it with the `in` operator. This interface replaces homebridge's UnknownContext (Record<string, any>) index signature so every context.<key> access is a
+// declared-property read, satisfying noPropertyAccessFromIndexSignature without a single cast. The `mac` and `packageCamera` keys are the two mutually exclusive identity
+// forms - a real device carries `mac`, a package camera carries its parent's MAC in `packageCamera`, never both - and isPackageCameraContext is the single predicate that
+// branches on that distinction. The `liveviewDerived` key marks every accessory the liveviews owner derives from the controller's liveviews, so the controller's device
+// removal passes leave those accessories to that owner.
 export interface ProtectAccessoryContext {
 
   detectMotion?: boolean;
   doorbellMuted?: boolean;
   hksvRecordingDisabled?: boolean;
   liveview?: string;
+  liveviewDerived?: boolean;
   liveviewState?: boolean;
   mac?: string;
   nvr?: string;
@@ -92,14 +96,25 @@ export interface ProtectAccessoryContext {
 }
 
 // The user-state context keys that survive a context reset. These are the ONLY keys resetAccessoryContext preserves - identity and owner-bookkeeping keys (mac, nvr,
-// packageCamera, liveview, securityState, systemInfo) are re-derived every configure, never carried across. Naming the set as a narrowed, homogeneous (all-boolean) type
-// is also what lets the preserve helper write each key directly: over the wide, heterogeneous ProtectAccessoryContext the same per-key write fails strict tsc with a
-// correlated-union error, but over this narrowed type it compiles clean.
+// packageCamera, liveview, liveviewDerived, systemInfo) are re-derived every configure, never carried across. Naming the set as a narrowed, homogeneous
+// (all-boolean) type is also what lets the preserve helper write each key directly: over the wide, heterogeneous ProtectAccessoryContext the same per-key write fails
+// strict tsc with a correlated-union error, but over this narrowed type it compiles clean.
 export type ProtectPersistedContextState = Partial<Pick<ProtectAccessoryContext, "detectMotion" | "doorbellMuted" | "hksvRecordingDisabled">>;
 
 // A Protect accessory: a homebridge PlatformAccessory whose context is our typed ProtectAccessoryContext. This alias is the single name threaded through every accessory
 // field, parameter, and creation site, so the context contract lives in exactly one place.
 export type ProtectAccessory = PlatformAccessory<ProtectAccessoryContext>;
+
+/* How a part of a device names itself: with a name of its own, or with the text it adds to its device's name, and never with a name and a suffix together. A part
+ * named from controller data carries its own name, and a part named from its device declares only its suffix, so its whole name is a function of the device's name
+ * that the device composes. A part that declares neither takes the suffix arm with no text, and is named the device's name itself.
+ */
+export type ProtectServiceNaming = { readonly name: string; readonly suffix?: never } | { readonly name?: never; readonly suffix?: string };
+
+// The options the device's service lifecycle takes, from the device itself and from a capability composed onto it: the library's own acquire or validate options,
+// less the accessory the device supplies and the name it composes, with the part's naming in their place. Every other field, its type, and its documentation stay the
+// library's own, so the lifecycle accepts exactly what the library does and nothing is restated here.
+export type ProtectServiceOptions<O extends Pick<AcquireServiceOptions, "accessory" | "name">> = Omit<O, "accessory" | "name"> & ProtectServiceNaming;
 
 /* The package-camera identity suffixes. A doorbell's package camera is a synthetic HomeKit accessory derived from its parent doorbell, and its identity is carried in two
  * distinct representations that must never be conflated: a protocol marker and a user-visible label are different jobs for different strings, so each gets its own
@@ -158,6 +173,7 @@ export const ProtectReservedNames = {
   CONTACT_SENSOR: "ContactSensor",
   CONTACT_SENSOR_ALARM_SOUND: "ContactAlarmSound",
   CONTACT_SENSOR_GLASS_BREAK: "ContactGlassBreak",
+  CONTACT_SENSOR_VAPE: "ContactVape",
 
   // Manage our leak sensor types.
   LEAKSENSOR_EXTERNAL: "External",

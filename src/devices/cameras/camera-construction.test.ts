@@ -1,35 +1,40 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * camera-construction.test.ts: The first real-ProtectCamera construction test - the proof of the platform-held streaming-delegate factory seam.
+ * camera-construction.test.ts: The first real-ProtectCamera construction test - the proof of the platform-held streaming-delegate factory interface.
  *
  * This suite constructs a REAL minimal ProtectCamera end to end - the base constructors, configureHints, configureDevice, the floating configure IIFE
- * (reconcileStreaming through the stub factory and accessory.configureController), and every state-observe loop the camera registers - against the reusable construction
+ * (the streaming reconcile through the stub factory and accessory.configureController), and every state-observe loop the camera registers - against the reusable
  * harness in testing.helpers.ts: the faithful store double, the read-through Camera projection double, the typed NVR / platform doubles, and the stub
  * StreamingDelegateFactory the dependency inversion exists to admit. It then drives a structural-sharing state push through a real observer reaction and
  * unwinds everything via cleanup(), asserting the wire-but-don't-fire observe contract at each phase through the observer-wake diagnostics channel.
  *
  * One honest infeasibility, recorded rather than papered over: asserting "no FFmpeg" directly is not meaningful, because camera.ts value-imports FFmpeg-adjacent
  * modules harmlessly at load. What the factory assertions prove is the real claim - the REAL streaming delegate class was never constructed, because the stub
- * factory satisfied the seam.
+ * factory satisfied the interface.
  *
  * The suite holds ONE observer-wake subscription across all phases (construction, push, teardown), windowing the wake log per phase; the zero-wake-during-
  * construction assertion is vacuity-proofed by the SAME subscription later observing the positive push wake. The subscription is removed once, in the suite's
  * unconditional teardown, because a leaked subscriber would flip hasSubscribers for every later test in the process.
  */
-import { CAMERA_FIXTURES, G2_PRO_CHANNELS, G6_PRO_ENTRY_CHANNELS } from "../../camera.fixtures.ts";
+import { CAMERA_FIXTURES, FIXTURE_HOST, FIXTURE_RTSPS_PORT, G2_PRO_CHANNELS, G6_PRO_ENTRY_CHANNELS } from "../../camera.fixtures.ts";
 import type { Camera, ProtectCameraConfig } from "unifi-protect";
 import type { CameraFixture, EntryProjection } from "../../camera.fixtures.ts";
-import { Characteristic, Service, TestCameraProjection, TestStateStore, makeCameraConfig, makeProtectState, makeTestAccessory, makeTestNvr, settle }
-  from "../../testing.helpers.ts";
-import type { TestAccessory, TestProtectNvr, TestStreamingDelegate, TestStreamingDelegateFactory, TestTimeshiftSupervisor } from "../../testing.helpers.ts";
+import { Characteristic, Service, TestStateStore, controllerEvents, makeProtectState, makeTestAccessory } from "../../testing.helpers.ts";
+import { TestCameraProjection, makeCameraConfig } from "../testing.helpers.ts";
+import { TestLivestreamProcessFactory, settle } from "homebridge-plugin-utils/testing";
+import type { TestProtectAccessory, TestStreamingDelegate, TestStreamingDelegateFactory, TestTimeshiftSupervisor } from "../../testing.helpers.ts";
 import { after, before, describe, test } from "node:test";
 import type { ObserverWakePayload } from "../../diagnostics.ts";
-import type { ProtectAccessory } from "../../types.ts";
 import { ProtectCamera } from "./camera.ts";
 import type { ProtectNvr } from "../../nvr/nvr.ts";
+import { ProtectReservedNames } from "../../types.ts";
 import type { Resolution } from "homebridge";
+import type { TestProtectNvr } from "../../nvr/testing.helpers.ts";
 import assert from "node:assert/strict";
+import { buildChannelProfile } from "../../media/resolution.ts";
+import { configured } from "../device-base.ts";
 import diagnosticsChannel from "node:diagnostics_channel";
+import { makeTestNvr } from "../../nvr/testing.helpers.ts";
 
 // Resolve a named fixture from the golden-master corpus, failing loudly if the corpus ever renames it.
 function fixtureByModel(model: string): CameraFixture {
@@ -47,7 +52,7 @@ function isSameResolution(a: Resolution, b: Resolution): boolean {
   return (a[0] === b[0]) && (a[1] === b[1]) && (a[2] === b[2]);
 }
 
-describe("real ProtectCamera construction through the streaming-delegate factory seam", () => {
+describe("real ProtectCamera construction through the streaming-delegate factory", () => {
 
   // The construction fixture (G2 Pro) and the push fixture (G6 Pro Entry - fully RTSP-enabled, so the re-run never enters the write-through PATCH branch). Both
   // expected advertised lists come from the golden-master corpus, single-sourcing this suite with the resolution suite.
@@ -59,7 +64,7 @@ describe("real ProtectCamera construction through the streaming-delegate factory
   const onWake = (message: unknown): void => { wakeLog.push(message as ObserverWakePayload); };
 
   // The suite-scoped harness handles, assembled once in before() so every phase asserts against the SAME constructed camera.
-  let accessory: TestAccessory;
+  let accessory: TestProtectAccessory;
   let camera: ProtectCamera;
   let cameraConfig: ProtectCameraConfig;
   let constructionWakes = 0;
@@ -79,11 +84,11 @@ describe("real ProtectCamera construction through the streaming-delegate factory
 
     projection = new TestCameraProjection(cameraConfig.id, store);
 
-    accessory = makeTestAccessory("Test Camera", "11111111-2222-3333-4444-555555555555");
+    accessory = makeTestAccessory("Test Camera", cameraConfig.mac);
 
-    // The construction under test: a REAL ProtectCamera against the harness doubles. The casts are confined to this seam; the instance itself is the production
+    // The construction under test: a REAL ProtectCamera against the harness doubles. The casts are confined to this boundary; the instance itself is the production
     // class, and everything it runs - configureHints, configureDevice, the floating IIFE, spawnObservers - is the production code path.
-    camera = new ProtectCamera(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Camera);
+    camera = configured(new ProtectCamera(nvr as unknown as ProtectNvr, accessory, projection as unknown as Camera));
 
     // Settle the floating configure IIFE and the observe loops' lazy registration before any phase asserts.
     await settle();
@@ -99,7 +104,7 @@ describe("real ProtectCamera construction through the streaming-delegate factory
 
   test("construction completes and invokes the stub factory exactly once, with the camera itself and the golden-master advertised resolutions", () => {
 
-    assert.equal(factory.createCalls.length, 1, "the factory seam was exercised exactly once");
+    assert.equal(factory.createCalls.length, 1, "the factory was exercised exactly once");
 
     const call = factory.createCalls[0];
 
@@ -111,19 +116,21 @@ describe("real ProtectCamera construction through the streaming-delegate factory
     assert.equal(projection.updateCalls.length, 0, "a fully-RTSP-enabled channel set issues no enable write during construction");
   });
 
-  test("the accessory's controller registration received exactly the stub delegate's sentinel controller, exactly once", () => {
+  test("the accessory's controller registration received exactly the stub delegate's stand-in controller, exactly once", () => {
 
     const call = factory.createCalls[0];
 
+    const configured = controllerEvents(accessory).filter((event) => event.kind === "configure");
+
     assert.ok(call, "the factory recorded its create call");
-    assert.equal(accessory.configureControllerCalls.length, 1, "configureController was called exactly once");
-    assert.equal(accessory.configureControllerCalls[0], call.delegate.controller, "the registered controller is the stub delegate's sentinel, by identity");
+    assert.equal(configured.length, 1, "HAP configured a controller exactly once");
+    assert.equal(configured[0]?.controller, call.delegate.controller, "the configured controller is the stub delegate's stand-in, by identity");
   });
 
-  test("construction wires but does not fire: zero observer wakes, with exactly fourteen observers registered", () => {
+  test("construction wires but does not fire: zero observer wakes, with exactly fifteen observers registered", () => {
 
     assert.equal(constructionWakes, 0, "no observer wake was published during construction - observers arm against the baseline and stay silent");
-    assert.equal(store.observerCount, 14, "the two base observers plus the camera's twelve are all registered against the store double");
+    assert.equal(store.observerCount, 15, "the two base observers plus the camera's thirteen are all registered against the store double");
   });
 
   test("the motion sensor's HomeKit-visible surface is real: MotionDetected false, StatusActive true, StatusTampered removed", () => {
@@ -132,23 +139,12 @@ describe("real ProtectCamera construction through the streaming-delegate factory
 
     assert.ok(motionService, "the minimal camera is HKSV-capable, so configureMotionSensor built the motion service through the real acquireService");
     assert.equal(motionService.getCharacteristic(Characteristic.MotionDetected).value, false, "MotionDetected initialized to false");
-    assert.equal(motionService.getCharacteristic(Characteristic.StatusActive).value, true, "StatusActive initialized from isReachable, which is true");
+    assert.equal(motionService.getCharacteristic(Characteristic.StatusActive).value, true, "StatusActive reads active from the sensor's setup");
 
     // The tamper-detection configure path reads prior existence side-effect-free through testCharacteristic and, with tamper detection unavailable on this camera, never
     // creates StatusTampered - the gate's prune branch has no prior characteristic to remove. The testCharacteristic predicate never lazily creates, so this is a pure
     // absence check.
     assert.equal(motionService.testCharacteristic(Characteristic.StatusTampered), false, "the tamper gate never created StatusTampered without the capability");
-  });
-
-  test("no service carries an undefined-keyed characteristic - the empty-UUID name-write pitfall stayed dead", () => {
-
-    // If the service doubles ever grew a UUID that compared equal to the degenerate empty-string name sets inside homebridge-plugin-utils' service helpers,
-    // setServiceName would write ConfiguredName / Name against undefined characteristic statics and silently pollute the double with undefined-keyed entries.
-    for(const service of accessory.services) {
-
-      assert.ok(service.characteristics.every((characteristic) => characteristic.type !== undefined),
-        "every characteristic on " + service.displayName + " is keyed by a real kind");
-    }
   });
 
   test("a structural-sharing channels push wakes exactly one observer and re-derives the advertised profiles through the real reaction", async () => {
@@ -166,27 +162,34 @@ describe("real ProtectCamera construction through the streaming-delegate factory
     assert.equal(wakes.length, 1, "exactly one observer woke for the single-slice push");
     assert.deepEqual(wakes[0], { accessoryId: accessory.UUID, key: "camera.channels" }, "the wake is the channels observer, attributed to this accessory");
 
-    // The reaction re-ran reconcileStreaming, which republished the advertised profiles from the NEW channel set. Pick a discriminating row - one advertised for
-    // the G6 Pro Entry but absent from the G2 Pro list - and select it through the production selectChannel, proving the published profiles really moved.
-    const discriminating: EntryProjection | undefined =
+    // The reaction re-ran the streaming reconcile, which republished the advertised profiles from the NEW channel set. Pick a row that tells the two models apart - one
+    // advertised for the G6 Pro Entry but absent from the G2 Pro list - and select it through the production selectChannel, proving the published profiles really
+    // moved.
+    const modelOnlyEntry: EntryProjection | undefined =
       g6Fixture.expected.find((entry) => !g2Fixture.expected.some((other) => isSameResolution(other.resolution, entry.resolution)));
 
-    assert.ok(discriminating, "the two fixture models differ in at least one advertised resolution");
+    assert.ok(modelOnlyEntry, "the two fixture models differ in at least one advertised resolution");
 
-    const selected = camera.selectChannel(discriminating.resolution[0], discriminating.resolution[1]);
+    const selected = camera.selectChannel(modelOnlyEntry.resolution[0], modelOnlyEntry.resolution[1], { bias: "nearest" });
 
-    assert.ok(selected, "selectChannel resolves the discriminating resolution against the re-derived profiles");
-    assert.deepEqual(selected.resolution, discriminating.resolution, "the selected profile carries the new model's resolution");
-    assert.equal(selected.url, discriminating.url, "the selected profile's URL matches the golden-master row");
-    assert.equal(selected.channel.id, discriminating.channelId, "the selected profile maps to the golden-master channel");
+    assert.ok(selected, "selectChannel resolves that resolution against the re-derived profiles");
+    assert.deepEqual(selected.resolution, modelOnlyEntry.resolution, "the selected profile carries the new model's resolution");
+    assert.equal(selected.url, modelOnlyEntry.url, "the selected profile's URL matches the golden-master row");
+    assert.equal(selected.channel.id, modelOnlyEntry.channelId, "the selected profile maps to the golden-master channel");
 
-    // The this.stream idempotency gate: the re-run republishes profiles and exits - no second delegate, no second controller registration.
+    // The this.stream reuse gate: a re-run is safe to repeat - it republishes profiles and exits, with no second delegate and no second controller registration.
     assert.equal(factory.createCalls.length, 1, "the factory was not invoked again on the re-run");
-    assert.equal(accessory.configureControllerCalls.length, 1, "the controller was not registered again on the re-run");
+    assert.equal(controllerEvents(accessory).length, 1, "the controller was not configured again on the re-run");
     assert.equal(projection.updateCalls.length, 0, "the fully-RTSP-enabled push issues no enable write on the re-run either");
+
+    // The production selectChannel forwards the caller's posture to the selector. A 1920x1080 request sits closer in area to the G6 Pro Entry's Medium 1440x1920 than
+    // to its Low 480x640, while Low is the highest channel at or under it, so the postures part here and a wrapper that read nearest as lower would answer Low to each
+    // call.
+    assert.equal(camera.selectChannel(1920, 1080, { bias: "nearest" })?.channel.id, 1, "copy mode's nearest posture takes Medium, the closest channel by area");
+    assert.equal(camera.selectChannel(1920, 1080, { bias: "lower" })?.channel.id, 2, "the lower posture takes Low, the highest channel at or under the request");
   });
 
-  test("cleanup unregisters the controller, unwinds all fourteen observers, and a further push wakes nothing", async () => {
+  test("cleanup unregisters the controller, unwinds all fifteen observers, and a further push wakes nothing", async () => {
 
     const call = factory.createCalls[0];
 
@@ -194,8 +197,10 @@ describe("real ProtectCamera construction through the streaming-delegate factory
 
     camera.cleanup();
 
-    assert.equal(accessory.removeControllerCalls.length, 1, "removeController was called exactly once");
-    assert.equal(accessory.removeControllerCalls[0], call.delegate.controller, "the removed controller is the same sentinel that was registered");
+    const removed = controllerEvents(accessory).filter((event) => event.kind === "remove");
+
+    assert.equal(removed.length, 1, "HAP removed the controller exactly once");
+    assert.equal(removed[0]?.controller, call.delegate.controller, "the removed controller is the same stand-in that was configured");
 
     // The per-accessory abort propagates through the composed signal into every observe loop; the store's drain-then-close completes each iterator, whose finally
     // deregisters it. Settle the microtask unwinding, then prove the registration set is empty.
@@ -224,7 +229,7 @@ describe("camera HKSV self-heal observer", () => {
     healController?.abort();
   });
 
-  // Behavior-first coverage of the both-edge availability kick (the camera.state observer drives updateAvailability, camera.ts): every camera lifecycle-state edge wakes
+  // Behavior-first coverage of the both-edge availability kick (the camera.state observer drives updateCameraState, camera.ts): every camera lifecycle-state edge wakes
   // the supervisor's reconcile, so ONE observer handles both directions - the offline edge ends an in-flight recording through the honest terminated path, and the online
   // edge re-establishes the buffer an offline-at-startup reconcile could not. We build our OWN camera here rather than reuse the suite-scoped one (that suite uses
   // before(), not beforeEach(), so its camera must not be mutated), spy on the factory-installed timeshift double's reconcile, then drive a genuine offline->online state
@@ -239,14 +244,14 @@ describe("camera HKSV self-heal observer", () => {
     healController = controller;
 
     const projection = new TestCameraProjection(cameraConfig.id, store);
-    const accessory = makeTestAccessory("HKSV Reconcile Camera", "22222222-3333-4444-5555-666666666666");
-    const camera = new ProtectCamera(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Camera);
+    const accessory = makeTestAccessory("HKSV Reconcile Camera", cameraConfig.mac);
+    const camera = configured(new ProtectCamera(nvr as unknown as ProtectNvr, accessory, projection as unknown as Camera));
 
     await settle();
 
-    // The availability observer calls updateAvailability on every lifecycle edge, which wakes the supervisor's reconcile through the standing-buffer kick; we read the
+    // The availability observer calls updateCameraState on every lifecycle edge, which wakes the supervisor's reconcile through the standing-buffer kick; we read the
     // factory-installed timeshift double's reconcile tally so the assertions observe the reconcile firing per edge rather than a private field. The hksv double retains
-    // isRecording and updateRecordingActive: both are load-bearing at teardown, where teardownStreamingDelegate calls updateRecordingActive(false) gated on
+    // isRecording and updateRecordingActive: the capability's delegate teardown calls updateRecordingActive(false) gated on
     // isRecording: true. The confined casts bridge the doubles to the StreamingDelegate types their fields are declared as.
     const delegate = factory.createCalls[0]?.delegate;
 
@@ -255,14 +260,14 @@ describe("camera HKSV self-heal observer", () => {
     delegate.hksv = { isRecording: true, updateRecordingActive: (): void => { /* No-op: only reached at teardown, not by the observer. */ } } as unknown as
       TestStreamingDelegate["hksv"];
 
-    // Discount the construction-time activation kick: the factory-installed double already recorded one reconcile from configureStreamingDelegate, so reset the tally to
+    // Discount the construction-time activation kick: the factory-installed double already recorded one reconcile from the capability's establishment, so reset the tally
     // zero before driving the lifecycle edges.
     const timeshift = delegate.timeshift as unknown as TestTimeshiftSupervisor;
 
     timeshift.reconcileCalls = 0;
 
     // The offline edge: the availability observer wakes the reconcile on every lifecycle edge, so the reconcile fires here. Asserted per-edge - exactly one call
-    // immediately after the DISCONNECTED push, BEFORE the CONNECTED push - so the assertion discriminates the offline edge rather than an end-of-test aggregate.
+    // immediately after the DISCONNECTED push, BEFORE the CONNECTED push - so the assertion pins the offline edge rather than an end-of-test aggregate.
     store.pushCameraPatch(cameraConfig.id, { state: "DISCONNECTED" });
 
     await settle();
@@ -282,7 +287,7 @@ describe("camera HKSV self-heal observer", () => {
     await settle();
   });
 
-  // The construction-time activation kick: configureStreamingDelegate wakes the supervisor right after it stands up the controller, so the standing buffer establishes
+  // The construction-time activation kick: the capability's establishment wakes the supervisor right after it stands up the controller, so the standing buffer
   // for the streaming arm independent of any recording demand. We read the factory-installed double's reconcile tally immediately after construction, before any state
   // edge could add one.
   test("construction kicks the supervisor once so the standing buffer establishes for the streaming arm", async () => {
@@ -291,16 +296,16 @@ describe("camera HKSV self-heal observer", () => {
     const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
     const { controller, factory, nvr } = makeTestNvr({ store });
 
-    const accessory = makeTestAccessory("Activation Kick Camera", "33333333-4444-5555-6666-777777777777");
-    const camera = new ProtectCamera(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory,
-      new TestCameraProjection(cameraConfig.id, store) as unknown as Camera);
+    const accessory = makeTestAccessory("Activation Kick Camera", cameraConfig.mac);
+    const camera = configured(new ProtectCamera(nvr as unknown as ProtectNvr, accessory,
+      new TestCameraProjection(cameraConfig.id, store) as unknown as Camera));
 
     await settle();
 
     const timeshift = factory.createCalls[0]?.delegate.timeshift as unknown as TestTimeshiftSupervisor;
 
     assert.ok(timeshift, "the factory installed a timeshift double on the created delegate");
-    assert.equal(timeshift.reconcileCalls, 1, "configureStreamingDelegate kicked the supervisor exactly once at construction");
+    assert.equal(timeshift.reconcileCalls, 1, "the capability's establishment kicked the supervisor exactly once at construction");
 
     camera.cleanup();
 
@@ -308,4 +313,141 @@ describe("camera HKSV self-heal observer", () => {
 
     controller.abort();
   });
+});
+
+describe("the streaming-delegate construction gate", () => {
+
+  // Each side of the gate builds its own camera against fresh harness doubles, so the controller phase is settled BEFORE construction runs rather than mutated
+  // underneath a shared one.
+  const gateControllers: AbortController[] = [];
+
+  after(() => {
+
+    for(const controller of gateControllers) {
+
+      controller.abort();
+    }
+  });
+
+  // Construct a real ProtectCamera end to end, optionally against a controller that has already entered shutdown. Everything the camera runs here - configureHints,
+  // configureDevice, the floating configure IIFE, the streaming reconcile - is the production path; only the NVR, accessory, projection, and factory are doubles.
+  async function constructCamera(phase?: TestProtectNvr["phase"]): Promise<{ camera: ProtectCamera; factory: TestStreamingDelegateFactory }> {
+
+    const gateConfig = makeCameraConfig({ channels: G2_PRO_CHANNELS });
+    const gateStore = new TestStateStore(makeProtectState({ cameras: [gateConfig] }));
+    const { controller, factory, nvr } = makeTestNvr({ store: gateStore });
+
+    gateControllers.push(controller);
+
+    if(phase) {
+
+      nvr.phase = phase;
+    }
+
+    const gateAccessory = makeTestAccessory("Gate Camera", gateConfig.mac);
+    const camera = configured(new ProtectCamera(nvr as unknown as ProtectNvr, gateAccessory,
+      new TestCameraProjection(gateConfig.id, gateStore) as unknown as Camera));
+
+    await settle();
+
+    return { camera, factory };
+  }
+
+  /* The control side, and it is what gives the gate side its meaning: without it, a rig that never reached construction at all - or an unrelated early return anywhere
+   * ahead of the gate - would satisfy the same empty-factory end state. This proves the arrangement genuinely reaches the construction the gate exists to decline.
+   */
+  test("a camera on a running controller stands up its streaming delegate", async () => {
+
+    const { camera, factory } = await constructCamera();
+
+    assert.equal(factory.createCalls.length, 1, "construction reached the factory exactly once");
+    assert.equal(camera.stream, factory.createCalls[0]?.delegate, "the camera holds the delegate the factory returned");
+  });
+
+  // The gate side. The shutdown teardown walk visits each camera exactly once, so a delegate built after it has passed would hold a registered controller and a pooled
+  // livestream seat that nothing would ever release. Construction declines outright instead.
+  test("a camera whose controller has begun shutting down stands up no streaming delegate", async () => {
+
+    const { camera, factory } = await constructCamera("shuttingDown");
+
+    assert.equal(factory.createCalls.length, 0, "construction never reached the factory");
+    assert.equal(camera.stream, undefined, "the camera holds no delegate");
+  });
+});
+
+describe("the RTSP debug livestream", () => {
+
+  // The hand-off the compiler cannot see: the camera reaches its platform through the NVR double's cast, so a platform double that lacked the livestream-process
+  // factory would still compile and the adapter would meet an undefined factory only at runtime. A camera with the debug option on, a standing streaming delegate,
+  // and an RTSP-enabled channel builds the adapter's process through the platform's factory, and the factory's record shows the camera's own FFmpeg options arrived
+  // with it.
+  test("a camera with the RTSP debug option builds its livestream's process through the platform's factory with the camera's own FFmpeg options", async () => {
+
+    const cameraConfig = makeCameraConfig({ channels: G2_PRO_CHANNELS });
+    const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
+    const livestreamProcessFactory = new TestLivestreamProcessFactory();
+    const { controller, nvr } = makeTestNvr({ livestreamProcessFactory, store, userOptions: ["Enable.Debug.Video.Timeshift.UseRtsp"] });
+    const accessory = makeTestAccessory("RTSP Debug Camera", cameraConfig.mac);
+    const camera = configured(new ProtectCamera(nvr as unknown as ProtectNvr, accessory,
+      new TestCameraProjection(cameraConfig.id, store) as unknown as Camera));
+
+    // The debug path needs the streaming delegate, which the floating configure pass stands up, so the pass settles before the livestream is requested.
+    await settle();
+
+    const channel = G2_PRO_CHANNELS.find((candidate) => candidate.isRtspEnabled);
+
+    assert.ok(camera.stream, "the camera stood up its streaming delegate");
+    assert.ok(channel, "the G2 Pro fixture carries an RTSP-enabled channel for the debug path to dial");
+
+    const subscription = camera.livestream(buildChannelProfile(channel, { rtspPort: FIXTURE_RTSPS_PORT, urlHost: FIXTURE_HOST }));
+
+    assert.equal(livestreamProcessFactory.createCalls.length, 1, "the camera built the adapter's process through the platform's factory, exactly once");
+    assert.equal(livestreamProcessFactory.createCalls[0]?.options, camera.stream.ffmpegOptions, "the factory received the camera's own FFmpeg options");
+
+    await subscription[Symbol.asyncDispose]();
+    camera.cleanup();
+
+    await settle();
+
+    controller.abort();
+  });
+});
+
+/* The construction-time HomeKit Secure Video surface follows the controller's motion report and nothing else. A camera Protect exposes a motion sensor for constructs
+ * with its motion sensor, the recording switch its option asks for, and a controller built with the recording arm; a camera it exposes none for constructs with none
+ * of the three, and smart detection on its own changes nothing, since smart detection is the smart-detection features' concern.
+ */
+describe("the construction-time HomeKit Secure Video surface", () => {
+
+  const cases: { expected: boolean; featureFlags: Partial<ProtectCameraConfig["featureFlags"]>; label: string }[] = [
+
+    { expected: false, featureFlags: { hasMotionDetection: false }, label: "a camera Protect exposes no motion sensor for" },
+    { expected: true, featureFlags: { hasMotionDetection: true }, label: "a camera Protect exposes a motion sensor for" },
+    { expected: false, featureFlags: { hasMotionDetection: false, hasSmartDetect: true, smartDetectTypes: ["person"] },
+      label: "a camera reporting smart detection without a motion sensor" }
+  ];
+
+  for(const { expected, featureFlags, label } of cases) {
+
+    test(label + (expected ? " carries" : " carries none of") + " the motion sensor, the recording switch, and the recording arm", async () => {
+
+      const cameraConfig = makeCameraConfig({ channels: G2_PRO_CHANNELS, featureFlags });
+      const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
+      const { controller, nvr } = makeTestNvr({ store, userOptions: ["Enable.Video.HKSV.Recording.Switch"] });
+      const accessory = makeTestAccessory("HKSV Surface Camera", cameraConfig.mac);
+      const camera = configured(new ProtectCamera(nvr as unknown as ProtectNvr, accessory,
+        new TestCameraProjection(cameraConfig.id, store) as unknown as Camera));
+
+      await settle();
+
+      assert.ok(camera.stream, "the camera built its controller, so the recording arm's presence is a real reading");
+      assert.equal(accessory.getService(Service.MotionSensor) !== undefined, expected, "the motion sensor's presence follows the motion report");
+      assert.equal(accessory.getServiceById(Service.Switch, ProtectReservedNames.SWITCH_HKSV_RECORDING) !== undefined, expected,
+        "the recording switch the option asks for follows the motion report");
+      assert.equal(camera.stream.builtFor.hksvCapable, expected, "the controller's recording arm follows the motion report");
+
+      camera.cleanup();
+      controller.abort();
+    });
+  }
 });

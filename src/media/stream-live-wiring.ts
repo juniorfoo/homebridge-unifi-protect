@@ -269,7 +269,7 @@ export function resolveStartStreamEncodePlan(input: { bufferForcedTranscodeReaso
     const transcodeSource = input.protectCamera.selectChannel(
       usesHardwareEncoder ? 3840 : input.request.video.width,
       usesHardwareEncoder ? 2160 : input.request.video.height,
-      { biasHigher: true, maxPixels: input.ffmpegOptions.maxSourcePixels("stream") }
+      { bias: "higher", maxPixels: input.ffmpegOptions.maxSourcePixels("stream") }
     );
 
     if(!transcodeSource) {

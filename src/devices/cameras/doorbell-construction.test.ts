@@ -7,35 +7,41 @@
  * construction-attaches its DoorbellCapability - the base constructors, the camera's configureDevice chain, the floating configure IIFE, the capability's configure
  * (the Doorbell service, LCD, physical chimes, chime volume), and the observers (the camera's plain-camera set, now including the always-armed isDoorbell
  * observer, the bare-motion lastMotion observer, and the capability-reconcile featureFlags observer, plus the capability's own). Suite B constructs
- * the full doorbell-plus-package family and pins the self-observing package camera: its exact persisted context, its
- * suffixed display name through the syncedName seam, its observer census, and the fact that firmware, name, availability, and reachability all flow through
+ * the full doorbell-plus-package family and locks in the self-observing package camera: its exact persisted context, its
+ * suffixed display name through the homeKitName delegation, its observer census, and the fact that firmware, name, availability, and reachability all flow through
  * the package's own observers or the NVR's endpoints iterator. The reclassification-flap regression and the
- * deleted-copy-forward hints-equality pin guard the two known hazards of the reshape, and the UUID-seed pin guards the persistence-critical identity suffix against
- * drift. The pure-test unlocks ride along: the package selectChannel lens-2/URL-host rows and the parent selectSubstrateChannel pixel-ceiling row.
+ * deleted-copy-forward hints-equality assertion guard the known hazards of the reshape, and the UUID-seed assertion guards the persistence-critical identity
+ * suffix against drift. The file also holds the pure-test unlocks: the package selectChannel lens-2/URL-host rows and the parent selectSubstrateChannel pixel-ceiling
+ * row. Suite D names the package camera under its doorbell's custom name with name syncing off, and reads the package's log prefix with the shared record present and
+ * removed.
  *
  * Each suite holds ONE observer-wake subscription across all its phases, windowing the wake log per phase; the zero-wake-during-construction assertions are
  * vacuity-proofed by the same subscription later observing positive wakes. Test files run in separate processes under the node:test runner, so the subscriptions
  * never cross-talk with other suites.
  */
-import { Characteristic, Service, TestAccessory, TestCameraProjection, TestRecordingDispatch, TestStateStore, makeCameraConfig, makeChimeConfig, makeProtectState,
-  makeTestAccessory, makeTestNvr, settle } from "../../testing.helpers.ts";
+import { Characteristic, Service, TestStateStore, accessoryUuid, controllerEvents, makeProtectState, makeTestAccessory } from "../../testing.helpers.ts";
 import { G2_PRO_CHANNELS, G6_INSTANT_CHANNELS, G6_PRO_ENTRY_CHANNELS } from "../../camera.fixtures.ts";
-import type { TestApiCall, TestLogEntry, TestProtectNvr, TestStreamingDelegate, TestStreamingDelegateFactory } from "../../testing.helpers.ts";
+import { TestCameraProjection, makeCameraConfig, makeChimeConfig } from "../testing.helpers.ts";
+import type { TestHomebridgeApi, TestLogEntry } from "homebridge-plugin-utils/testing";
+import type { TestProtectAccessory, TestStreamingDelegate, TestStreamingDelegateFactory } from "../../testing.helpers.ts";
+import { TestRecordingDispatch, makeTestNvr, restoreAccessories } from "../../nvr/testing.helpers.ts";
 import { after, afterEach, before, describe, test } from "node:test";
+import { assertNoUnhandledRejections, formatLogEntry, logCount, settle } from "homebridge-plugin-utils/testing";
 import type { Camera } from "unifi-protect";
 import type { ObserverWakePayload } from "../../diagnostics.ts";
-import type { ProtectAccessory } from "../../types.ts";
 import { ProtectCamera } from "./camera.ts";
 import type { ProtectEventDispatch } from "../../nvr/event-dispatch.ts";
 import type { ProtectNvr } from "../../nvr/nvr.ts";
+import type { TestProtectNvr } from "../../nvr/testing.helpers.ts";
 import assert from "node:assert/strict";
+import { configured } from "../device-base.ts";
 import diagnosticsChannel from "node:diagnostics_channel";
 
-// Construct a real ProtectCamera against an isDoorbell-true config so it construction-attaches its DoorbellCapability, with the casts confined to this seam - the
+// Construct a real ProtectCamera against an isDoorbell-true config so it construction-attaches its DoorbellCapability, with the casts confined to this one boundary - the
 // instance under test is the production ProtectCamera and its composed capability.
-function constructDoorbell(nvr: TestProtectNvr, accessory: TestAccessory, projection: TestCameraProjection): ProtectCamera {
+function constructDoorbell(nvr: TestProtectNvr, accessory: TestProtectAccessory, projection: TestCameraProjection): ProtectCamera {
 
-  return new ProtectCamera(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Camera);
+  return configured(new ProtectCamera(nvr as unknown as ProtectNvr, accessory, projection as unknown as Camera));
 }
 
 describe("real doorbell construction (suite A)", () => {
@@ -43,7 +49,7 @@ describe("real doorbell construction (suite A)", () => {
   const wakeLog: ObserverWakePayload[] = [];
   const onWake = (message: unknown): void => { wakeLog.push(message as ObserverWakePayload); };
 
-  let accessory: TestAccessory;
+  let accessory: TestProtectAccessory;
   let constructionWakes = 0;
   let doorbell: ProtectCamera;
   let factory: TestStreamingDelegateFactory;
@@ -62,7 +68,7 @@ describe("real doorbell construction (suite A)", () => {
 
     ({ controller: harnessController, factory, nvr } = makeTestNvr({ store }));
 
-    accessory = makeTestAccessory("Front Door", "uuid:74ACB9000001");
+    accessory = makeTestAccessory("Front Door", "74ACB9000001");
     doorbell = constructDoorbell(nvr, accessory, new TestCameraProjection(cameraConfig.id, store));
 
     await settle();
@@ -83,21 +89,21 @@ describe("real doorbell construction (suite A)", () => {
     const doorbellService = accessory.getService(Service.Doorbell);
 
     assert.ok(doorbellService, "the video doorbell service exists");
-    assert.equal(doorbellService.isPrimary, true, "configureDoorbellService marked the Doorbell service primary");
+    assert.equal(doorbellService.isPrimaryService, true, "configureDoorbellService marked the Doorbell service primary");
   });
 
-  test("the doorbell wires eighteen observers - the camera's plain-camera set plus the capability's four - and fires none at construction", () => {
+  test("the doorbell wires nineteen observers - the camera's plain-camera set plus the capability's four - and fires none at construction", () => {
 
     // The census: the base observers (name, firmware) + the camera set (the always-armed isDoorbell observer, the bare-motion lastMotion observer, the
-    // capability-reconcile featureFlags observer, and the Access-lock supportUnlock observer all join the doorbell-attached camera's set) + the capability observers
-    // (lcdMessage, hasPackageCamera, chimeDuration, chimeVolume) = the doorbell's full observer set.
-    assert.equal(store.observerCount, 18, "the eighteen-observer census holds across the capability collapse and the always-armed isDoorbell observer");
+    // capability-reconcile featureFlags observer, the Access-lock supportUnlock observer, and the HomeKit Secure Video eligibility observer all join the
+    // doorbell-attached camera's set) + the capability observers (lcdMessage, hasPackageCamera, chimeDuration, chimeVolume) = the doorbell's full observer set.
+    assert.equal(store.observerCount, 19, "the nineteen-observer census holds across the capability collapse and the always-armed isDoorbell observer");
     assert.equal(constructionWakes, 0, "observers arm against the baseline and stay silent at construction");
   });
 
   test("the capability is attached, its name delegates to the camera's, and messageSwitches stays capability-private (no camera field)", () => {
 
-    // The composition seam: the camera carries the live capability, attached at construction because the config reports isDoorbell.
+    // The composition point: the camera carries the live capability, attached at construction because the config reports isDoorbell.
     assert.ok(doorbell.doorbell, "the camera carries an attached DoorbellCapability");
 
     // Log-prefix parity: the capability's name override resolves to the camera's name (the live controller projection name), the exact value the pre-collapse doorbell
@@ -121,13 +127,13 @@ describe("real doorbell construction (suite A)", () => {
     const chimeConfig = makeChimeConfig({ cameraIds: [cameraConfig.id], ringSettings: [{ cameraId: cameraConfig.id, volume: 50 }] });
     const localStore = new TestStateStore(makeProtectState({ cameras: [cameraConfig], chimes: [chimeConfig] }));
     const { controller: localController, nvr: localNvr } = makeTestNvr({ store: localStore });
-    const localAccessory = makeTestAccessory("Front Door", "uuid:74ACB9000099");
+    const localAccessory = makeTestAccessory("Front Door", "74ACB9000099");
     const localDoorbell = constructDoorbell(localNvr, localAccessory, new TestCameraProjection(cameraConfig.id, localStore));
 
     await settle();
 
     // The wake assertion for one key: push the slice that drives the keyed observer, settle, and assert a wake carrying that verbatim key under the camera's accessory
-    // UUID - which proves the key is preserved, the capability's observer is armed, AND the publishObserverWake delegation seam attributes it to the camera.
+    // UUID - which proves the key is preserved, the capability's observer is armed, AND the publishObserverWake delegation attributes it to the camera.
     const assertWake = async (key: string, push: () => void): Promise<void> => {
 
       const baseline = localWakes.length;
@@ -171,6 +177,52 @@ describe("real doorbell construction (suite A)", () => {
 
     assert.equal(wakeLog.length, teardownBaseline, "a push after cleanup wakes nothing");
   });
+
+  test("the capability falls with its host's lifetime alone, without the camera's explicit teardown call", async () => {
+
+    // A self-contained construction, for two reasons: the suite's shared doorbell was torn down by the test above, and this arrangement mutates a field on the camera
+    // under test.
+    const localWakes: ObserverWakePayload[] = [];
+    const onLocalWake = (message: unknown): void => { localWakes.push(message as ObserverWakePayload); };
+
+    diagnosticsChannel.subscribe("hbup:observer:wake", onLocalWake);
+
+    const cameraConfig = makeCameraConfig({ channels: G2_PRO_CHANNELS, featureFlags: { hasLcdScreen: true, isDoorbell: true }, name: "Front Door" });
+    const localStore = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
+    const { controller: localController, nvr: localNvr } = makeTestNvr({ store: localStore });
+    const localDoorbell = constructDoorbell(localNvr, makeTestAccessory("Front Door", "74ACB9000098"), new TestCameraProjection(cameraConfig.id, localStore));
+
+    await settle();
+
+    const capability = localDoorbell.doorbell;
+
+    assert.ok(capability, "the isDoorbell config attached the capability whose teardown cascade is under test");
+
+    try {
+
+      // The camera's own cleanup tears its capability down by an explicit call, which would unwind these observers whatever lifetime the capability composed against.
+      // Nulling the field removes that courtesy, so the only thing left to unwind the capability is the contract's own guarantee: a capability composes its controller
+      // against its host's signal, so aborting either level tears the capability down.
+      localDoorbell.doorbell = null;
+      localDoorbell.cleanup();
+
+      await settle();
+
+      const teardownBaseline = localWakes.length;
+
+      // lcdMessage is a slice one of the capability's own observers watches, so a wake here means that observer outlived the host whose lifetime it rides.
+      localStore.pushCameraPatch(cameraConfig.id, { lcdMessage: { resetAt: null, text: "GO AWAY", type: "CUSTOM_MESSAGE" } });
+
+      await settle();
+
+      assert.equal(localWakes.length, teardownBaseline, "the host's teardown cascaded into the capability, so the capability's own observer wakes nothing");
+    } finally {
+
+      capability.cleanup();
+      localController.abort();
+      diagnosticsChannel.unsubscribe("hbup:observer:wake", onLocalWake);
+    }
+  });
 });
 
 describe("doorbell + package camera family construction (suite B)", () => {
@@ -178,35 +230,35 @@ describe("doorbell + package camera family construction (suite B)", () => {
   const wakeLog: ObserverWakePayload[] = [];
   const onWake = (message: unknown): void => { wakeLog.push(message as ObserverWakePayload); };
 
-  let apiCalls: TestApiCall[];
+  let api: TestHomebridgeApi;
   let cameraId = "";
   let constructionWakes = 0;
   let doorbell: ProtectCamera;
   let harnessController: AbortController | undefined;
-  let logEntries: TestLogEntry[];
+  let logEntries: readonly TestLogEntry[];
   let nvr: TestProtectNvr;
   let store: TestStateStore;
 
   // The package camera's accessory, asserted live.
-  function packageAccessory(): TestAccessory {
+  function packageAccessory(): TestProtectAccessory {
 
     assert.ok(doorbell.packageCamera, "the package camera instance is live");
 
-    return doorbell.packageCamera.accessory as unknown as TestAccessory;
+    return doorbell.packageCamera.accessory as unknown as TestProtectAccessory;
   }
 
   before(async () => {
 
     diagnosticsChannel.subscribe("hbup:observer:wake", onWake);
 
-    // Name syncing is enabled for this family so the suffixed-name seam and the rename reaction are exercised; everything else sits at its default.
+    // Name syncing is enabled for this family so the suffixed-name delegation and the rename reaction are exercised; everything else sits at its default.
     const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { hasPackageCamera: true, isDoorbell: true }, name: "Front Door" });
 
     cameraId = cameraConfig.id;
     store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
-    ({ apiCalls, controller: harnessController, logEntries, nvr } = makeTestNvr({ store, userOptions: ["Enable.Device.SyncName"] }));
+    ({ api, controller: harnessController, logEntries, nvr } = makeTestNvr({ store, userOptions: ["Enable.Device.SyncName"] }));
 
-    doorbell = constructDoorbell(nvr, makeTestAccessory("Front Door", "uuid:74ACB9000001"), new TestCameraProjection(cameraId, store));
+    doorbell = constructDoorbell(nvr, makeTestAccessory("Front Door", "74ACB9000001"), new TestCameraProjection(cameraId, store));
 
     await settle();
 
@@ -223,15 +275,15 @@ describe("doorbell + package camera family construction (suite B)", () => {
 
     const accessory = packageAccessory();
 
-    assert.equal(accessory.UUID, "uuid:74ACB9000001.PackageCamera", "the accessory UUID derives from the parent MAC plus the identity suffix");
+    assert.equal(accessory.UUID, accessoryUuid("74ACB9000001.PackageCamera"), "the accessory UUID derives from the parent MAC plus the identity suffix");
     assert.ok(nvr.platform.accessories.includes(accessory), "the accessory is tracked in the platform's accessories array");
-    assert.equal(apiCalls.filter((call) => (call.kind === "register") && call.accessories.includes(accessory)).length, 1, "the accessory registered as bridged");
+    assert.equal(api.calls.filter((call) => (call.kind === "register") && call.accessories.includes(accessory)).length, 1, "the accessory registered as bridged");
     assert.deepEqual(Object.keys(accessory.context).sort(), [ "detectMotion", "nvr", "packageCamera" ], "the persisted context carries exactly the production keys");
-    assert.equal(accessory.context["packageCamera"], "74ACB9000001", "the packageCamera context key carries the parent MAC");
-    assert.equal(accessory.context["detectMotion"], true, "motion awareness defaults on");
+    assert.equal(accessory.context.packageCamera, "74ACB9000001", "the packageCamera context key carries the parent MAC");
+    assert.equal(accessory.context.detectMotion, true, "motion awareness defaults on");
   });
 
-  test("the package camera's display name flows through the syncedName seam with the display suffix applied", () => {
+  test("the package camera's display name flows through the homeKitName accessor with the display suffix applied", () => {
 
     const accessory = packageAccessory();
 
@@ -241,13 +293,13 @@ describe("doorbell + package camera family construction (suite B)", () => {
       "the HomeKit-visible name carries the suffix");
   });
 
-  test("the family wires but does not fire: eighteen doorbell observers plus four package observers, zero construction wakes", () => {
+  test("the family wires but does not fire: nineteen doorbell observers plus four package observers, zero construction wakes", () => {
 
     // The package census: the inherited base observers (name, firmware) plus its bespoke camera.state availability and package-channel observers - and nothing from the
-    // camera set. The doorbell-attached camera contributes its full observer set (its plain-camera set, now including the always-armed isDoorbell observer, the
-    // bare-motion lastMotion observer, the capability-reconcile featureFlags observer, and the Access-lock supportUnlock observer, plus the capability's own plus the
-    // base observers).
-    assert.equal(store.observerCount, 22, "eighteen doorbell observers plus the package's four");
+    // camera set. The doorbell-attached camera contributes its full observer set (its plain-camera set, including the always-armed isDoorbell observer, the
+    // bare-motion lastMotion observer, the capability-reconcile featureFlags observer, the Access-lock supportUnlock observer, and the HomeKit Secure Video
+    // eligibility observer, plus the capability's own plus the base observers).
+    assert.equal(store.observerCount, 23, "nineteen doorbell observers plus the package's four");
     assert.equal(constructionWakes, 0, "no observer fired during family construction");
   });
 
@@ -263,7 +315,7 @@ describe("doorbell + package camera family construction (suite B)", () => {
     }
   });
 
-  test("a firmware push drives the package camera's own configureInfo - the doorbell fan-out is dead", async () => {
+  test("a firmware push drives the package camera's own setInfo - the doorbell fan-out is dead", async () => {
 
     const pushBaseline = wakeLog.length;
 
@@ -293,15 +345,16 @@ describe("doorbell + package camera family construction (suite B)", () => {
 
     // The package camera carries its OWN decorated "Name [Model]" log prefix - the parent's name with the Package Camera suffix - so its log lines are attributable
     // rather than colliding with the doorbell's. It shares the underlying projection and market name, so only the suffix on the name keeps the two prefixes distinct.
-    const renameLines = logEntries.filter((entry) => (entry.level === "info") && entry.formatted.includes("updating the HomeKit name to"));
+    const renameLines = logEntries.filter((entry) => (entry.level === "info") && formatLogEntry(entry).includes("updating the HomeKit name to"));
 
-    assert.equal(renameLines.filter((entry) => entry.formatted.includes("New Door Package Camera.")).length, 1,
+    assert.equal(renameLines.filter((entry) => formatLogEntry(entry).includes("New Door Package Camera.")).length, 1,
       "the package logs exactly one rename line of its own");
-    assert.ok(renameLines.some((entry) => entry.formatted.startsWith("New Door Package Camera [Test Camera Model]: ")),
+    assert.ok(renameLines.some((entry) => formatLogEntry(entry).startsWith("New Door Package Camera [Test Camera Model]: ")),
       "the package's rename line carries its own suffixed \"Name [Model]\" prefix, distinct from the doorbell's");
   });
 
-  test("a device-state push drives the package's narrow availability projection: StatusActive only, StatusTampered never appears", async () => {
+  // Connection is No Response's question, so a device-state push moves neither camera's StatusActive.
+  test("a device-state push moves nothing on the package's StatusActive, and StatusTampered never appears", async () => {
 
     store.pushCameraPatch(cameraId, { state: "DISCONNECTED" });
 
@@ -310,25 +363,23 @@ describe("doorbell + package camera family construction (suite B)", () => {
     const motionService = packageAccessory().getService(Service.MotionSensor);
 
     assert.ok(motionService, "the package carries its motion sensor");
-    assert.equal(motionService.getCharacteristic(Characteristic.StatusActive).value, false, "the package's own state observer drove StatusActive inactive");
+    assert.equal(motionService.getCharacteristic(Characteristic.StatusActive).value, true, "the package's own state observer moved nothing on StatusActive");
     assert.equal(motionService.testCharacteristic(Characteristic.StatusTampered), false,
-      "the guarded base availability projection never sprouts StatusTampered onto the package motion sensor");
+      "the guarded camera state reaction never sprouts StatusTampered onto the package motion sensor");
 
     // Restore the connected state for the suites that follow.
     store.pushCameraPatch(cameraId, { state: "CONNECTED" });
 
     await settle();
-
-    assert.equal(motionService.getCharacteristic(Characteristic.StatusActive).value, true, "the return to CONNECTED restores StatusActive");
   });
 
   test("an isDoorbell flap within one drain self-collapses: no WARN, the capability stays attached, and the controller never churns", async () => {
 
     // The isDoorbell observer is unconditionally armed on every camera, so it may wake on the flap -
     // but the reconcile re-reads LIVE state on each wake, and the flap (isDoorbell drops then returns before any consumer drains) leaves live state at its final value.
-    const accessory = doorbell.accessory as unknown as TestAccessory;
+    const accessory = doorbell.accessory as unknown as TestProtectAccessory;
     const warnBaseline = logEntries.filter((entry) => entry.level === "warn").length;
-    const churnBaseline = accessory.controllerEvents.length;
+    const churnBaseline = controllerEvents(accessory).length;
 
     // The flap: isDoorbell drops and returns before any consumer drains.
     store.pushCameraFeatureFlags(cameraId, { isDoorbell: false });
@@ -341,39 +392,28 @@ describe("doorbell + package camera family construction (suite B)", () => {
     assert.equal(logEntries.filter((entry) => entry.level === "warn").length, warnBaseline, "the within-drain flap raises no withdrawal warning - it self-collapsed");
     assert.ok(doorbell.doorbell, "the doorbell capability survives the flap, never detached");
 
-    // No controller churn: the self-collapse leaves isDoorbell at the value the controller was already built for, so the capability reconcile's audio rebuild sees no
-    // frozen audio capability appeared and skips rebuildStreamingDelegate - no removeController/configureController fired at the flap.
-    assert.equal(accessory.controllerEvents.length, churnBaseline, "the flap drove zero controller churn - no rebuild");
+    // No controller churn: the self-collapse leaves isDoorbell at the value the controller was already built for, so the capability reconcile's controller-identity
+    // check sees no frozen term appeared and skips the in-place controller rebuild - no removeController/configureController fired at the flap.
+    assert.equal(controllerEvents(accessory).length, churnBaseline, "the flap drove zero controller churn - no rebuild");
   });
 
-  test("controller-health reachability: the doorbell no longer fans out to the package, whose endpoint surface is first-class", async () => {
+  // The connection loop walks the package camera as an endpoint of its own, and nothing it pushes moves a camera's active state.
+  test("controller-health reachability moves neither camera's active state, and the package answers its own push", () => {
 
     nvr.client.connection.isHealthy = false;
 
-    // The doorbell's own refresh runs first, exactly as the NVR endpoints iterator would drive it - and its refresh does not touch the package accessory.
-    const doorbellTransition = doorbell.refreshReachability();
+    assert.ok(doorbell.packageCamera, "the package camera instance is live");
 
-    assert.deepEqual(doorbellTransition, { now: false, was: true }, "the doorbell reports its own reachability flip");
+    doorbell.noteConnectionChanged();
+    doorbell.packageCamera.noteConnectionChanged();
 
     const motionService = packageAccessory().getService(Service.MotionSensor);
 
-    assert.equal(motionService?.getCharacteristic(Characteristic.StatusActive).value, true, "the deleted override no longer fans reachability into the package");
-
-    // The package endpoint the iterator yields right after its parent: the base refreshReachability writes the identical StatusActive surface and reports the flip
-    // for the reachability-fanout diagnostics.
-    assert.ok(doorbell.packageCamera, "the package camera instance is live");
-
-    const packageTransition = doorbell.packageCamera.refreshReachability();
-
-    assert.deepEqual(packageTransition, { now: false, was: true }, "the package reports its own reachability flip for the fanout diagnostics");
-    assert.equal(motionService?.getCharacteristic(Characteristic.StatusActive).value, false, "the package endpoint write landed on its motion sensor");
+    assert.equal(motionService?.getCharacteristic(Characteristic.StatusActive).value, true, "the package's StatusActive stands through the outage");
+    assert.equal(doorbell.accessory.getService(Service.MotionSensor)?.getCharacteristic(Characteristic.StatusActive).value, true, "and so does the doorbell's");
 
     // Restore controller health for any suite that follows.
     nvr.client.connection.isHealthy = true;
-    doorbell.refreshReachability();
-    doorbell.packageCamera.refreshReachability();
-
-    assert.equal(motionService?.getCharacteristic(Characteristic.StatusActive).value, true, "the restored health reads back active");
   });
 
   test("family cleanup unwinds the doorbell and the package together", async () => {
@@ -386,7 +426,7 @@ describe("doorbell + package camera family construction (suite B)", () => {
 
     assert.equal(doorbell.packageCamera, null, "cleanup nulls the package camera handle");
     assert.equal(store.observerCount, 0, "every family observer deregistered");
-    assert.equal(accessory.removeControllerCalls.length, 1, "the package's controller was unregistered at cleanup");
+    assert.equal(controllerEvents(accessory).filter((event) => event.kind === "remove").length, 1, "the package's controller was unregistered at cleanup");
 
     const teardownBaseline = wakeLog.length;
 
@@ -399,7 +439,7 @@ describe("doorbell + package camera family construction (suite B)", () => {
 });
 
 // Suite C drives the parent doorbell's bare-motion lastMotion observer for its package-forward effect against the REAL ProtectEventDispatch contract, with the recording
-// dispatch injected through the NVR double's seam (the recording subclass captures the delivery without arming a reset timer or touching HAP). A plain camera has
+// dispatch injected through the NVR double's dispatch hook (the recording subclass captures the delivery without arming a reset timer or touching HAP). A bare camera has
 // no packageCamera, so this case can only live in the doorbell-plus-package family harness. The parent owns the single forward: when the package camera is recording for
 // HKSV, the parent's raw motion always trips the package's motion sensor (the package has no motion signal of its own), independent of whether the parent itself
 // fired. The parent is built smart-capable and smart-enabled (and is not itself recording), so shouldDeliverBareMotion SUPPRESSES the parent's own delivery - which is
@@ -411,7 +451,7 @@ describe("doorbell bare-motion package forward (suite C)", () => {
   let harnessController: AbortController | undefined;
 
   // Build a real doorbell-plus-package family with the package channel provisioned (so the package camera holds a stub stream), wiring the recording dispatch through the
-  // dispatch seam. The doorbell is smart-capable and smart-enabled so its OWN bare motion is suppressed by the policy, isolating the package forward. Returns the family
+  // dispatch hook. The doorbell is smart-capable and smart-enabled so its OWN bare motion is suppressed by the policy, isolating the package forward. Returns the family
   // handles the tests drive: the shared parent record id, the recording dispatch, and the store.
   async function buildFamily(): Promise<{ cameraId: string; recording: TestRecordingDispatch; store: TestStateStore }> {
 
@@ -425,8 +465,8 @@ describe("doorbell bare-motion package forward (suite C)", () => {
 
     const recording = nvr.events as TestRecordingDispatch;
 
-    doorbell = new ProtectCamera(nvr as unknown as ProtectNvr, makeTestAccessory("Front Door", "uuid:74ACB9000001") as unknown as ProtectAccessory,
-      new TestCameraProjection(cameraConfig.id, store) as unknown as Camera);
+    doorbell = configured(new ProtectCamera(nvr as unknown as ProtectNvr, makeTestAccessory("Front Door", "74ACB9000001"),
+      new TestCameraProjection(cameraConfig.id, store) as unknown as Camera));
 
     await settle();
 
@@ -448,8 +488,8 @@ describe("doorbell bare-motion package forward (suite C)", () => {
     assert.ok(doorbell?.packageCamera?.stream, "the package camera holds its stub stream with the channel provisioned");
 
     // Mark the package camera recording for HKSV: the production forward reads packageCamera.stream.hksv.isRecording. The afterEach cleanup also reads hksv through
-    // teardownStreamingDelegate (isRecording -> updateRecordingActive, then timeshift.stop), so the stub carries those no-ops - the same shape the camera-construction
-    // self-heal test seeds, cast once through the confined seam.
+    // the capability's delegate teardown (isRecording -> updateRecordingActive, then timeshift.stop), so the stub carries those no-ops - the same shape the camera-
+    // self-heal test seeds, cast once through the confined boundary.
     (doorbell.packageCamera.stream as TestStreamingDelegate).hksv = { isRecording: true,
       timeshift: { isStarted: false, stop: (): void => { /* No-op: the double owns no buffer to release on teardown. */ } },
       updateRecordingActive: (): void => { /* No-op: the double records no HKSV state. */ } } as unknown as TestStreamingDelegate["hksv"];
@@ -481,26 +521,158 @@ describe("doorbell bare-motion package forward (suite C)", () => {
   });
 });
 
-describe("the package camera UUID-seed pin", () => {
+/* Suite D names the package camera under its doorbell's custom name, with name syncing off, so a name the package carries is one the custom name put there. The
+ * package accessory is restored from the cache under the name a run before the custom name gave it, so the package's own configure pass is what renames it. Its log
+ * prefix leads with the custom name where one is set and with the name the controller reports otherwise, and once the shared record is gone it reads the package
+ * accessory's own name, which nothing has to read the record for. Each test builds a fresh family and unwinds it in afterEach.
+ */
+describe("the package camera under a custom name (suite D)", () => {
+
+  // The doorbell's MAC, whose scope the package camera's hints resolve the custom name from, and the custom name set there.
+  const PARENT_MAC = "74ACB9000001";
+  const CUSTOM_NAME = "Porch";
+
+  let family: { controller: AbortController; doorbell: ProtectCamera } | undefined;
+
+  afterEach(() => {
+
+    family?.doorbell.cleanup();
+    family?.controller.abort();
+    family = undefined;
+  });
+
+  // Build the doorbell-plus-package family with name syncing off, the package restored from the cache under the controller's name for it, and the doorbell's
+  // custom name set or not.
+  async function buildFamily(options: { customName: boolean }): Promise<{ cameraId: string; doorbell: ProtectCamera; logEntries: readonly TestLogEntry[];
+    store: TestStateStore; }> {
+
+    const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { hasPackageCamera: true, isDoorbell: true }, name: "Front Door" });
+    const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
+    const { controller, logEntries, nvr } = makeTestNvr({ store,
+      userOptions: options.customName ? ["Enable.Device.Name." + PARENT_MAC + "=" + CUSTOM_NAME] : [] });
+
+    restoreAccessories(nvr, [makeTestAccessory("Front Door Package Camera", PARENT_MAC + ".PackageCamera")]);
+
+    const doorbell = constructDoorbell(nvr, makeTestAccessory("Front Door", PARENT_MAC), new TestCameraProjection(cameraConfig.id, store));
+
+    family = { controller, doorbell };
+
+    await settle();
+
+    return { cameraId: cameraConfig.id, doorbell, logEntries, store };
+  }
+
+  // The prefix of the one line the package camera logs when asked to, read from the line itself.
+  function packagePrefix(built: { doorbell: ProtectCamera; logEntries: readonly TestLogEntry[] }, line: string): string | undefined {
+
+    assert.ok(built.doorbell.packageCamera, "the package camera instance is live");
+    assert.doesNotThrow(() => built.doorbell.packageCamera?.log.info(line), "a package camera log line does not throw");
+
+    const entries = built.logEntries.filter((entry) => formatLogEntry(entry).endsWith(": " + line));
+
+    assert.equal(entries.length, 1, "the package camera logged the line once");
+
+    return entries[0] ? formatLogEntry(entries[0]).slice(0, -line.length) : undefined;
+  }
+
+  test("with Device.SyncName off, a doorbell's custom name names its package camera \"<custom name> Package Camera\"", async () => {
+
+    const built = await buildFamily({ customName: true });
+    const accessory = built.doorbell.packageCamera?.accessory as unknown as TestProtectAccessory | undefined;
+
+    assert.ok(accessory, "the package camera instance is live");
+    assert.equal(built.doorbell.accessory.displayName, CUSTOM_NAME, "the doorbell carries its custom name");
+    assert.equal(accessory.displayName, CUSTOM_NAME + " Package Camera", "the package's own configure pass renamed it under the doorbell's custom name");
+    assert.equal(accessory.getService(Service.AccessoryInformation)?.getCharacteristic(Characteristic.Name).value, CUSTOM_NAME + " Package Camera",
+      "the HomeKit-visible name carries the custom name with the suffix");
+  });
+
+  // The package camera's log prefix with the shared record present, and then once the record is removed, as a detached timer callback in the removal grace reads it.
+  async function packagePrefixes(options: { customName: boolean }): Promise<{ present: string | undefined; removed: string | undefined }> {
+
+    const built = await buildFamily(options);
+    const present = packagePrefix(built, "Present line.");
+
+    built.store.removeCameraRecord(built.cameraId);
+
+    await settle();
+
+    return { present, removed: packagePrefix(built, "Removed line.") };
+  }
+
+  test("with the parent record removed, a package log line does not throw and its prefix carries Protect's name with the suffix", async () => {
+
+    // With no custom name the package accessory's own name is Protect's name with the suffix, so the prefix reads that name with the record and without it.
+    assert.deepEqual(await packagePrefixes({ customName: false }), { present: "Front Door Package Camera [Test Camera Model]: ",
+      removed: "Front Door Package Camera: " }, "the prefix is the parent's descriptor with the suffix, and the package accessory's own name once the record is gone");
+  });
+
+  test("under a custom name, a package log line carries the custom name with the suffix, with the record and without it", async () => {
+
+    // The log prefix leads with the custom name, as the display name does, so the custom name names the package while the record stands, beside the model, and once
+    // the record is gone through the package accessory's own name, which carries it.
+    assert.deepEqual(await packagePrefixes({ customName: true }), { present: CUSTOM_NAME + " Package Camera [Test Camera Model]: ",
+      removed: CUSTOM_NAME + " Package Camera: " }, "the prefix carries the custom name with the suffix while the record stands and once it is gone");
+  });
+});
+
+describe("the doorbell's parts under name syncing (suite E)", () => {
+
+  test("a controller rename under SyncName renames a part of the doorbell and a part of its doorbell capability live", async () => {
+
+    // The doorbell's motion sensor is a part of the camera itself, and a physical chime switch is a part the doorbell capability stands up on the camera's accessory,
+    // so the rename reaching each shows the capability's parts are held by the host's one registry.
+    const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { hasChime: true, isDoorbell: true }, name: "Front Door" });
+    const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
+    const { controller, nvr } = makeTestNvr({ store, userOptions: [ "Enable.Device.SyncName", "Enable.Doorbell.PhysicalChime" ] });
+    const doorbell = constructDoorbell(nvr, makeTestAccessory("Front Door", cameraConfig.mac), new TestCameraProjection(cameraConfig.id, store));
+
+    await settle();
+
+    try {
+
+      const motion = doorbell.accessory.getService(Service.MotionSensor);
+      const chime = doorbell.accessory.getServiceById(Service.Switch, "DoorbellChime.mechanical");
+
+      assert.ok(motion && chime, "the doorbell carries its motion sensor and the capability's mechanical chime switch");
+      assert.equal(chime.getCharacteristic(Characteristic.ConfiguredName).value, "Front Door Physical Chime Mechanical",
+        "precondition: the chime starts under the controller's first name for the doorbell");
+
+      store.pushCameraPatch(cameraConfig.id, { name: "New Door" });
+
+      await settle();
+
+      assert.equal(motion.getCharacteristic(Characteristic.ConfiguredName).value, "New Door", "the doorbell's own part took the controller's new name");
+      assert.equal(chime.getCharacteristic(Characteristic.ConfiguredName).value, "New Door Physical Chime Mechanical",
+        "and so did the capability's part, its suffix after the new name");
+    } finally {
+
+      doorbell.cleanup();
+      controller.abort();
+    }
+  });
+});
+
+describe("the package camera UUID-seed assertion", () => {
 
   test("a cached accessory keyed by the literal MAC + .PackageCamera seed is found, not re-registered", async () => {
 
     const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { hasPackageCamera: true, isDoorbell: true }, name: "Front Door" });
     const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
-    const { apiCalls, controller, nvr } = makeTestNvr({ store });
+    const { api, controller, nvr } = makeTestNvr({ store });
 
-    // The pin is the LITERAL seed string, deliberately not derived from the production constant: cached accessories in the field were keyed by exactly this value,
-    // so any drift in the persistence-critical identity suffix must break this fixture loudly.
-    const cached = new TestAccessory("Cached Package", "uuid:" + cameraConfig.mac + ".PackageCamera");
+    // The seed is the LITERAL string, deliberately not derived from the production constant: cached accessories in the field were keyed by exactly this value, so
+    // any drift in the persistence-critical identity suffix must break this fixture loudly.
+    const cached = makeTestAccessory("Cached Package", cameraConfig.mac + ".PackageCamera");
 
-    nvr.platform.accessories.push(cached);
+    restoreAccessories(nvr, [cached]);
 
-    const doorbell = constructDoorbell(nvr, makeTestAccessory("Front Door", "uuid:74ACB9000001"), new TestCameraProjection(cameraConfig.id, store));
+    const doorbell = constructDoorbell(nvr, makeTestAccessory("Front Door", "74ACB9000001"), new TestCameraProjection(cameraConfig.id, store));
 
     await settle();
 
     assert.equal(doorbell.packageCamera?.accessory, cached, "the doorbell adopted the cached accessory by its persisted UUID");
-    assert.equal(apiCalls.filter((call) => (call.kind === "register") || (call.kind === "publishExternal")).length, 0, "no new accessory was ever registered");
+    assert.equal(api.calls.filter((call) => (call.kind === "register") || (call.kind === "publish")).length, 0, "no new accessory was ever registered");
 
     doorbell.cleanup();
 
@@ -553,6 +725,84 @@ describe("pure-test unlocks: package channel selection and the recording pixel c
     overrideHarness.controller.abort();
   });
 
+  /* The option leg of the same chain, and the empty-value hazard that comes with it. The address override resolves at controller scope from the feature option first,
+   * with the legacy per-controller property as the transition fallback - so a configuration that names the option and one that names only the property both reach the
+   * host they configured. An option that is enabled but left empty counts as absent rather than resolving the RTSP host to nothing, which is what lets an emptied
+   * field fall back through the rest of the chain instead of producing an unreachable URL.
+   */
+  test("the address override option outranks the legacy property, and an enabled-but-empty option falls through it", async () => {
+
+    // Both sources configured at once: the option must win. The controller mac addresses the entry, because the option declares controller scope and resolves through
+    // no other slot.
+    const optionConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { hasPackageCamera: true, isDoorbell: true } });
+    const optionStore = new TestStateStore(makeProtectState({ cameras: [optionConfig] }));
+    const optionHarness = makeTestNvr({ overrideAddress: "legacy.example", store: optionStore,
+      userOptions: ["Enable.Nvr.OverrideAddress.74ACB9FFFFFF=option.example"] });
+    const optionDoorbell = constructDoorbell(optionHarness.nvr, makeTestAccessory(), new TestCameraProjection(optionConfig.id, optionStore));
+
+    await settle();
+
+    assert.equal(optionDoorbell.packageCamera?.selectChannel()?.url, "rtsps://option.example:7441/alias3?enableSrtp",
+      "the configured option outranks the legacy property");
+
+    optionDoorbell.cleanup();
+
+    await settle();
+
+    optionHarness.controller.abort();
+
+    // The option enabled with no value at all, alongside a legacy property: the empty option is absent, so the chain continues to the legacy address rather than
+    // resolving the host to an empty string.
+    const emptyConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { hasPackageCamera: true, isDoorbell: true } });
+    const emptyStore = new TestStateStore(makeProtectState({ cameras: [emptyConfig] }));
+    const emptyHarness = makeTestNvr({ overrideAddress: "legacy.example", store: emptyStore,
+      userOptions: ["Enable.Nvr.OverrideAddress.74ACB9FFFFFF="] });
+    const emptyDoorbell = constructDoorbell(emptyHarness.nvr, makeTestAccessory(), new TestCameraProjection(emptyConfig.id, emptyStore));
+
+    await settle();
+
+    assert.equal(emptyDoorbell.packageCamera?.selectChannel()?.url, "rtsps://legacy.example:7441/alias3?enableSrtp",
+      "an enabled-but-empty option falls through to the legacy property");
+
+    emptyDoorbell.cleanup();
+
+    await settle();
+
+    emptyHarness.controller.abort();
+  });
+
+  /* An override address carrying an IPv6 zone cannot stand in an RTSP URL, so the controller sets it aside with one warning and each camera resolves its URLs through
+   * the rest of the chain: the doorbell's own channel profiles and its package camera's alike compose against the camera's connection host. Composing against the zoned
+   * address instead refuses it inside the camera's setup, where nothing would handle the refusal, so the row also holds that construction raises nothing unhandled.
+   */
+  test("an override address carrying an IPv6 zone is set aside with one warning, and the URLs fall through to the connection host", async () => {
+
+    const zonedConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { hasPackageCamera: true, isDoorbell: true } });
+    const zonedStore = new TestStateStore(makeProtectState({ cameras: [zonedConfig] }));
+    const zonedHarness = makeTestNvr({ overrideAddress: "fe80::1%en0", store: zonedStore });
+
+    await assertNoUnhandledRejections(async () => {
+
+      const zonedDoorbell = constructDoorbell(zonedHarness.nvr, makeTestAccessory(), new TestCameraProjection(zonedConfig.id, zonedStore));
+
+      await settle();
+
+      assert.match(zonedDoorbell.selectChannel(3024, 4096, { bias: "nearest" })?.url ?? "", /^rtsps:\/\/camera\.test:7441\/alias\d\?enableSrtp$/,
+        "the doorbell's channel profiles resolve against its connection host");
+      assert.equal(zonedDoorbell.packageCamera?.selectChannel()?.url, "rtsps://camera.test:7441/alias3?enableSrtp",
+        "and so do its package camera's");
+
+      zonedDoorbell.cleanup();
+
+      await settle();
+    });
+
+    assert.equal(logCount(zonedHarness.logEntries, "warn", "The override address fe80::1%en0 carries an IPv6 zone"), 1,
+      "the controller said once that it set the override aside");
+
+    zonedHarness.controller.abort();
+  });
+
   test("a finite substrate pixel ceiling drops channels above the cap from selectSubstrateChannel", async () => {
 
     // The capped camera with no substrate pin: a 720p ceiling drops the 4K High channel, so the structural default lands on the highest surviving channel, Medium.
@@ -562,8 +812,8 @@ describe("pure-test unlocks: package channel selection and the recording pixel c
 
     capped.factory.maxSourcePixels = 1280 * 720;
 
-    const cappedCamera = new ProtectCamera(capped.nvr as unknown as ProtectNvr, makeTestAccessory() as unknown as ProtectAccessory,
-      new TestCameraProjection(cappedConfig.id, cappedStore) as unknown as Camera);
+    const cappedCamera = configured(new ProtectCamera(capped.nvr as unknown as ProtectNvr, makeTestAccessory(),
+      new TestCameraProjection(cappedConfig.id, cappedStore) as unknown as Camera));
 
     await settle();
 
@@ -579,12 +829,12 @@ describe("pure-test unlocks: package channel selection and the recording pixel c
     // pinned-but-dropped channel honestly selects nothing rather than silently substituting.
     const pinnedConfig = makeCameraConfig({ channels: G6_INSTANT_CHANNELS });
     const pinnedStore = new TestStateStore(makeProtectState({ cameras: [pinnedConfig] }));
-    const pinned = makeTestNvr({ store: pinnedStore, userOptions: ["Enable.Video.Timeshift.Only.High"] });
+    const pinned = makeTestNvr({ store: pinnedStore, userOptions: ["Enable.Video.Timeshift.Only=High"] });
 
     pinned.factory.maxSourcePixels = 1280 * 720;
 
-    const pinnedCamera = new ProtectCamera(pinned.nvr as unknown as ProtectNvr, makeTestAccessory() as unknown as ProtectAccessory,
-      new TestCameraProjection(pinnedConfig.id, pinnedStore) as unknown as Camera);
+    const pinnedCamera = configured(new ProtectCamera(pinned.nvr as unknown as ProtectNvr, makeTestAccessory(),
+      new TestCameraProjection(pinnedConfig.id, pinnedStore) as unknown as Camera));
 
     await settle();
 
@@ -600,8 +850,8 @@ describe("pure-test unlocks: package channel selection and the recording pixel c
     const openConfig = makeCameraConfig({ channels: G6_INSTANT_CHANNELS });
     const openStore = new TestStateStore(makeProtectState({ cameras: [openConfig] }));
     const open = makeTestNvr({ store: openStore });
-    const openCamera = new ProtectCamera(open.nvr as unknown as ProtectNvr, makeTestAccessory() as unknown as ProtectAccessory,
-      new TestCameraProjection(openConfig.id, openStore) as unknown as Camera);
+    const openCamera = configured(new ProtectCamera(open.nvr as unknown as ProtectNvr, makeTestAccessory(),
+      new TestCameraProjection(openConfig.id, openStore) as unknown as Camera));
 
     await settle();
 

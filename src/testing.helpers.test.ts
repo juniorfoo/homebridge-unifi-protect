@@ -2,258 +2,20 @@
  *
  * testing.helpers.test.ts: Unit tests for the cross-cutting test helpers in testing.helpers.ts.
  *
- * The HAP test-double is itself code, and a bug in the double would silently corrupt every consumer test that depends on it...particularly the StatusActive
- * write path the reachability rewire relies on. The double earns the same coverage rigor as production code: every accessor, every fan-out branch, every handler binding.
+ * The harness is itself code, and a bug in a helper would silently corrupt every consumer test that depends on it, so the helpers earn the same coverage rigor as
+ * production code. HAP and Homebridge are not restated here: every accessory, service and characteristic a suite builds is the real thing, and HBPU's own suite covers
+ * the Homebridge double it runs through. What these rows cover is what the harness adds on top: the state store facade and the state builder that seeds it, the
+ * accessory builder's identities, the read helpers over HAP's change record, and the controller log the streaming stub's stand-in controller keeps.
  */
-import { Characteristic, Service, TestAccessory, TestBaseDevice, TestCameraProjection, TestChimeProjection, TestLightProjection, TestRecordingDispatch,
-  TestSensorProjection, TestStateStore, TestViewerProjection, makeCameraConfig, makeChimeConfig, makeControllableLivestreamDouble, makeKeyframeFragment, makeLightConfig,
-  makeLivestreamSubscriptionDouble, makeLiveviewConfig, makeNonKeyframeFragment, makeNvrConfig, makeProtectState, makeRingtoneConfig, makeSensorConfig, makeTestAccessory,
-  makeTestAccessoryFamily, makeTestNvr, makeViewerConfig, settle } from "./testing.helpers.ts";
-import type { CharacteristicType, TestService } from "./testing.helpers.ts";
-import type { ProtectAccessory, ProtectDevices } from "./types.ts";
-import type { ProtectCameraConfig, ProtectLightConfig, ProtectNvrConfig, ProtectNvrLiveviewConfig, ProtectRingtoneConfig, ProtectSensorConfig, ProtectViewerConfig,
-  Segment, Sensor } from "unifi-protect";
+import { Characteristic, Service, TestStateStore, TestStreamingDelegate, accessoryUuid, controllerEvents, eventsFrom, makeProtectState, makeTestAccessory,
+  makeTestApi, runtime, writesTo } from "./testing.helpers.ts";
+import { PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
+import type { ProtectCameraConfig, ProtectLightConfig, ProtectNvrConfig, ProtectNvrLiveviewConfig, ProtectRingtoneConfig, ProtectSensorConfig,
+  ProtectViewerConfig } from "unifi-protect";
 import { describe, test } from "node:test";
-import { ProtectEventDispatch } from "./nvr/event-dispatch.ts";
-import type { ProtectNvr } from "./nvr/nvr.ts";
+import { settle, triggerSet } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
-import { isKeyframe } from "homebridge-plugin-utils";
-
-describe("HAP test-double", () => {
-
-  describe("TestAccessory", () => {
-
-    test("preloads an AccessoryInformation service so production code can fetch it without first calling addService", () => {
-
-      const accessory = makeTestAccessory();
-
-      assert.ok(accessory.getService(Service.AccessoryInformation), "every HomeKit accessory carries an AccessoryInformation service from construction");
-    });
-
-    test("makeTestAccessory carries the supplied displayName and UUID through to the instance fields", () => {
-
-      const accessory = new TestAccessory("Doorbell-1", "00000000-1111-2222-3333-444444444444");
-
-      assert.equal(accessory.displayName, "Doorbell-1", "displayName is forwarded verbatim");
-      assert.equal(accessory.UUID, "00000000-1111-2222-3333-444444444444", "UUID is forwarded verbatim");
-    });
-
-    test("addService returns the new service instance and getService finds it by type", () => {
-
-      const accessory = makeTestAccessory();
-      const motion = accessory.addService(Service.MotionSensor, "Motion");
-
-      assert.equal(accessory.getService(Service.MotionSensor), motion, "the same TestService instance is returned by getService(type)");
-    });
-
-    test("getServiceById matches on (type, subtype); getService only matches the subtype-less instance", () => {
-
-      const accessory = makeTestAccessory();
-      const baseSwitch = accessory.addService(Service.Switch, "Base Switch");
-      const taggedSwitch = accessory.addService(Service.Switch, "Tagged Switch", "tagged");
-
-      assert.equal(accessory.getService(Service.Switch), baseSwitch, "getService matches the subtype-less Switch service");
-      assert.equal(accessory.getServiceById(Service.Switch, "tagged"), taggedSwitch, "getServiceById matches the tagged Switch service");
-      assert.equal(accessory.getServiceById(Service.Switch, "missing"), undefined, "an unknown subtype returns undefined rather than throwing");
-    });
-
-    test("the services array is publicly iterable and reflects every added service plus the preloaded AccessoryInformation", () => {
-
-      const accessory = makeTestAccessory();
-
-      accessory.addService(Service.MotionSensor, "Motion");
-      accessory.addService(Service.OccupancySensor, "Occupancy");
-
-      // The reachability fan-out walks accessory.services directly, so the array must be public and complete. AccessoryInformation is preloaded, so we expect three.
-      assert.equal(accessory.services.length, 3, "AccessoryInformation plus the two added sensors are all visible on the public services array");
-      assert.ok(accessory.services.some((service) => service.type === Service.OccupancySensor), "the occupancy sensor kind is present on the double");
-    });
-
-    // removeService is the removal path homebridge-plugin-utils' validService takes when an existing service fails validation, the camera's smart-detect pruning calls
-    // directly, and the sweep-stale arm's DoorbellCapability.removeServices drives - so the capability-detach-adjacent assertions lean on it. It must drop exactly the
-    // named instance, leave every other service (including a same-type, different-subtype sibling) in place, and tolerate a service that is not present without throwing.
-    test("removeService drops exactly the named service, leaves same-type siblings, and is a no-op on an absent service", () => {
-
-      const accessory = makeTestAccessory();
-      const baseSwitch = accessory.addService(Service.Switch, "Base Switch");
-      const taggedSwitch = accessory.addService(Service.Switch, "Tagged Switch", "tagged");
-
-      accessory.removeService(taggedSwitch);
-
-      assert.equal(accessory.getServiceById(Service.Switch, "tagged"), undefined, "the removed tagged Switch is gone");
-      assert.equal(accessory.getService(Service.Switch), baseSwitch, "the same-type, different-subtype sibling survives the removal");
-
-      // A second removal of the already-removed instance must not corrupt the array (no negative-index splice) and must leave the survivors untouched.
-      accessory.removeService(taggedSwitch);
-
-      assert.equal(accessory.getService(Service.Switch), baseSwitch, "the base Switch still resolves after a redundant remove of an absent service");
-      assert.ok(accessory.services.includes(baseSwitch), "the base Switch remains on the public services array after the no-op removal");
-    });
-  });
-
-  describe("TestService", () => {
-
-    test("getCharacteristic returns the same instance across calls for a given kind", () => {
-
-      const accessory = makeTestAccessory();
-      const service = accessory.addService(Service.MotionSensor, "Motion");
-      const first = service.getCharacteristic(Characteristic.StatusActive);
-      const second = service.getCharacteristic(Characteristic.StatusActive);
-
-      assert.equal(first, second, "the same characteristic instance is returned per kind, so an onGet binding stays attached across reads");
-    });
-
-    test("updateCharacteristic writes a value visible via the characteristic's .value getter and overwrites on subsequent writes", () => {
-
-      const accessory = makeTestAccessory();
-      const service = accessory.addService(Service.MotionSensor, "Motion");
-
-      service.updateCharacteristic(Characteristic.StatusActive, true);
-      assert.equal(service.getCharacteristic(Characteristic.StatusActive).value, true, "first write lands");
-
-      service.updateCharacteristic(Characteristic.StatusActive, false);
-      assert.equal(service.getCharacteristic(Characteristic.StatusActive).value, false, "subsequent write overwrites the previous value");
-    });
-
-    test("testCharacteristic reports false before a characteristic is created and true once getCharacteristic has materialized it", () => {
-
-      const accessory = makeTestAccessory();
-      const service = accessory.addService(Service.MotionSensor, "Motion");
-
-      assert.equal(service.testCharacteristic(Characteristic.StatusActive), false, "a never-accessed characteristic reports absent, the predicate the reachability " +
-        "fan-out uses to skip services that do not carry StatusActive");
-
-      service.getCharacteristic(Characteristic.StatusActive);
-
-      assert.equal(service.testCharacteristic(Characteristic.StatusActive), true, "once materialized, the predicate reports present");
-    });
-
-    test("testCharacteristic does not itself materialize the characteristic, unlike getCharacteristic", () => {
-
-      const accessory = makeTestAccessory();
-      const service = accessory.addService(Service.Switch, "Switch");
-
-      service.testCharacteristic(Characteristic.StatusActive);
-
-      assert.equal(service.testCharacteristic(Characteristic.StatusActive), false, "calling the predicate is side-effect free; it never creates the characteristic");
-    });
-  });
-
-  describe("TestCharacteristic", () => {
-
-    test("onGet installs a handler whose value is re-invoked on each triggerGet (not memoized)", async () => {
-
-      const accessory = makeTestAccessory();
-      const service = accessory.addService(Service.MotionSensor, "Motion");
-      let computed = "first";
-
-      service.getCharacteristic(Characteristic.StatusActive).onGet(() => computed);
-
-      assert.equal(await service.getCharacteristic(Characteristic.StatusActive).triggerGet(), "first", "the bound getter runs against current closure state");
-
-      computed = "second";
-
-      assert.equal(await service.getCharacteristic(Characteristic.StatusActive).triggerGet(), "second", "the bound getter is re-invoked, not memoized");
-    });
-
-    test("onSet installs a handler that triggerSet invokes; the post-set value becomes the new .value", async () => {
-
-      const accessory = makeTestAccessory();
-      const service = accessory.addService(Service.Switch, "Switch");
-      const observed: unknown[] = [];
-
-      service.getCharacteristic(Characteristic.On).onSet((value) => { observed.push(value); });
-      await service.getCharacteristic(Characteristic.On).triggerSet(true);
-      await service.getCharacteristic(Characteristic.On).triggerSet(false);
-
-      assert.deepEqual(observed, [ true, false ], "every triggered set call reaches the bound handler in order");
-      assert.equal(service.getCharacteristic(Characteristic.On).value, false, ".value reflects the most recent set value");
-    });
-
-    test("triggerGet falls through to the cached value when no onGet handler is bound", async () => {
-
-      const accessory = makeTestAccessory();
-      const service = accessory.addService(Service.MotionSensor, "Motion");
-
-      service.updateCharacteristic(Characteristic.StatusActive, true);
-
-      assert.equal(await service.getCharacteristic(Characteristic.StatusActive).triggerGet(), true, "with no handler bound, the cached value is returned");
-    });
-  });
-
-  // setCharacteristic is the HAP-faithful set path the production MQTT subscribeSet handlers (and the doorbell chime-volume / stream flashlight writes) take to drive
-  // a device command through HomeKit's own set machinery. Unlike updateCharacteristic - a silent status push - it must FIRE the bound onSet handler. The handler is
-  // async and fire-and-forget, so every effect is asserted only after settle() lets the microtask run, never synchronously.
-  describe("TestService.setCharacteristic", () => {
-
-    test("fires the bound onSet handler with the supplied value", async () => {
-
-      const accessory = makeTestAccessory();
-      const service = accessory.addService(Service.Lightbulb, "Light");
-      const observed: unknown[] = [];
-
-      service.getCharacteristic(Characteristic.On).onSet((value) => { observed.push(value); });
-      service.setCharacteristic(Characteristic.On, true);
-
-      await settle();
-
-      assert.deepEqual(observed, [true], "setCharacteristic routes through the bound onSet handler, the production command path");
-    });
-
-    test("updates the read cache to the set value once the handler resolves", async () => {
-
-      const accessory = makeTestAccessory();
-      const service = accessory.addService(Service.Lightbulb, "Light");
-
-      service.getCharacteristic(Characteristic.Brightness).onSet(() => { /* The handler does not write the cache; triggerSet does, after it resolves. */ });
-      service.setCharacteristic(Characteristic.Brightness, 42);
-
-      await settle();
-
-      assert.equal(service.getCharacteristic(Characteristic.Brightness).value, 42, "the post-set value becomes the new cached value, mirroring HAP's set semantics");
-    });
-
-    test("is distinct from updateCharacteristic, which writes the value but never fires the handler", async () => {
-
-      const accessory = makeTestAccessory();
-      const service = accessory.addService(Service.Lightbulb, "Light");
-      const observed: unknown[] = [];
-
-      service.getCharacteristic(Characteristic.On).onSet((value) => { observed.push(value); });
-      service.updateCharacteristic(Characteristic.On, true);
-
-      await settle();
-
-      assert.deepEqual(observed, [], "updateCharacteristic is a status push that never runs the onSet handler");
-      assert.equal(service.getCharacteristic(Characteristic.On).value, true, "updateCharacteristic still writes the value, it just bypasses the handler");
-    });
-
-    test("works through the lazy getCharacteristic, materializing and firing a not-yet-created characteristic", async () => {
-
-      const accessory = makeTestAccessory();
-      const service = accessory.addService(Service.Lightbulb, "Light");
-      const observed: unknown[] = [];
-
-      // Bind the handler before the value is ever set; getCharacteristic lazily materializes the characteristic here, and setCharacteristic must reach that same
-      // instance rather than creating a second, handler-less one.
-      service.getCharacteristic(Characteristic.On).onSet((value) => { observed.push(value); });
-      service.setCharacteristic(Characteristic.On, false);
-
-      await settle();
-
-      assert.deepEqual(observed, [false], "setCharacteristic resolves the characteristic through the lazy getCharacteristic, firing the bound handler");
-      assert.equal(service.getCharacteristic(Characteristic.On).value, false, "the lazily-materialized characteristic carries the set value afterward");
-    });
-
-    test("returns the service for chaining, like updateCharacteristic", () => {
-
-      const accessory = makeTestAccessory();
-      const service = accessory.addService(Service.Lightbulb, "Light");
-
-      assert.equal(service.setCharacteristic(Characteristic.On, true), service, "setCharacteristic returns this so production chained writes compile");
-    });
-  });
-});
+import { makeCameraConfig } from "./devices/testing.helpers.ts";
 
 describe("the state-store double (TestStateStore)", () => {
 
@@ -276,7 +38,7 @@ describe("the state-store double (TestStateStore)", () => {
 
     const received: unknown[] = [];
 
-    for await (const value of store.observe((state) => state.cameras.get(camera.id)?.name, { signal: controller.signal })) {
+    for await(const value of store.observe((state) => state.cameras.get(camera.id)?.name, { signal: controller.signal })) {
 
       received.push(value);
     }
@@ -347,7 +109,7 @@ describe("the state-store double (TestStateStore)", () => {
 
     const loop = (async (): Promise<void> => {
 
-      for await (const value of store.observe((state) => state.cameras.get(camera.id)?.name, { signal: controller.signal })) {
+      for await(const value of store.observe((state) => state.cameras.get(camera.id)?.name, { signal: controller.signal })) {
 
         consumed.push(value);
 
@@ -370,12 +132,19 @@ describe("the state-store double (TestStateStore)", () => {
     // anyway so nothing lingers.
     controller.abort();
   });
+
+  test("selectors exposes the real store's catalog, so a by-id read over the snapshot returns the seeded camera", () => {
+
+    const { camera, store } = makeStore();
+
+    assert.equal(store.selectors.camera.byId(camera.id)(store.snapshot()), camera, "the catalog's camera by-id selector resolves the seeded record");
+  });
 });
 
 describe("makeProtectState device-slice widening", () => {
 
   // No per-slice config builder exists yet (each lands with its own device-family suite), so each record is a minimal id-bearing literal bridged through the same
-  // confined `as unknown as` seam cast the harness uses for makeCameraConfig / makeNvrConfig - honest about being a partial double, while keeping the population and
+  // confined `as unknown as` cast the harness uses for makeCameraConfig / makeNvrConfig - honest about being a partial double, while keeping the population and
   // keying under test exactly the production-shaped path.
   const lightRecord = { id: "light-1" } as unknown as ProtectLightConfig;
   const liveviewRecord = { id: "liveview-1" } as unknown as ProtectNvrLiveviewConfig;
@@ -421,146 +190,70 @@ describe("makeProtectState device-slice widening", () => {
   });
 });
 
-describe("harness growth: service identity, controller log, and event notifications", () => {
+describe("harness growth: accessory identities, the change-record readers, and the controller log", () => {
 
-  test("every namespace service marker carries a distinct, non-empty static UUID, mirrored onto instances from both construction paths", () => {
+  test("makeTestAccessory derives a seeded identity through HAP's generator and seeds each default uniquely, so same-named accessories each join the bridge", () => {
 
-    const uuids = Object.values(Service).map((marker) => marker.UUID);
+    // A seeded accessory carries the UUID HAP derives from its seed, the derivation production runs over a device's MAC.
+    assert.equal(makeTestAccessory("Seeded", "74ACB9000001").UUID, accessoryUuid("74ACB9000001"), "a seeded accessory carries the UUID its seed derives");
+    assert.equal(accessoryUuid("74ACB9000001"), runtime.hap.uuid.generate("74ACB9000001"), "the derivation is HAP's own generator");
 
-    // The amended identity contract: real, distinct, never-empty identities (an empty UUID would false-positive homebridge-plugin-utils' degenerate
-    // name-set predicates).
-    assert.ok(uuids.every((uuid) => (typeof uuid === "string") && (uuid.length > 0)), "every marker carries a non-empty static UUID");
-    assert.equal(new Set(uuids).size, uuids.length, "every marker UUID is distinct");
+    // Homebridge skips a registration whose UUID it already holds, so same-named accessories built without a seed must never share one.
+    const api = makeTestApi();
+    const first = makeTestAccessory("Same Name");
+    const second = makeTestAccessory("Same Name");
 
-    // The marker-construction path (what acquireService's create branch invokes) and the legacy type-form path both mirror the static through this.type.
-    const viaMarker = new Service.MotionSensor("Motion");
+    assert.notEqual(first.UUID, second.UUID, "accessories built without a seed carry distinct UUIDs");
 
-    assert.equal(viaMarker.UUID, Service.MotionSensor.UUID, "a marker-constructed service mirrors its class static");
+    api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [ first, second ]);
 
-    const accessory = makeTestAccessory();
-    const viaLegacy = accessory.addService(Service.Switch, "Switch");
-
-    assert.equal(viaLegacy.UUID, Service.Switch.UUID, "a legacy type-form service mirrors the namespace entry's static through this.type");
-    assert.notEqual(viaLegacy.UUID, "", "no construction path ever yields an empty UUID");
+    assert.ok(first._associatedHAPAccessory.bridged && second._associatedHAPAccessory.bridged, "the registration bridged each, skipping none as a duplicate");
   });
 
-  test("setPrimaryService records the primary designation", () => {
+  test("writesTo and eventsFrom tell one characteristic's update writes and notifications apart, leaving out HomeKit's writes and every other instance", async () => {
 
     const accessory = makeTestAccessory();
-    const service = accessory.addService(Service.Doorbell, "Doorbell");
+    const first = accessory.addService(new Service.Switch("First", "first"));
+    const second = accessory.addService(new Service.Switch("Second", "second"));
+    const on = first.getCharacteristic(Characteristic.On);
 
-    assert.equal(service.isPrimary, false, "a fresh service is not primary");
+    // An update write and an unchanged rewrite of the same value, which HAP records all the same; a write to the same kind on the sibling service; HomeKit's own
+    // write; and an event notification. Each reader takes exactly its own reason on exactly this instance.
+    on.updateValue(true);
+    on.updateValue(true);
+    second.updateCharacteristic(Characteristic.On, true);
+    await triggerSet(on, false);
+    on.sendEventNotification(true);
 
-    service.setPrimaryService(true);
-
-    assert.equal(service.isPrimary, true, "setPrimaryService(true) records the designation");
-
-    service.setPrimaryService(false);
-
-    assert.equal(service.isPrimary, false, "setPrimaryService(false) clears it");
+    assert.deepEqual(writesTo(accessory, on), [ true, true ], "writesTo holds each update write, the unchanged one included, and nothing else");
+    assert.deepEqual(eventsFrom(accessory, on), [true], "eventsFrom holds the one event notification and nothing else");
   });
 
-  test("the controller-event log records configure and remove in order, the derived views filter it, and a double configure throws", () => {
+  test("the controller log records the stand-in controller's configure and remove in HAP's order, and HAP refuses a second camera controller", () => {
 
     const accessory = makeTestAccessory();
-    const first = { sentinel: "first" };
-    const second = { sentinel: "second" };
+    const first = new TestStreamingDelegate({ accessory }).controller;
+    const second = new TestStreamingDelegate({ accessory }).controller;
 
     accessory.configureController(first);
 
-    // HAP throws on a second controller registration while one is configured - the double enforces the same invariant.
-    assert.throws(() => accessory.configureController(second), /already added/, "a double configure throws, mirroring HAP");
+    // HAP keys an accessory's controllers by id and refuses a second one under an id it holds, and the stand-in carries the real camera controller's id.
+    assert.throws(() => accessory.configureController(second), /already added/, "HAP refuses a second camera controller while one is configured");
 
     accessory.removeController(first);
 
-    // After removal the chokepoint clears, so a re-configure succeeds, exactly as it would live.
+    // The removal frees the id, so the second controller configures, exactly as a rebuilt delegate's does.
     accessory.configureController(second);
 
-    assert.deepEqual(accessory.controllerEvents.map((event) => event.kind), [ "configure", "remove", "configure" ], "the unified log preserves event order");
-    assert.deepEqual(accessory.controllerEvents.map((event) => event.seq), [ 0, 1, 2 ], "sequence numbers are monotonic");
-    assert.deepEqual(accessory.configureControllerCalls, [ first, second ], "the configure view derives from the log");
-    assert.deepEqual(accessory.removeControllerCalls, [first], "the remove view derives from the log");
-    assert.equal(accessory.configuredController, second, "the chokepoint tracks the currently configured controller");
-  });
+    const log = controllerEvents(accessory);
 
-  test("sendEventNotification records events in order without disturbing the cached value", () => {
-
-    const doorbell = new Service.Doorbell("Doorbell");
-    const characteristic = doorbell.getCharacteristic(Characteristic.ProgrammableSwitchEvent);
-
-    characteristic.updateValue("resting");
-    characteristic.sendEventNotification(Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS);
-    characteristic.sendEventNotification(Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS);
-
-    assert.deepEqual(characteristic.events, [ 0, 0 ], "both press events are recorded in order");
-    assert.equal(characteristic.value, "resting", "an event notification never changes the cached value");
-  });
-
-  test("the sensor-family service markers construct and each carries its seeded primary characteristic", () => {
-
-    // The sensor-family markers added for the ProtectSensor real-construction net. Each must construct without throwing (acquireService's create branch invokes the
-    // namespace entry directly) AND carry its seed characteristic as the materialized first element (getCharacteristicConstructor destructures it), mirroring the
-    // OccupancySensor / MotionSensor precedent. The seed pairing is the load-bearing claim: a wrong seed would let construction succeed yet break the kind-true read.
-    // We pair each marker with its expected seed and assert the first characteristic IS that kind - reading characteristics[0] with a length guard so the index access
-    // is type-honest under strict null checks rather than asserted away.
-    const cases: { expectedSeed: CharacteristicType; service: TestService }[] = [
-
-      { expectedSeed: Characteristic.BatteryLevel, service: new Service.Battery("Battery") },
-      { expectedSeed: Characteristic.CurrentAmbientLightLevel, service: new Service.LightSensor("Light Sensor") },
-      { expectedSeed: Characteristic.CurrentRelativeHumidity, service: new Service.HumiditySensor("Humidity Sensor") },
-      { expectedSeed: Characteristic.CurrentTemperature, service: new Service.TemperatureSensor("Temperature Sensor") },
-      { expectedSeed: Characteristic.LeakDetected, service: new Service.LeakSensor("Leak Sensor") }
-    ];
-
-    for(const { expectedSeed, service } of cases) {
-
-      const [primary] = service.characteristics;
-
-      assert.ok(primary, "the " + service.UUID + " marker materialized a primary characteristic at construction");
-      assert.equal(primary.type, expectedSeed, "the " + service.UUID + " marker seeds its kind-true primary characteristic");
-      assert.ok(service.testCharacteristic(expectedSeed), "the " + service.UUID + " marker reports its seed via testCharacteristic");
-    }
-  });
-
-  test("the standalone StatusLowBattery characteristic marker resolves to a distinct on-demand kind", () => {
-
-    // StatusLowBattery is NOT a service seed - updateBatteryStatus writes it on-demand alongside BatteryLevel on the Battery service - so it must resolve as its own
-    // distinct namespace entry, never collapsing onto the BatteryLevel seed. A test materializes both on a Battery service and asserts they are independent instances.
-    const battery = new Service.Battery("Battery");
-
-    battery.updateCharacteristic(Characteristic.BatteryLevel, 80);
-    battery.updateCharacteristic(Characteristic.StatusLowBattery, true);
-
-    assert.equal(battery.getCharacteristic(Characteristic.BatteryLevel).value, 80, "BatteryLevel holds its own value");
-    assert.equal(battery.getCharacteristic(Characteristic.StatusLowBattery).value, true, "StatusLowBattery holds its own value on a distinct entry");
-    assert.notEqual(battery.getCharacteristic(Characteristic.BatteryLevel), battery.getCharacteristic(Characteristic.StatusLowBattery),
-      "BatteryLevel and StatusLowBattery are distinct characteristic instances");
+    assert.deepEqual(log.map((event) => event.kind), [ "configure", "remove", "configure" ], "the log holds HAP's configure and remove calls in order");
+    assert.deepEqual(log.map((event) => event.seq), [ 0, 1, 2 ], "sequence numbers are monotonic");
+    assert.deepEqual(log.map((event) => event.controller), [ first, first, second ], "each entry names the controller HAP ran the hook on");
   });
 });
 
-describe("harness growth: chime state and record removal", () => {
-
-  test("makeChimeConfig populates the chime-volume read set and pushChimePatch wakes only chime-derived selectors that changed", async () => {
-
-    const chime = makeChimeConfig({ cameraIds: ["camera-1"], ringSettings: [{ cameraId: "camera-1", volume: 50 }] });
-    const store = new TestStateStore(makeProtectState({ chimes: [chime] }));
-    const controller = new AbortController();
-    const iterator = store.observe((state) => state.chimes.get(chime.id)?.ringSettings.find((ring) => ring.cameraId === "camera-1")?.volume,
-      { signal: controller.signal });
-    const first = iterator.next();
-
-    await settle();
-
-    // An unrelated chime patch leaves the derived volume unchanged, so the observer must stay parked; the volume change is the only wake.
-    store.pushChimePatch(chime.id, { name: "Renamed Chime" });
-    store.pushChimePatch(chime.id, { ringSettings: [{ cameraId: "camera-1", repeatTimes: 1, ringtoneId: "default", volume: 80 }] });
-
-    assert.equal((await first).value, 80, "the volume change is the first and only yield");
-
-    controller.abort();
-
-    assert.equal((await iterator.next()).done, true, "abort completes the iterator");
-  });
+describe("harness growth: record removal", () => {
 
   test("removeCameraRecord deletes the record so reads see absence and selectors yield undefined", async () => {
 

@@ -2,68 +2,74 @@
  *
  * security-system.ts: Security system accessory for UniFi Protect.
  */
-import { acquireService, composeSignals, validService } from "homebridge-plugin-utils";
+import { acquireService, presenceChanged, validService } from "homebridge-plugin-utils";
 import type { CharacteristicValue } from "homebridge";
 import type { ProtectAccessory } from "../types.ts";
 import { ProtectBase } from "../devices/device-base.ts";
 import type { ProtectNvr } from "../nvr/nvr.ts";
+import type { ProtectNvrLiveviewConfig } from "unifi-protect";
 import { ProtectReservedNames } from "../types.ts";
+import { mqttTopics } from "../mqtt.ts";
 
+// The liveviews the security system is built from. Any one of them calls for it, so they all collapse onto its one identity.
+const SECURITY_SYSTEM_LIVEVIEW = /^Protect-(Away|Home|Night|Off)$/i;
+
+// Whether a liveview list calls for the security system, the one answer the liveviews owner reconciles its accessory against and the security system's verdict reads.
+export function isSecuritySystemCalledFor(liveviews: readonly ProtectNvrLiveviewConfig[]): boolean {
+
+  return liveviews.some(x => SECURITY_SYSTEM_LIVEVIEW.test(x.name));
+}
+
+/* The security system accessory synthesized from the controller's Protect-* liveviews. It is the one controller-scoped owner whose lifetime is shorter than the
+ * controller connection: its accessory comes and goes with those liveviews, so the inherited composed lifetime is exactly what its MQTT registrations need. Deleting the
+ * last Protect-* liveview removes the accessory and calls the inherited cleanup(), which unwinds exactly this owner's securitysystem get/set handlers so they stop
+ * commanding the cameras; a later re-add builds a fresh instance whose configure() subscribes anew.
+ */
 export class ProtectSecuritySystem extends ProtectBase {
 
   public accessory: ProtectAccessory;
-  // The per-owner abort controller. Aborting it (on accessory removal) unwinds this owner's MQTT registrations without waiting for the plugin to shut down.
-  private readonly controller: AbortController;
   private isAlarmTriggered: boolean;
-  // The composed owner-lifetime signal that scopes this owner's MQTT registrations: aborts when EITHER this owner's controller is aborted OR the NVR's terminal
-  // shutdown signal fires.
-  private readonly signal: AbortSignal;
 
   // Create an instance.
   constructor(nvr: ProtectNvr, accessory: ProtectAccessory) {
 
     super(nvr);
 
-    // Build the owner-lifetime signal BEFORE configureDevice runs, so the MQTT subscriptions it registers thread the composed signal rather than the base controller
-    // signal.
     this.accessory = accessory;
-    this.controller = new AbortController();
     this.isAlarmTriggered = false;
-    this.signal = composeSignals(this.controller.signal, nvr.signal);
+  }
+
+  // The security system has no record of its own to say it is leaving, so the liveviews that call for it are its record: with none left HomeKit shows No Response until
+  // one returns or the accessory is removed, whatever the removal gate holds. Each read asks afresh, so a liveview that returns clears the refusal with nothing rebound.
+  public override get isAvailable(): boolean {
+
+    return super.isAvailable && isSecuritySystemCalledFor(this.nvr.client.liveviews);
+  }
+
+  // An MQTT set answers through the time no liveview calls for the security system, so only the controller's own verdict refuses one.
+  protected override get acceptsMqttSet(): boolean {
+
+    return this.nvr.isAvailable;
+  }
+
+  // Set the security system up for HomeKit.
+  public override configure(): void {
 
     this.configureDevice();
-  }
-
-  // The owner-lifetime signal scoping this owner's MQTT registrations. The security system is the one controller-scoped owner whose lifetime is shorter than the
-  // controller connection: its accessory comes and goes with the Protect-* liveviews, so its registrations must unwind with the accessory, not with the plugin. This
-  // overrides the base seam, which returns the controller-lifetime nvr.signal that the teardown-less controller-scoped owners ride.
-  protected override get observeSignal(): AbortSignal {
-
-    return this.signal;
-  }
-
-  // Release this owner's MQTT registrations when its accessory is removed. Deleting the last Protect-* liveview removes the security accessory, and this abort unwinds
-  // exactly this owner's securitysystem get/set handlers so they no longer command the cameras. A later re-add builds a fresh instance whose constructor subscribes anew.
-  public cleanup(): void {
-
-    this.controller.abort();
+    this.platform.claimAccessory(this.accessory, this);
   }
 
   // Configure a security system accessory for HomeKit.
   private configureDevice(): boolean {
 
-    let securityState: CharacteristicValue = this.hap.Characteristic.SecuritySystemCurrentState.STAY_ARM;
+    // The scene the user last set this security system to, which the accessory carries across a restart. The saved state is the user's choice alone: only a set
+    // writes it, and the plugin writes none of its own, so an accessory the user has never set carries none.
+    const savedState = this.accessory.context.securityState;
 
-    // Save the security system state before we wipe out the context.
-    if(this.accessory.context.securityState !== undefined) {
-
-      securityState = this.accessory.context.securityState;
-    }
-
-    // Clean out the context object in case it's been polluted somehow.
-    this.accessory.context = {};
-    this.accessory.context.nvr = this.nvr.ufp.mac;
-    this.accessory.context.securityState = securityState;
+    // Clean out the context object in case it's been polluted somehow, carrying a saved scene through the wipe. The accessory is marked as one the liveviews owner
+    // derives, so the controller's device removal passes leave it to that owner, and the context is saved.
+    this.accessory.context = (savedState === undefined) ? {} : { securityState: savedState };
+    this.platform.persistence.persist(this.accessory, { liveviewDerived: true, nvr: this.nvr.ufp.mac });
 
     this.configureInfo();
 
@@ -98,13 +104,13 @@ export class ProtectSecuritySystem extends ProtectBase {
   private configureMqtt(): boolean {
 
     // Get the current status of the security system.
-    this.subscribeGet("securitysystem", "security system state", () => {
+    this.subscribeGet(mqttTopics.securitysystem.topic, mqttTopics.securitysystem.label, () => {
 
       return this.currentSecuritySystemState;
     });
 
     // Set the security system state.
-    this.subscribeSet("securitysystem", "security system state", (value: string) => {
+    this.subscribeSet(mqttTopics.securitysystem.topic, mqttTopics.securitysystem.label, (value: string) => {
 
       const SecuritySystemCurrentState = this.hap.Characteristic.SecuritySystemCurrentState;
       const SecuritySystemTargetState = this.hap.Characteristic.SecuritySystemTargetState;
@@ -163,8 +169,16 @@ export class ProtectSecuritySystem extends ProtectBase {
           return;
       }
 
-      // The security alarm gets handled differently than the other state settings.
+      // The security alarm gets handled differently than the other state settings. The alarm belongs to the SecuritySystem.Alarm feature, so with that feature off an
+      // alarm value is refused as an unknown one is, and the alarm state the option hides cannot be driven from MQTT.
       if(targetState === SecuritySystemCurrentState.ALARM_TRIGGERED) {
+
+        if(!this.nvr.hasFeature("SecuritySystem.Alarm")) {
+
+          this.log.error("Unable to process MQTT security system setting: %s.", value);
+
+          return;
+        }
 
         this.setSecurityAlarm(alarmState);
 
@@ -176,20 +190,26 @@ export class ProtectSecuritySystem extends ProtectBase {
       this.setSecurityState(targetState);
     });
 
+    // State the security system's current state as it is set up, since its setup publishes nothing else, and again at the start of every later broker session.
+    // The liveviews owner can build a security system while a session is held, when a matching liveview appears, so the statement here is what that session hears.
+    const restate = (): void => this.publish(mqttTopics.securitysystem.topic, this.currentSecuritySystemState);
+
+    restate();
+    this.restateOnConnect(restate);
+
     return true;
   }
 
-  // Configure the security system for HomeKit.
-  private configureSecuritySystem(): boolean {
+  // Configure the security system for HomeKit. It shows the saved scene, the user's last choice, or Off when none is saved, and applies nothing to the cameras.
+  private configureSecuritySystem(): void {
 
-    // Acquire (find or create) the security system service.
-    const service = acquireService(this.accessory, this.hap.Service.SecuritySystem, this.accessory.displayName);
+    // Acquire (find or create) the security system service. A service the acquisition attached changes what Homebridge's accessory cache holds, so the accessory is
+    // marked for the next save.
+    const { service, transition } = acquireService({ accessory: this.accessory, name: this.accessory.displayName, serviceType: this.hap.Service.SecuritySystem });
 
-    if(!service) {
+    if(transition === "attached") {
 
-      this.log.error("Unable to add security system.");
-
-      return false;
+      this.platform.persistence.persist(this.accessory);
     }
 
     const SecuritySystemCurrentState = this.hap.Characteristic.SecuritySystemCurrentState;
@@ -227,20 +247,23 @@ export class ProtectSecuritySystem extends ProtectBase {
 
     // Handlers to get our current state, and initialize on startup.
     service.updateCharacteristic(SecuritySystemCurrentState, this.accessory.context.securityState ?? SecuritySystemCurrentState.DISARMED)
-      .getCharacteristic(SecuritySystemCurrentState).onGet(() => {
+      .getCharacteristic(SecuritySystemCurrentState).onGet(this.answering(() => {
 
-        return this.isAlarmTriggered ? this.hap.Characteristic.SecuritySystemCurrentState.ALARM_TRIGGERED :
-          (this.accessory.context.securityState ?? SecuritySystemCurrentState.DISARMED);
-      });
+      return this.isAlarmTriggered ? this.hap.Characteristic.SecuritySystemCurrentState.ALARM_TRIGGERED :
+        (this.accessory.context.securityState ?? SecuritySystemCurrentState.DISARMED);
+    }));
 
     // Handlers for triggering a change in the security system state.
-    this.accessory.getService(this.hap.Service.SecuritySystem)?.getCharacteristic(SecuritySystemTargetState).onSet(this.setSecurityState.bind(this));
+    this.answerHeld(service, SecuritySystemTargetState);
+    this.accessory.getService(this.hap.Service.SecuritySystem)?.getCharacteristic(SecuritySystemTargetState).onSet(this.answering((value: CharacteristicValue) => {
 
-    // Set the initial state after we have setup our handlers above. This way, when we startup, we
-    // automatically restore the scene we've been set to, if any.
+      this.setSecurityState(value);
+    }));
+
+    // Show the saved scene as the target state, or Off when none is saved. This is a status update, which runs no set handler, so nothing is applied to the cameras.
+    // Each camera persists its own motion detection setting and is the source of truth for it, so applying the scene here would override any choice the user made
+    // on a camera after setting the scene.
     this.accessory.getService(this.hap.Service.SecuritySystem)?.updateCharacteristic(SecuritySystemTargetState, targetSecurityState);
-
-    return true;
   }
 
   // Configure the security alarm for HomeKit.
@@ -248,32 +271,31 @@ export class ProtectSecuritySystem extends ProtectBase {
 
     this.isAlarmTriggered = false;
 
-    // Have we enabled the security system alarm?
-    if(!validService(this.accessory, this.hap.Service.Switch, this.nvr.hasFeature("SecuritySystem.Alarm"))) {
+    this.platform.featureOptions.logFeature({ controller: { id: this.nvr.ufp.mac, log: this.nvr.log }, label: "Security system alarm switch",
+      log: this.platform.pluginLog, option: "SecuritySystem.Alarm" });
 
-      return false;
+    // Have we enabled the security system alarm? A switch the gate attached or removed changes what Homebridge's accessory cache holds, so the accessory is marked for
+    // the next save.
+    const { service, transition } = validService({ accessory: this.accessory, name: this.accessory.displayName + " Security Alarm",
+      serviceType: this.hap.Service.Switch, validate: this.nvr.hasFeature("SecuritySystem.Alarm") });
+
+    if(presenceChanged(transition)) {
+
+      this.platform.persistence.persist(this.accessory);
     }
-
-    // Acquire the service.
-    const service = acquireService(this.accessory, this.hap.Service.Switch, this.accessory.displayName + " Security Alarm");
 
     if(!service) {
 
-      this.log.error("Unable to add security system alarm.");
-
       return false;
     }
 
-    // Notify the user that we're enabled.
-    this.log.info("Enabling the security alarm switch on the security system accessory.");
-
     // Activate or deactivate the security alarm.
-    service.getCharacteristic(this.hap.Characteristic.On).onGet(() => this.isAlarmTriggered);
-    service.getCharacteristic(this.hap.Characteristic.On).onSet((value: CharacteristicValue) => {
+    service.getCharacteristic(this.hap.Characteristic.On).onGet(this.answering(() => this.isAlarmTriggered));
+    service.getCharacteristic(this.hap.Characteristic.On).onSet(this.answering((value: CharacteristicValue) => {
 
       this.setSecurityAlarm(!!value);
       this.log.info("Security system alarm %s.", value ? "triggered" : "reset");
-    });
+    }));
 
     // Initialize the value.
     service.updateCharacteristic(this.hap.Characteristic.On, this.isAlarmTriggered);
@@ -403,13 +425,23 @@ export class ProtectSecuritySystem extends ProtectBase {
     // out, you can define multiple liveviews in Protect with the same name...who knew!), and then create a single list containing all of the cameras found.
     const targetCameraIds = liveviews.filter(view => view.name.toLowerCase() === viewScene).map(view => view.slots.map(slots => slots.cameras)).flat(2);
 
-    // We don't have a liveview for this state and we aren't disarming - update state for the user and we're done.
+    // Arming or disarming is how the user acknowledges a triggered alarm, so every scene change clears it and turns the alarm switch off, whether or not a liveview
+    // backs the scene.
+    this.isAlarmTriggered = false;
+
+    if(this.accessory.getService(this.hap.Service.Switch)?.getCharacteristic(this.hap.Characteristic.On).value !== this.isAlarmTriggered) {
+
+      this.accessory.getService(this.hap.Service.Switch)?.updateCharacteristic(this.hap.Characteristic.On, this.isAlarmTriggered);
+    }
+
+    // We don't have a liveview for this state and we aren't disarming - save, show and publish the state for the user, and we're done.
     if((newState !== SecuritySystemCurrentState.DISARMED) && !targetCameraIds.length) {
 
       this.log.info("No liveview configured for this security system state. Create a liveview named %s in the Protect webUI to use this feature.", viewScene);
 
-      this.accessory.context.securityState = newState;
+      this.platform.persistence.persist(this.accessory, { securityState: newState });
       this.accessory.getService(this.hap.Service.SecuritySystem)?.updateCharacteristic(SecuritySystemCurrentState, newState);
+      this.publish(mqttTopics.securitysystem.topic, this.currentSecuritySystemState);
 
       return;
     }
@@ -449,14 +481,14 @@ export class ProtectSecuritySystem extends ProtectBase {
       // Only take action to change motion detection state if needed.
       if(targetAccessory.context.detectMotion !== targetState) {
 
-        targetAccessory.context.detectMotion = targetState;
+        this.platform.persistence.persist(targetAccessory, { detectMotion: targetState });
 
         // Update the switch service, if present.
         const motionSwitch = targetAccessory.getServiceById(this.hap.Service.Switch, ProtectReservedNames.SWITCH_MOTION_SENSOR);
 
         if(motionSwitch) {
 
-          motionSwitch.updateCharacteristic(this.hap.Characteristic.On, targetAccessory.context.detectMotion);
+          motionSwitch.updateCharacteristic(this.hap.Characteristic.On, targetState);
         }
 
         this.log.info("%s -> %s: Motion detection %s.", viewScene, targetAccessory.displayName,
@@ -464,20 +496,12 @@ export class ProtectSecuritySystem extends ProtectBase {
       }
     }
 
-    // Inform the user of our new state.
-    this.accessory.context.securityState = newState;
+    // Save and show our new state.
+    this.platform.persistence.persist(this.accessory, { securityState: newState });
     this.accessory.getService(this.hap.Service.SecuritySystem)?.updateCharacteristic(SecuritySystemCurrentState, newState);
 
-    // Reset our alarm state and update our alarm switch.
-    this.isAlarmTriggered = false;
-
-    if(this.accessory.getService(this.hap.Service.Switch)?.getCharacteristic(this.hap.Characteristic.On).value !== this.isAlarmTriggered) {
-
-      this.accessory.getService(this.hap.Service.Switch)?.updateCharacteristic(this.hap.Characteristic.On, this.isAlarmTriggered);
-    }
-
     // Publish to MQTT, if configured.
-    this.publish("securitysystem", this.currentSecuritySystemState);
+    this.publish(mqttTopics.securitysystem.topic, this.currentSecuritySystemState);
   }
 
   // Set the security alarm.
@@ -501,6 +525,6 @@ export class ProtectSecuritySystem extends ProtectBase {
     this.accessory.getService(this.hap.Service.Switch)?.updateCharacteristic(this.hap.Characteristic.On, this.isAlarmTriggered);
 
     // Publish to MQTT, if configured.
-    this.publish("securitysystem", this.currentSecuritySystemState);
+    this.publish(mqttTopics.securitysystem.topic, this.currentSecuritySystemState);
   }
 }

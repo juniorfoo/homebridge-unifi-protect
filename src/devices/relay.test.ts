@@ -11,44 +11,65 @@
  *
  * The isolation model mirrors the light reference: a per-test-fresh beforeEach builds a clean relay against a clean store so #pendingDesired, the recorded toggles, the
  * characteristic state, and the observer baselines are clean every test. The wake log is windowed per push via a captured baseline. buildRelay is the copyable skeleton;
- * only makeRelayConfig, TestRelayProjection, the slice keys, the observer count (two base, one per output, plus ledSettings), and the relay-specific reactions are
- * relay-particular.
+ * only makeRelayConfig, TestRelayProjection, the slice keys, the observer count (the base class's universal observers, one per output, plus ledSettings), and the
+ * relay-specific reactions are relay-particular.
  */
-import { Characteristic, Service, TestRelayProjection, TestStateStore, makeProtectState, makeRelayConfig, makeTestAccessory, makeTestNvr, settle }
-  from "../testing.helpers.ts";
-import type { TestAccessory, TestMqttClient } from "../testing.helpers.ts";
-import { after, before, beforeEach, describe, mock, test } from "node:test";
+import { Characteristic, Service, TestStateStore, makeProtectState, makeTestAccessory } from "../testing.helpers.ts";
+import { PROTECT_HOMEKIT_REFLECT_DELAY, PROTECT_RELAY_COMMAND_TIMEOUT } from "../settings.ts";
+import type { ProtectRelayConfig, Relay } from "unifi-protect";
+import type { TestClock, TestMqttClient } from "homebridge-plugin-utils/testing";
+import { TestRelayProjection, makeRelayConfig } from "./testing.helpers.ts";
+import { after, afterEach, before, beforeEach, describe, test } from "node:test";
+import { settle, triggerGet, triggerSet } from "homebridge-plugin-utils/testing";
 import type { ObserverWakePayload } from "../diagnostics.ts";
-import { PROTECT_RELAY_COMMAND_TIMEOUT } from "../settings.ts";
-import type { ProtectAccessory } from "../types.ts";
 import type { ProtectNvr } from "../nvr/nvr.ts";
 import { ProtectRelay } from "./relay.ts";
-import type { ProtectRelayConfig } from "unifi-protect";
 import { ProtectReservedNames } from "../types.ts";
-import type { Relay } from "unifi-protect";
+import type { TestProtectAccessory } from "../testing.helpers.ts";
 import assert from "node:assert/strict";
+import { configured } from "./device-base.ts";
 import diagnosticsChannel from "node:diagnostics_channel";
+import { makeTestNvr } from "../nvr/testing.helpers.ts";
+import { translateRetiredOptions } from "../options-retired.ts";
+
+// The MAC-scoped tail the plugin composed, with the /get or /set suffix the MQTT client appends taken back off. These rows assert what the plugin addressed,
+// which is the tail rather than the child topic the registration lands on.
+const composedTail = (topic: string): string => topic.replace(/\/(get|set)$/, "");
 
 // The subtype the relay assigns each output switch, keyed by the 0-based wire id. Single-sourced here so every lookup in the suite names the exact subtype the class
 // created the service under.
 const outputSubtype = (id: number): string => ProtectReservedNames.SWITCH_RELAY_OUTPUT + "." + id.toString();
 
-// The reusable construction helper: build a REAL ProtectRelay against the harness doubles. The casts are confined to the construction seam exactly as the light and
-// camera suites do; the instance under test runs its real configureHints / configureDevice / spawnObservers paths. Each call builds a fresh store, so an extra build
+// Every harness controller this suite opens, drained in afterEach so the controller lifetime signal bounds each test's constructions rather than the file's. The builder
+// is the single push site, so an extra build inside a test body is captured exactly as the fixture's is.
+const controllers: AbortController[] = [];
+
+// The reusable construction helper: build a REAL ProtectRelay against the harness doubles. The casts are confined to where the class is constructed, exactly as the light
+// and camera suites do; the instance under test runs its real configureHints / configureDevice / spawnObservers paths. Each call builds a fresh store, so an extra build
 // inside a test (the feature-enabled variants) is fully isolated from the beforeEach relay.
-function buildRelay(configOptions: Parameters<typeof makeRelayConfig>[0] = {}, harnessOptions: { userOptions?: string[] } = {}): {
-  accessory: TestAccessory; mqtt: TestMqttClient; relay: ProtectRelay; relayConfig: ProtectRelayConfig; relayProjection: TestRelayProjection; store: TestStateStore;
+function buildRelay(configOptions: Parameters<typeof makeRelayConfig>[0] = {}, harnessOptions: { disconnected?: boolean; userOptions?: string[] } = {}): {
+  accessory: TestProtectAccessory; clock: TestClock; mqtt: TestMqttClient; relay: ProtectRelay; relayConfig: ProtectRelayConfig; relayProjection: TestRelayProjection;
+  store: TestStateStore;
 } {
 
   const relayConfig = makeRelayConfig(configOptions);
   const store = new TestStateStore(makeProtectState({ relays: [relayConfig] }));
-  const { mqtt, nvr } = makeTestNvr({ mqtt: true, store, userOptions: harnessOptions.userOptions });
-  const accessory = makeTestAccessory("Test Relay", "uuid:test-relay");
+  const { clock, controller, mqtt, nvr } = makeTestNvr({ mqtt: true, store, userOptions: harnessOptions.userOptions });
+
+  controllers.push(controller);
+
+  // A disconnected double is the production startup shape: the relay is built before the broker acknowledges the first session.
+  if(mqtt && harnessOptions.disconnected) {
+
+    mqtt.connected = false;
+  }
+
+  const accessory = makeTestAccessory("Test Relay", relayConfig.mac);
 
   // The projection is named (not cast inline) so the toggle / status-LED tests read its toggleCalls / updateCalls - and set its rejection levers - on the SAME instance
-  // the relay's onSet write-through reaches; the lone construction-seam cast is confined to the new ProtectRelay(...) call.
+  // the relay's onSet write-through reaches; the lone cast at construction is confined to the new ProtectRelay(...) call.
   const projection = new TestRelayProjection(relayConfig.id, store);
-  const relay = new ProtectRelay(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Relay);
+  const relay = configured(new ProtectRelay(nvr as unknown as ProtectNvr, accessory, projection as unknown as Relay));
 
   // makeTestNvr was called with mqtt: true, so the recording double is present; a guard narrows Nullable<TestMqttClient> to the non-null type without an assertion or a
   // same-type cast, and fails loudly if the opt-in ever stops installing the double.
@@ -57,7 +78,7 @@ function buildRelay(configOptions: Parameters<typeof makeRelayConfig>[0] = {}, h
     throw new Error("The MQTT recording double was not installed despite mqtt: true.");
   }
 
-  return { accessory, mqtt, relay, relayConfig, relayProjection: projection, store };
+  return { accessory, clock, mqtt, relay, relayConfig, relayProjection: projection, store };
 }
 
 describe("real ProtectRelay construction and behavior", () => {
@@ -67,7 +88,8 @@ describe("real ProtectRelay construction and behavior", () => {
   const onWake = (message: unknown): void => { wakeLog.push(message as ObserverWakePayload); };
 
   // The per-test-fresh handles, rebuilt in beforeEach so every test starts from a clean relay, clean recording, and clean wake baseline.
-  let accessory: TestAccessory;
+  let accessory: TestProtectAccessory;
+  let clock: TestClock;
   let constructionWakes = 0;
   let mqtt: TestMqttClient;
   let relay: ProtectRelay;
@@ -85,13 +107,27 @@ describe("real ProtectRelay construction and behavior", () => {
     diagnosticsChannel.unsubscribe("hbup:observer:wake", onWake);
   });
 
+  afterEach(() => {
+
+    for(const controller of controllers) {
+
+      controller.abort();
+    }
+
+    controllers.length = 0;
+  });
+
   beforeEach(async () => {
 
-    ({ accessory, mqtt, relay, relayConfig, relayProjection, store } = buildRelay());
+    ({ accessory, clock, mqtt, relay, relayConfig, relayProjection, store } = buildRelay());
 
     // Settle the observe loops' lazy registration before any test asserts, then snapshot the construction-wake count and reset the window so each test measures only
     // its own pushes.
     await settle();
+
+    // The relay states each output's held state as it is built, so each row reads what its own occasion publishes from a list taken past that statement. The double's
+    // gate memory still holds what was stated, as the client's would, so a same-value statement stays unsent.
+    mqtt.published.length = 0;
 
     constructionWakes = wakeLog.length;
     wakeLog.length = 0;
@@ -99,7 +135,7 @@ describe("real ProtectRelay construction and behavior", () => {
 
   test("five observers register, construction wakes none, and both output switches are created and distinctly named", () => {
 
-    assert.equal(store.observerCount, 5, "the two base observers plus the relay's three (one per output, plus ledSettings) are registered against the store double");
+    assert.equal(store.observerCount, 6, "the base observers, the MQTT availability observer and the relay's three (one per output, plus ledSettings) are there");
     assert.equal(constructionWakes, 0, "no observer wake was published during construction - observers arm against the baseline and stay silent");
 
     const output0 = accessory.getServiceById(Service.Switch, outputSubtype(0));
@@ -135,22 +171,85 @@ describe("real ProtectRelay construction and behavior", () => {
     const output0 = accessory.getServiceById(Service.Switch, outputSubtype(0));
 
     assert.ok(output0, "output 0's switch exists");
-    assert.equal(await output0.getCharacteristic(Characteristic.On).triggerGet(), false, "the getter reads the live off state");
+    assert.equal(await triggerGet(output0.getCharacteristic(Characteristic.On)), false, "the getter reads the live off state");
 
     store.pushRelayOutputs(relayConfig.id, [ { id: 0, state: "on" }, { id: 1, state: "off" } ]);
 
     await settle();
 
-    assert.equal(await output0.getCharacteristic(Characteristic.On).triggerGet(), true, "the getter reads on after the controller flips the output");
+    assert.equal(await triggerGet(output0.getCharacteristic(Characteristic.On)), true, "the getter reads on after the controller flips the output");
   });
 
-  test("disabling one output prunes exactly its switch, leaving the sibling switch and the accessory intact", () => {
+  test("leaving one output out of the selection prunes exactly its switch, leaving the sibling switch and the accessory intact", () => {
+
+    const built = buildRelay({}, { userOptions: ["Enable.Relay.Outputs=1"] });
+
+    assert.ok(built.accessory.getServiceById(Service.Switch, outputSubtype(0)), "output 1's switch survives the narrowing");
+    assert.equal(built.accessory.getServiceById(Service.Switch, outputSubtype(1)), undefined, "output 2's switch is pruned");
+    assert.ok(built.accessory.getService(Service.AccessoryInformation), "the accessory itself is intact");
+
+    built.relay.cleanup();
+  });
+
+  /* The end-to-end translation row, written in the retired grammar this plugin used before output visibility was one list: one option per output, each default-on. It
+   * is the only row in this file written that way. The retired entries stay in the configuration untouched - stating what they leave standing takes the live output
+   * list, which a configuration string does not carry - so what gives them their old meaning is the runtime overlay, resolved against this relay's own outputs.
+   */
+  test("a relay configured in the retired per-output grammar keeps exactly the outputs it had", () => {
 
     const built = buildRelay({}, { userOptions: ["Disable.Relay.Output.2"] });
 
-    assert.ok(built.accessory.getServiceById(Service.Switch, outputSubtype(0)), "output 1's switch survives the hide of output 2");
-    assert.equal(built.accessory.getServiceById(Service.Switch, outputSubtype(1)), undefined, "output 2's switch is pruned");
-    assert.ok(built.accessory.getService(Service.AccessoryInformation), "the accessory itself is intact");
+    assert.ok(built.accessory.getServiceById(Service.Switch, outputSubtype(0)), "output 1's switch survives");
+    assert.equal(built.accessory.getServiceById(Service.Switch, outputSubtype(1)), undefined, "the output the retired configuration hid is still hidden");
+
+    built.relay.cleanup();
+  });
+
+  /* The capability the live-domain selection adds: a relay reporting more outputs than the retired catalog ever enumerated shows every one of them. Under the retired
+   * grammar a third output had no option of its own and resolved hidden, so this row is the blessed change - and the narrowed half beside it proves the selection is
+   * what decides, not the hardware.
+   */
+  test("a three-output relay shows every output by default, and a selection hides exactly the ones left out", () => {
+
+    const threeOutputs = [ { id: 0, state: "off" as const }, { id: 1, state: "off" as const }, { id: 2, state: "off" as const } ];
+    const all = buildRelay({ outputs: threeOutputs });
+
+    for(const id of [ 0, 1, 2 ]) {
+
+      assert.ok(all.accessory.getServiceById(Service.Switch, outputSubtype(id)), "output " + (id + 1).toString() + " has a switch by default");
+    }
+
+    all.relay.cleanup();
+
+    const narrowed = buildRelay({ outputs: threeOutputs }, { userOptions: ["Enable.Relay.Outputs=1,3"] });
+
+    assert.ok(narrowed.accessory.getServiceById(Service.Switch, outputSubtype(0)), "output 1 stays");
+    assert.equal(narrowed.accessory.getServiceById(Service.Switch, outputSubtype(1)), undefined, "output 2 is the only one hidden");
+    assert.ok(narrowed.accessory.getServiceById(Service.Switch, outputSubtype(2)), "output 3 stays");
+
+    narrowed.relay.cleanup();
+  });
+
+  /* The mixed-configuration row: a retired per-output entry AND a canonical selection present together. The canonical value is evidence the user has adopted the
+   * current grammar, so it wins outright and every output it names is shown - which is what tells the ruled composition apart from a union (same answer here), an
+   * intersection (which would hide output 2), and a silent retired override (which would also hide it). The retired entry is superseded rather than honored, and the
+   * startup narration names it so the user can see what was set aside.
+   */
+  test("a canonical selection supersedes a retired per-output entry outright, and the narration names what it set aside", () => {
+
+    const threeOutputs = [ { id: 0, state: "off" as const }, { id: 1, state: "off" as const }, { id: 2, state: "off" as const } ];
+    const built = buildRelay({ outputs: threeOutputs }, { userOptions: [ "Disable.Relay.Output.2", "Enable.Relay.Outputs=1,2,3" ] });
+
+    for(const id of [ 0, 1, 2 ]) {
+
+      assert.ok(built.accessory.getServiceById(Service.Switch, outputSubtype(id)),
+        "output " + (id + 1).toString() + " is shown - the canonical selection wins over the retired entry");
+    }
+
+    const translation = translateRetiredOptions([ "Disable.Relay.Output.2", "Enable.Relay.Outputs=1,2,3" ]);
+
+    assert.equal(translation.selection({ domain: [], option: "Relay.Outputs" }), undefined, "a superseded family is not overlaid");
+    assert.deepEqual(translation.translated, ["Disable.Relay.Output.2"], "the superseded entry is named for the startup line");
 
     built.relay.cleanup();
   });
@@ -161,23 +260,23 @@ describe("real ProtectRelay construction and behavior", () => {
 
     assert.ok(output0, "output 0's switch exists");
 
-    // The output starts off, so turning it off again is a no-op - the toggle is not idempotent, and re-issuing it would flip it the wrong way.
-    await output0.getCharacteristic(Characteristic.On).triggerSet(false);
+    // The output starts off, so turning it off again is a no-op - calling toggleOutput twice would flip it back, so re-issuing it here would flip it the wrong way.
+    await triggerSet(output0.getCharacteristic(Characteristic.On), false);
 
     assert.deepEqual(relayProjection.toggleCalls, [], "an off-when-already-off set issued no toggle");
 
     // Turning it on flips it exactly once.
-    await output0.getCharacteristic(Characteristic.On).triggerSet(true);
+    await triggerSet(output0.getCharacteristic(Characteristic.On), true);
 
     assert.deepEqual(relayProjection.toggleCalls, [{ outputId: 0 }], "an on-when-off set toggled output 0 exactly once");
 
     // Turning it on again while the on-intent is still pending is a no-op - the guard compares against where the output is headed, not the lagging controller value.
-    await output0.getCharacteristic(Characteristic.On).triggerSet(true);
+    await triggerSet(output0.getCharacteristic(Characteristic.On), true);
 
     assert.deepEqual(relayProjection.toggleCalls, [{ outputId: 0 }], "a second on-when-heading-on set issued no further toggle");
   });
 
-  test("a rapid on-then-off tap sequence issues two toggles, publishes each intent, and resolves to off once the broadcasts land", async () => {
+  test("a rapid on-then-off tap sequence issues two toggles, publishes each confirmed state, and resolves to off once the broadcasts land", async () => {
 
     const output0 = accessory.getServiceById(Service.Switch, outputSubtype(0));
 
@@ -185,13 +284,11 @@ describe("real ProtectRelay construction and behavior", () => {
 
     // Tap on, then tap off before either broadcast lands. The guard compares the off tap against the pending on-intent - not the controller value, which still reads off
     // during the write-through window - so it issues a second toggle rather than suppressing.
-    await output0.getCharacteristic(Characteristic.On).triggerSet(true);
-    await output0.getCharacteristic(Characteristic.On).triggerSet(false);
+    await triggerSet(output0.getCharacteristic(Characteristic.On), true);
+    await triggerSet(output0.getCharacteristic(Characteristic.On), false);
 
     assert.deepEqual(relayProjection.toggleCalls, [ { outputId: 0 }, { outputId: 0 } ], "the on tap and the off tap each issued a toggle");
-    assert.deepEqual(mqtt.published.filter((entry) => entry.topic === relayConfig.mac + "/relay/1"),
-      [ { message: "true", topic: relayConfig.mac + "/relay/1" }, { message: "false", topic: relayConfig.mac + "/relay/1" } ],
-      "each accepted tap published its desired state on the 1-based output topic");
+    assert.equal(mqtt.publishedTo("/relay/1").length, 0, "the taps with no controller confirmation published nothing");
 
     // The first broadcast (on, from the first toggle) lands, then the second (off, from the second toggle).
     store.pushRelayOutputs(relayConfig.id, [ { id: 0, state: "on" }, { id: 1, state: "off" } ]);
@@ -205,9 +302,11 @@ describe("real ProtectRelay construction and behavior", () => {
     await settle();
 
     assert.equal(output0.getCharacteristic(Characteristic.On).value, false, "the second broadcast resolved the tile to off - the rapid on-then-off ends off");
+    assert.deepEqual(mqtt.publishedTo("/relay/1").map((entry) => entry.payload), [ "true", "false" ],
+      "each confirming broadcast published the output's state once on the 1-based output topic");
 
     // The confirming broadcast cleared the intent: a fresh on tap toggles again rather than being suppressed against a stale pending value.
-    await output0.getCharacteristic(Characteristic.On).triggerSet(true);
+    await triggerSet(output0.getCharacteristic(Characteristic.On), true);
 
     assert.deepEqual(relayProjection.toggleCalls, [ { outputId: 0 }, { outputId: 0 }, { outputId: 0 } ],
       "the confirming broadcast cleared the intent, so a fresh on tap toggled again");
@@ -241,7 +340,7 @@ describe("real ProtectRelay construction and behavior", () => {
     assert.ok(output1, "output 1's switch exists");
 
     // Tap output 0 ON. Its broadcast has not landed, so #pendingDesired[0] stands and HAP holds tile 0 on.
-    await output0.getCharacteristic(Characteristic.On).triggerSet(true);
+    await triggerSet(output0.getCharacteristic(Characteristic.On), true);
 
     assert.equal(output0.getCharacteristic(Characteristic.On).value, true, "tile 0 is optimistically on with the tap in flight");
 
@@ -279,68 +378,97 @@ describe("real ProtectRelay construction and behavior", () => {
     await settle();
 
     assert.equal(output0.getCharacteristic(Characteristic.On).value, false, "the self-revert mirrored back off");
+    assert.deepEqual(mqtt.publishedTo("/relay/1").map((entry) => entry.payload), [ "true", "false" ], "the pulse and its self-revert each published once");
+  });
+
+  test("an output Relay.Outputs hides publishes nothing for its changes while a visible output's change publishes once", async () => {
+
+    const built = buildRelay({}, { userOptions: ["Enable.Relay.Outputs=1"] });
+
+    try {
+
+      await settle();
+
+      assert.deepEqual(built.mqtt.publishedTo("/relay/1").map((entry) => entry.payload), ["false"], "the visible output's held state is stated once as it is built");
+      assert.equal(built.mqtt.publishedTo("/relay/2").length, 0, "the hidden output states nothing as it is built");
+
+      built.mqtt.published.length = 0;
+
+      built.store.pushRelayOutputs(built.relayConfig.id, [ { id: 0, state: "on" }, { id: 1, state: "on" } ]);
+      await settle();
+
+      assert.deepEqual(built.mqtt.publishedTo("/relay/1").map((entry) => entry.payload), ["true"], "the visible output's change published once");
+      assert.equal(built.mqtt.publishedTo("/relay/2").length, 0, "the hidden output's change published nothing");
+    } finally {
+
+      built.relay.cleanup();
+    }
+  });
+
+  test("an output Relay.Outputs hides registers no MQTT get or set while a visible output registers its get and its set", () => {
+
+    const built = buildRelay({}, { userOptions: ["Enable.Relay.Outputs=1"] });
+
+    // The registration kinds each output's MAC-scoped tail carries. A hidden output has no switch, and with it no MQTT topic, so its tail carries neither kind.
+    const kinds = (tail: string): string[] => built.mqtt.subscriptions.filter((subscription) => composedTail(subscription.topic) === built.relayConfig.mac + tail)
+      .map((subscription) => subscription.kind);
+
+    try {
+
+      assert.ok(built.accessory.getServiceById(Service.Switch, outputSubtype(0)), "the visible output's switch exists");
+      assert.equal(built.accessory.getServiceById(Service.Switch, outputSubtype(1)), undefined, "the hidden output's switch is pruned");
+      assert.deepEqual(kinds("/relay/1"), [ "get", "set" ], "the visible output registers its get and its set");
+      assert.deepEqual(kinds("/relay/2"), [], "the hidden output registers neither a get nor a set");
+    } finally {
+
+      built.relay.cleanup();
+    }
   });
 
   test("a toggle command failure drops the intent, cancels the safety timer, and bounces the tile back to controller truth", async () => {
 
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const output0 = accessory.getServiceById(Service.Switch, outputSubtype(0));
 
-    try {
+    assert.ok(output0, "output 0's switch exists");
 
-      const output0 = accessory.getServiceById(Service.Switch, outputSubtype(0));
+    relayProjection.toggleRejection = new Error("the controller refused the command.");
 
-      assert.ok(output0, "output 0's switch exists");
+    await triggerSet(output0.getCharacteristic(Characteristic.On), true);
 
-      relayProjection.toggleRejection = new Error("the controller refused the command.");
+    assert.deepEqual(relayProjection.toggleCalls, [{ outputId: 0 }], "the command was attempted");
 
-      await output0.getCharacteristic(Characteristic.On).triggerSet(true);
+    // HAP holds the requested (true) value on the characteristic; the deferred reflect then writes the true controller state, which is still off.
+    clock.advance(PROTECT_HOMEKIT_REFLECT_DELAY);
 
-      assert.deepEqual(relayProjection.toggleCalls, [{ outputId: 0 }], "the command was attempted");
+    assert.equal(output0.getCharacteristic(Characteristic.On).value, false, "the deferred bounce restored the tile to the live off state after the failure");
 
-      // HAP holds the requested (true) value on the characteristic; the deferred cosmetic bounce then reflects the true controller state, which is still off.
-      mock.timers.tick(50);
+    // The intent was dropped on failure, so a fresh on tap (rejection cleared) toggles again rather than being suppressed against a stale pending value.
+    relayProjection.toggleRejection = null;
 
-      assert.equal(output0.getCharacteristic(Characteristic.On).value, false, "the deferred bounce restored the tile to the live off state after the failure");
+    await triggerSet(output0.getCharacteristic(Characteristic.On), true);
 
-      // The intent was dropped on failure, so a fresh on tap (rejection cleared) toggles again rather than being suppressed against a stale pending value.
-      relayProjection.toggleRejection = null;
-
-      await output0.getCharacteristic(Characteristic.On).triggerSet(true);
-
-      assert.deepEqual(relayProjection.toggleCalls, [ { outputId: 0 }, { outputId: 0 } ], "the failure dropped the intent, so a fresh tap toggled again");
-    } finally {
-
-      mock.timers.reset();
-    }
+    assert.deepEqual(relayProjection.toggleCalls, [ { outputId: 0 }, { outputId: 0 } ], "the failure dropped the intent, so a fresh tap toggled again");
   });
 
   test("the pending-intent safety timer drops an unconfirmed intent so a later same-direction tap toggles again", async () => {
 
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const output0 = accessory.getServiceById(Service.Switch, outputSubtype(0));
 
-    try {
+    assert.ok(output0, "output 0's switch exists");
 
-      const output0 = accessory.getServiceById(Service.Switch, outputSubtype(0));
+    // Tap on: the intent is recorded, and a same-direction second tap is suppressed while it stands.
+    await triggerSet(output0.getCharacteristic(Characteristic.On), true);
+    await triggerSet(output0.getCharacteristic(Characteristic.On), true);
 
-      assert.ok(output0, "output 0's switch exists");
+    assert.deepEqual(relayProjection.toggleCalls, [{ outputId: 0 }], "the second same-direction tap was suppressed while the intent stood");
 
-      // Tap on: the intent is recorded, and a same-direction second tap is suppressed while it stands.
-      await output0.getCharacteristic(Characteristic.On).triggerSet(true);
-      await output0.getCharacteristic(Characteristic.On).triggerSet(true);
+    // No broadcast ever confirms; the bounded safety timer fires and drops the intent so a lost broadcast cannot wedge the tap decision.
+    clock.advance(PROTECT_RELAY_COMMAND_TIMEOUT);
 
-      assert.deepEqual(relayProjection.toggleCalls, [{ outputId: 0 }], "the second same-direction tap was suppressed while the intent stood");
+    // A fresh on tap now toggles again: the controller value is still off and the stale intent is gone.
+    await triggerSet(output0.getCharacteristic(Characteristic.On), true);
 
-      // No broadcast ever confirms; the bounded safety timer fires and drops the intent so a lost broadcast cannot wedge the tap decision.
-      mock.timers.tick(PROTECT_RELAY_COMMAND_TIMEOUT);
-
-      // A fresh on tap now toggles again: the controller value is still off and the stale intent is gone.
-      await output0.getCharacteristic(Characteristic.On).triggerSet(true);
-
-      assert.deepEqual(relayProjection.toggleCalls, [ { outputId: 0 }, { outputId: 0 } ], "after the safety timer dropped the intent, a fresh tap toggled again");
-    } finally {
-
-      mock.timers.reset();
-    }
+    assert.deepEqual(relayProjection.toggleCalls, [ { outputId: 0 }, { outputId: 0 } ], "after the safety timer dropped the intent, a fresh tap toggled again");
   });
 
   test("an output with a controller-assigned name uses that name; an unnamed output falls back to the 1-based Output N label", () => {
@@ -364,7 +492,7 @@ describe("real ProtectRelay construction and behavior", () => {
     assert.ok(ledSwitch, "enabling the feature created the status-indicator switch");
     assert.equal(ledSwitch.getCharacteristic(Characteristic.On).value, false, "the switch seeded from the off indicator setting");
 
-    await ledSwitch.getCharacteristic(Characteristic.On).triggerSet(true);
+    await triggerSet(ledSwitch.getCharacteristic(Characteristic.On), true);
 
     assert.deepEqual(enabled.relayProjection.updateCalls, [{ payload: { ledSettings: { isEnabled: true } } }],
       "the LED onSet wrote ledSettings.isEnabled through device.update");
@@ -396,25 +524,120 @@ describe("real ProtectRelay construction and behavior", () => {
 
   test("MQTT registers a MAC-scoped get and set per output; the get reads live state and the set drives the toggle path", async () => {
 
-    const tails = mqtt.subscriptions.map((subscription) => subscription.topic);
+    const tails = mqtt.subscriptions.map((subscription) => composedTail(subscription.topic));
 
     assert.ok(tails.includes(relayConfig.mac + "/relay/1"), "output 1 registered a MAC-scoped subscription tail");
     assert.ok(tails.includes(relayConfig.mac + "/relay/2"), "output 2 registered a MAC-scoped subscription tail");
 
     // HARD-assert the GET subscription exists FIRST: an absent subscription whose getValue is optional-chained would let the value assertion pass vacuously.
-    const get = mqtt.subscriptions.find((subscription) => (subscription.kind === "get") && (subscription.topic === relayConfig.mac + "/relay/1"));
+    const get = mqtt.subscriptions.find((subscription) => (subscription.kind === "get") && (subscription.topic === relayConfig.mac + "/relay/1/get"));
 
-    assert.ok(get?.getValue, "output 1 registered a GET subscription");
-    assert.equal(get.getValue(), "false", "the GET reads the live off state as the string \"false\"");
+    assert.ok(get, "output 1 registered a GET subscription");
+    assert.equal(await mqtt.invokeGet(relayConfig.mac + "/relay/1/get"), "false", "the GET reads the live off state as the string \"false\"");
 
     // The SET body drives the output switch's On onSet, which re-enters the single set-to-toggle path.
-    const set = mqtt.subscriptions.find((subscription) => (subscription.kind === "set") && (subscription.topic === relayConfig.mac + "/relay/1"));
+    const set = mqtt.subscriptions.find((subscription) => (subscription.kind === "set") && (subscription.topic === relayConfig.mac + "/relay/1/set"));
 
-    assert.ok(set?.setValue, "output 1 registered a SET subscription");
+    assert.ok(set, "output 1 registered a SET subscription");
 
-    await set.setValue("true", "true");
+    await mqtt.invokeSet(relayConfig.mac + "/relay/1/set", "true");
     await settle();
 
     assert.deepEqual(relayProjection.toggleCalls, [{ outputId: 0 }], "a \"true\" SET on the output topic drove the toggle path for output 0");
+  });
+
+  test("under a custom name, a rename in the Home app of an output's switch stands, since an output's label stands in for the controller's name for it", async () => {
+
+    const built = buildRelay({}, { userOptions: ["Enable.Device.Name." + relayConfig.mac + "=Garage Relay"] });
+    const output0 = built.accessory.getServiceById(Service.Switch, outputSubtype(0));
+
+    assert.ok(output0, "output 0's switch exists");
+    assert.equal(output0.displayName, "Garage Relay Output 1", "precondition: the switch was created under the custom name the accessory carries");
+
+    await triggerSet(output0.getCharacteristic(Characteristic.ConfiguredName), "Gate");
+    await settle();
+
+    assert.equal(output0.getCharacteristic(Characteristic.ConfiguredName).value, "Gate", "the Home app's name for the output stands");
+
+    built.relay.cleanup();
+  });
+});
+
+describe("the relay's outputs restated per broker session", () => {
+
+  test("a session restore restates each visible output once and a hidden output not at all, and a push leaving the outputs unchanged records nothing", async () => {
+
+    const built = buildRelay({}, { userOptions: ["Enable.Relay.Outputs=1"] });
+
+    try {
+
+      await settle();
+
+      built.mqtt.connected = false;
+      await settle();
+      built.mqtt.connected = true;
+      await settle();
+
+      assert.deepEqual(built.mqtt.publishedTo("/relay/1").map((entry) => entry.payload), [ "false", "false" ], "the visible output is stated as built and restated once");
+      assert.equal(built.mqtt.publishedTo("/relay/2").length, 0, "the hidden output is never stated");
+      assert.equal(built.mqtt.publishedTo("/motion").length, 0, "no event topic is restated");
+
+      const recorded = built.mqtt.published.length;
+
+      // A push that leaves every output's state where it was is one the per-output observer never sees, so this holds only that such a push records nothing. That the
+      // gate suppresses an unchanged statement is held by the owner spine's own rows in device-mqtt-topic.test.ts.
+      built.store.pushRelayOutputs(built.relayConfig.id, [ { id: 0, state: "off" }, { id: 1, state: "on" } ]);
+      await settle();
+
+      assert.equal(built.mqtt.published.length, recorded, "a push leaving the outputs unchanged records nothing");
+    } finally {
+
+      built.relay.cleanup();
+    }
+  });
+
+  test("a relay built while no session is held records nothing until the session starts, then each visible output once", async () => {
+
+    const built = buildRelay({}, { disconnected: true, userOptions: ["Enable.Relay.Outputs=1"] });
+
+    try {
+
+      await settle();
+
+      assert.equal(built.mqtt.published.length, 0, "the statements made with no session held are refused");
+
+      built.mqtt.connected = true;
+      await settle();
+
+      assert.deepEqual(built.mqtt.publishedTo("/relay/1").map((entry) => entry.payload), ["false"], "the first session states the visible output once");
+      assert.equal(built.mqtt.publishedTo("/relay/2").length, 0, "the hidden output is never stated");
+    } finally {
+
+      built.relay.cleanup();
+    }
+  });
+
+  test("an output changed while the session is down is restated once, as the current value, when the session returns", async () => {
+
+    const built = buildRelay();
+
+    try {
+
+      await settle();
+
+      built.mqtt.connected = false;
+      built.store.pushRelayOutputs(built.relayConfig.id, [ { id: 0, state: "on" }, { id: 1, state: "off" } ]);
+      await settle();
+
+      const asBuilt = built.mqtt.publishedTo("/relay/1").length;
+
+      built.mqtt.connected = true;
+      await settle();
+
+      assert.deepEqual(built.mqtt.publishedTo("/relay/1").slice(asBuilt).map((entry) => entry.payload), ["true"], "the returning session hears the current value once");
+    } finally {
+
+      built.relay.cleanup();
+    }
   });
 });

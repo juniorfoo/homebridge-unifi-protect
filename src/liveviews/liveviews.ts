@@ -4,24 +4,30 @@
  */
 import { PLATFORM_NAME, PLUGIN_NAME } from "../settings.ts";
 import type { ProtectAccessory, ProtectAccessoryContext } from "../types.ts";
+import { ProtectBase, configured } from "../devices/device-base.ts";
+import { ProtectSecuritySystem, isSecuritySystemCalledFor } from "./security-system.ts";
+import { acquireService, membershipDelta, notResponding, sanitizeName } from "homebridge-plugin-utils";
 import type { CharacteristicValue } from "homebridge";
 import type { Nullable } from "homebridge-plugin-utils";
-import { ProtectBase } from "../devices/device-base.ts";
 import type { ProtectNvr } from "../nvr/nvr.ts";
 import type { ProtectNvrLiveviewConfig } from "unifi-protect";
 import { ProtectReservedNames } from "../types.ts";
-import { ProtectSecuritySystem } from "./security-system.ts";
-import { sanitizeName } from "homebridge-plugin-utils";
+import { deviceDisplayName } from "../devices/device-descriptor.ts";
+import { isolateAccessoryChange } from "../nvr/nvr-accessory-change.ts";
+import { mqttTopics } from "../mqtt.ts";
 import { selectLiveviews } from "unifi-protect";
+
+// The liveviews that call for a switch: views beginning with Protect- whose name is not reserved for the security system. The capture is the switch's view name.
+const LIVEVIEW_SWITCH = /^Protect-((?!Away$|Off$|Home$|Night$).+)$/i;
 
 export class ProtectLiveviews extends ProtectBase {
 
   private isConfigured: Set<string>;
   private isMqttConfigured: boolean;
-  private securityAccessory: Nullable<ProtectAccessory> | undefined;
+  private securityAccessory: Nullable<ProtectAccessory>;
   private securitySystem: Nullable<ProtectSecuritySystem>;
 
-  // Configure our liveviews capability.
+  // Create an instance.
   constructor(nvr: ProtectNvr) {
 
     super(nvr);
@@ -30,6 +36,10 @@ export class ProtectLiveviews extends ProtectBase {
     this.isMqttConfigured = false;
     this.securityAccessory = null;
     this.securitySystem = null;
+  }
+
+  // Configure our liveviews capability.
+  public override configure(): void {
 
     // Subject owns its reactivity: observe the controller's liveview collection and reconcile the liveview-derived accessories on each change. The store yields only on
     // change, so the initial population is seeded once by the NVR after device discovery (a liveview switch restores motion state onto its member cameras, which must
@@ -45,11 +55,51 @@ export class ProtectLiveviews extends ProtectBase {
   }
 
   // Whether a platform accessory is a liveview switch this controller owns. Liveview accessories are scoped to their owning controller by the context MAC written at
-  // reconcile time, so on a multi-controller install this owner reconciles, sweeps, and addresses only its own switches and never another controller's. This is the one
-  // home for the scoping rule, consumed by the orphan sweep and both MQTT lookups.
+  // reconcile time, so on a multi-controller install this owner reconciles, removes, and addresses only its own switches and never another controller's. This is the
+  // one home for the scoping rule, consumed by the switch reconcile's membership delta and the MQTT get and set lookups.
   private isOwnedLiveviewSwitch(accessory: ProtectAccessory): boolean {
 
     return ("liveview" in accessory.context) && (accessory.context.nvr === this.nvr.ufp.mac);
+  }
+
+  /* The liveview switches the controller's liveviews call for, keyed by identity: the upper-cased view name, onto which every liveview of that name collapses, so
+   * liveviews that share a name share one switch. Each identity carries the view name as the first such liveview spells it, which the switch is named with. The
+   * switch reconcile diffs these identities against the switches this controller owns, and each pending removal re-reads them when its grace ends.
+   */
+  private get liveviewSwitchNames(): Map<string, string> {
+
+    const names = new Map<string, string>();
+
+    for(const liveview of this.liveviews) {
+
+      const viewName = LIVEVIEW_SWITCH.exec(liveview.name)?.[1];
+
+      if(!viewName || names.has(viewName.toUpperCase())) {
+
+        continue;
+      }
+
+      names.set(viewName.toUpperCase(), viewName);
+    }
+
+    return names;
+  }
+
+  // Whether a liveview still calls for a switch, by the switch's identity. The switch's refusal and its pending removal's re-check read this one answer, so HomeKit shows
+  // No Response for exactly the switch the removal would take.
+  private isSwitchCalledFor(id: string): boolean {
+
+    return this.liveviewSwitchNames.has(id);
+  }
+
+  // Every liveview switch this controller owns with its current state, as the MQTT topic carries the whole list. The get answers it and the session restatement
+  // publishes it, so the get and the restatement read one derivation.
+  private get liveviewsPayload(): string {
+
+    const liveviews = this.platform.accessories.filter(x => this.isOwnedLiveviewSwitch(x))
+      .map(x => ({ name: x.context.liveview ?? "", state: x.getService(this.hap.Service.Switch)?.getCharacteristic(this.hap.Characteristic.On).value }));
+
+    return JSON.stringify(liveviews);
   }
 
   // Reconcile the liveview-derived accessories against the controller's current liveview collection. The NVR-level observe loop drives this on each change to the live
@@ -64,165 +114,215 @@ export class ProtectLiveviews extends ProtectBase {
   // Configure the security system accessory.
   private configureSecuritySystem(): void {
 
-    const regexSecuritySystemLiveview = /^Protect-(Away|Home|Night|Off)$/i;
     const uuid = this.hap.uuid.generate(this.nvr.ufp.mac + ".Security");
+    const isCalledFor = (): boolean => isSecuritySystemCalledFor(this.liveviews);
+    const present = this.securityAccessory ?? this.platform.accessories.find(x => x.UUID === uuid);
 
-    // If the user removed the last Protect-centric liveview for the security system, we remove the security system accessory.
-    if(!this.liveviews.some(x => regexSecuritySystemLiveview.test(x.name))) {
+    /* The membership delta over the security system's one identity. Every plugin-specific liveview projects onto the accessory's UUID, and the accessory present is the
+     * one this owner built or the one Homebridge restored from its cache, so an accessory whose liveviews were deleted while Homebridge was down is found here too.
+     *
+     * The user removed the last plugin-specific liveview: the removal goes through the controller's removal gate, which waits for the controller to be stable and for
+     * the user's removal delay, then re-reads the liveviews before it acts. Until then the accessory stays and its MQTT handlers answer, and HomeKit shows No Response.
+     */
+    const { toRemove } = membershipDelta(isCalledFor() ? [uuid] : [], present ? [present.UUID] : []);
 
-      if(this.securityAccessory) {
+    if(present && toRemove.length) {
 
-        this.log.info("No plugin-specific liveviews found. Disabling the security system accessory associated with this UniFi Protect controller.");
-
-        // Remove the accessory through the shared removal tail, which unregisters a bridged accessory and splices it out of the platform list. The tail logs nothing by
-        // design, so the user-facing narration above stays here with the owner.
-        this.nvr.removeAccessoryFromHomeKit(this.securityAccessory);
-      }
-
-      // Release the security system's MQTT registrations before dropping the instance, so its get/set handlers no longer command this controller's cameras once its
-      // accessory is gone. A later re-add builds a fresh instance that subscribes anew.
-      this.securitySystem?.cleanup();
-
-      this.securityAccessory = null;
-      this.securitySystem = null;
+      this.nvr.removals.schedule({ accessory: present,
+        reason: "No plugin-specific liveviews found. Disabling the security system accessory associated with this UniFi Protect controller.",
+        remove: () => this.removeSecuritySystem(present), stillGone: () => !isCalledFor() });
 
       return;
     }
 
-    // Create the security system accessory if it doesn't already exist.
-    if(!this.securityAccessory) {
+    if(!isCalledFor()) {
 
-      // See if we already have this accessory defined.
-      if((this.securityAccessory = this.platform.accessories.find(x => x.UUID === uuid)) === undefined) {
-
-        // We will use the NVR MAC address + ".Security" to create our UUID. That should provide the guaranteed uniqueness we need.
-        this.securityAccessory = new this.api.platformAccessory<ProtectAccessoryContext>(sanitizeName(this.nvr.ufp.name ?? this.nvr.ufp.marketName), uuid);
-
-        // Register this accessory with homebridge and add it to the platform accessory array so we can track it.
-        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [this.securityAccessory]);
-        this.platform.accessories.push(this.securityAccessory);
-      }
-
-      this.log.info("Plugin-specific liveviews have been detected. Enabling the security system accessory.");
+      return;
     }
 
-    // We have the security system accessory, now let's configure it.
-    this.securitySystem ??= new ProtectSecuritySystem(this.nvr, this.securityAccessory);
+    // A plugin-specific liveview calls for the security system, so a removal an earlier pass scheduled, if any, is cancelled.
+    this.nvr.removals.cancelFor(uuid);
 
-    // Update our NVR reference.
-    this.securityAccessory.context.nvr = this.nvr.ufp.mac;
+    /* Add the security system when we hold none, its accessory's creation and the instance on it together, through the shared isolation: a bridge already holding as
+     * many accessories as HomeKit allows refuses the registration with a throw, and every caller is a pass a throw would cost far more than the security system - the
+     * startup liveviews reconcile inside login(), the liveviews observer's loop, and the stability sweep's timer. A failed add leaves the instance null, so the next
+     * liveviews reconcile retries it.
+     */
+    this.securitySystem ??= isolateAccessoryChange({ act: "add", change: () => this.#addSecuritySystem(uuid), log: this.log, name: "the security system" });
+
+    if(!this.securitySystem) {
+
+      return;
+    }
+
+    // Update our NVR reference, and save the accessory's context.
+    this.platform.persistence.persist(this.securitySystem.accessory, { nvr: this.nvr.ufp.mac });
 
     // Refresh the available arm states from the current liveview collection, so adding or removing a Protect-Away/Home/Night liveview re-scopes the security system's
     // valid target states. The owner drives this on every reconcile because it owns the security accessory's lifecycle and its refresh.
     this.securitySystem.updateDevice();
   }
 
+  /* Find or create the security system's accessory, registering one it creates, and stand the security system up on it. The accessory is held only once its
+   * registration returns, so a registration that throws leaves none held and the retry creates it afresh rather than configuring an accessory HomeKit never took. The
+   * instance is returned only once configured() returns, so one whose setup threw is released there, and the retry reuses the accessory held here.
+   */
+  #addSecuritySystem(uuid: string): ProtectSecuritySystem {
+
+    // Create the security system accessory if it doesn't already exist.
+    if(!this.securityAccessory) {
+
+      // See if we already have this accessory defined.
+      let accessory = this.platform.accessories.find(x => x.UUID === uuid);
+
+      if(!accessory) {
+
+        // We will use the NVR MAC address + ".Security" to create our UUID. That should provide the guaranteed uniqueness we need.
+        accessory = new this.api.platformAccessory<ProtectAccessoryContext>(deviceDisplayName(this.nvr.ufp), uuid);
+
+        // Register this accessory with homebridge and add it to the platform accessory array so we can track it.
+        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+        this.platform.accessories.push(accessory);
+      }
+
+      this.securityAccessory = accessory;
+      this.log.info("Plugin-specific liveviews have been detected. Enabling the security system accessory.");
+    }
+
+    // We have the security system accessory, now let's configure it.
+    return configured(new ProtectSecuritySystem(this.nvr, this.securityAccessory));
+  }
+
+  // Remove the security system, the removal a granted removal-gate decision runs. Its MQTT registrations are released before the instance is dropped, so its get and
+  // set handlers no longer command this controller's cameras once its accessory is gone, and a later re-add builds a fresh instance that subscribes anew. The accessory
+  // leaves through the shared removal tail, which unregisters a bridged accessory and splices it out of the platform list.
+  private removeSecuritySystem(accessory: ProtectAccessory): void {
+
+    this.securitySystem?.cleanup();
+    this.securityAccessory = null;
+    this.securitySystem = null;
+    this.nvr.removeAccessoryFromHomeKit(accessory);
+  }
+
   // Configure any liveview-associated switches.
   private configureSwitches(): void {
 
-    // Sweep away any orphan liveview switches whose liveview was removed or renamed on the controller. We iterate a filtered SNAPSHOT of this controller's own liveview
-    // switches (the scoping predicate keys on the context MAC), so the sweep never disturbs another controller's switches and the removal splice never races the
-    // iterator it walks.
-    for(const accessory of this.platform.accessories.filter(x => this.isOwnedLiveviewSwitch(x))) {
+    const identity = (accessory: ProtectAccessory): string => (accessory.context.liveview ?? "").toUpperCase();
+    const names = this.liveviewSwitchNames;
 
-      // We found a switch matching this liveview. Move along...
-      if(this.liveviews.some(x => x.name.toUpperCase() === ("Protect-" + (accessory.context.liveview ?? "")).toUpperCase())) {
+    /* The membership delta over the switch identities: a switch this controller owns that no liveview calls for any longer - its liveview was removed or renamed on the
+     * controller, whether this session or while Homebridge was down - is removed through the controller's removal gate, which waits for the controller to be stable and
+     * for the user's removal delay, then re-reads the liveviews before it acts. Until then the accessory stays, its MQTT get answers, its MQTT set skips it, and HomeKit
+     * shows No Response. We diff a filtered SNAPSHOT of this controller's own switches (the scoping predicate keys on the context MAC), so the reconcile never disturbs
+     * another controller's switches and a removal splice never races an iterator walking the live list.
+     */
+    const owned = this.platform.accessories.filter(x => this.isOwnedLiveviewSwitch(x));
+    const toRemove = new Set(membershipDelta([...names.keys()], owned.map(identity)).toRemove);
 
-        continue;
-      }
+    for(const accessory of owned.filter(x => toRemove.has(identity(x)))) {
 
-      // The switch has no associated liveview - let's get rid of it.
-      this.log.info("Removing plugin-specific liveview switch: %s. The liveview has been either removed or renamed in UniFi Protect.", accessory.context.liveview);
+      const id = identity(accessory);
 
-      // Forget the configured name and remove the accessory through the shared removal tail, which unregisters a bridged accessory and splices it out of the platform
-      // list. The tail logs nothing by design, so the user-facing narration above stays here with the owner.
-      this.isConfigured.delete((accessory.context.liveview ?? "").toUpperCase());
-      this.nvr.removeAccessoryFromHomeKit(accessory);
+      this.nvr.removals.schedule({ accessory,
+        reason: "Removing plugin-specific liveview switch: " + (accessory.context.liveview ?? "") + ". The liveview has been either removed or renamed in UniFi Protect.",
+        remove: () => {
+
+          // Forget the configured name and remove the accessory through the shared removal tail, which unregisters a bridged accessory and splices it out of the
+          // platform list.
+          this.isConfigured.delete(id);
+          this.nvr.removeAccessoryFromHomeKit(accessory);
+        },
+        stillGone: () => !this.isSwitchCalledFor(id) });
     }
 
-    // Initialize the regular expression here so we don't have to reinitialize it in each iteration below.
-    const regexLiveview = /^Protect-((?!Away$|Off$|Home$|Night$).+)$/i;
-
-    // Check for any new plugin-specific liveviews.
-    for(const liveview of [...new Set(this.liveviews.map(x => x.name))]) {
-
-      // Only match on views beginning with Protect- that are not reserved for the security system.
-      const viewMatch = regexLiveview.exec(liveview);
-
-      // No match found, we're not interested in it.
-      if(!viewMatch) {
-
-        continue;
-      }
-
-      // Grab the name of our new switch for reference.
-      const viewName = viewMatch[1];
-
-      // The capture group is always present when the regex matched, but guard to keep viewName a string for the comparisons and UUID composition below.
-      if(!viewName) {
-
-        continue;
-      }
-
-      // By design, we want to avoid configuring multiple liveview switches with the same name. Instead we combine all liveviews of the same name into a single switch.
-      if(this.isConfigured.has(viewName.toUpperCase())) {
-
-        continue;
-      }
+    // Configure every switch the liveviews call for. By design, liveviews of the same name share a single switch, which the identity projection above provides.
+    for(const [ id, viewName ] of names) {
 
       // We use the NVR MAC address + ".Liveview." + viewname to create our unique UUID for our switches.
-      const uuid = this.hap.uuid.generate(this.nvr.ufp.mac + ".Liveview." + viewName.toUpperCase());
+      const uuid = this.hap.uuid.generate(this.nvr.ufp.mac + ".Liveview." + id);
 
-      // Check to see if the accessory already exists before we create it.
-      let liveviewState = true;
-      let newAccessory;
+      // A liveview calls for this switch, so a removal an earlier pass scheduled, if any, is cancelled.
+      this.nvr.removals.cancelFor(uuid);
 
-      if((newAccessory = this.platform.accessories.find(x => x.UUID === uuid)) === undefined) {
+      if(this.isConfigured.has(id)) {
 
-        newAccessory = new this.api.platformAccessory<ProtectAccessoryContext>(sanitizeName((this.nvr.ufp.name ?? "") + " " + viewName), uuid);
-
-        // Register this accessory with homebridge and add it to the platform accessory array so we can track it.
-        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [newAccessory]);
-        this.platform.accessories.push(newAccessory);
+        continue;
       }
 
-      // Configure our accessory.
-      if("liveviewState" in newAccessory.context) {
-
-        liveviewState = newAccessory.context.liveviewState ?? false;
-      }
-
-      newAccessory.context = {};
-      newAccessory.context.liveview = viewName;
-      newAccessory.context.liveviewState = liveviewState;
-      newAccessory.context.nvr = this.nvr.ufp.mac;
-
-      // Find the existing liveview switch, if we have one.
-      let switchService = newAccessory.getService(this.hap.Service.Switch);
-
-      // Add the liveview switch to the accessory.
-      if(!switchService) {
-
-        switchService = new this.hap.Service.Switch(newAccessory.displayName);
-
-        newAccessory.addService(switchService);
-      }
-
-      // Activate or deactivate motion detection.
-      switchService.getCharacteristic(this.hap.Characteristic.On)
-        .onGet(this.getSwitchState.bind(this, newAccessory.context.liveview ?? ""))
-        .onSet(this.setSwitchState.bind(this, newAccessory));
-
-      // Initialize the switch. We keep a saved liveview switch state because we want to account for edge cases where liveviews can disappear and we end up in a
-      // situation where motion detection is disabled without a way to enable it. By saving the switch state on the accessory, we can always initialize all
-      // motion-related accessories at startup as having motion enabled, and explicitly disable them here at startup when we restore state.
-      switchService.updateCharacteristic(this.hap.Characteristic.On, newAccessory.context.liveviewState);
-      this.setSwitchState(newAccessory, newAccessory.context.liveviewState);
-      this.isConfigured.add((newAccessory.context.liveview ?? "").toUpperCase());
-
-      // Inform the user.
-      this.log.info("Configuring plugin-specific liveview switch: %s.", viewName);
+      // Each switch is added through the shared isolation, so a switch that cannot be added, a full bridge refusing its registration among the causes, costs the
+      // switches behind it and the pass running this reconcile nothing. A failed switch is not marked configured, so the next liveviews reconcile retries it.
+      isolateAccessoryChange({ act: "add", change: () => this.#addLiveviewSwitch({ id, uuid, viewName }), log: this.log, name: "the " + viewName + " liveview switch" });
     }
+  }
+
+  /* Find or create one liveview switch's accessory, registering one it creates, and configure the switch on it, marking the switch configured once it stands.
+   *
+   * @param options          - The switch to add.
+   * @param options.id       - The switch's identity, the upper-cased view name its liveviews collapse onto.
+   * @param options.uuid     - The UUID of the switch's accessory.
+   * @param options.viewName - The view name the switch carries, as the first liveview of its identity spells it.
+   */
+  #addLiveviewSwitch({ id, uuid, viewName }: { id: string; uuid: string; viewName: string }): void {
+
+    // Check to see if the accessory already exists before we create it.
+    let liveviewState = true;
+    let newAccessory;
+
+    if((newAccessory = this.platform.accessories.find(x => x.UUID === uuid)) === undefined) {
+
+      // The switch is named for its controller and its view together, the join rendering an absent controller name as nothing, and the whole name is sanitized at
+      // once, so a character HomeKit refuses only at a name's end stays when the view name follows it. Only a switch whose controller and view names each sanitize to
+      // nothing takes the controller's display name, because HAP refuses an accessory whose display name is empty.
+      const switchName = sanitizeName([ this.nvr.ufp.name, viewName ].join(" ")) || deviceDisplayName(this.nvr.ufp);
+
+      newAccessory = new this.api.platformAccessory<ProtectAccessoryContext>(switchName, uuid);
+
+      // Register this accessory with homebridge and add it to the platform accessory array so we can track it.
+      this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [newAccessory]);
+      this.platform.accessories.push(newAccessory);
+    }
+
+    // Configure our accessory.
+    if("liveviewState" in newAccessory.context) {
+
+      liveviewState = newAccessory.context.liveviewState ?? false;
+    }
+
+    // Rewrite the context from a clean slate, marking the accessory as one the liveviews owner derives so the controller's device removal passes leave it to us, and
+    // save it.
+    newAccessory.context = {};
+    this.platform.persistence.persist(newAccessory, { liveview: viewName, liveviewDerived: true, liveviewState, nvr: this.nvr.ufp.mac });
+
+    // Acquire the liveview switch under the accessory's name, marking the accessory for the next save when the switch is new to it. HBPU's helper names a new
+    // switch in every name characteristic its kind supports, the one the Home app edits included, and leaves the names of a switch the accessory already carries
+    // as they stand.
+    const { service: switchService, transition } = acquireService({ accessory: newAccessory, name: newAccessory.displayName, serviceType: this.hap.Service.Switch });
+
+    if(transition === "attached") {
+
+      this.platform.persistence.persist(newAccessory);
+    }
+
+    // One owner holds many switches and the wrapper it inherits reads the controller's verdict alone, so each switch refuses through a wrapper of its own that reads its
+    // liveview too. The liveview's presence is read on each call, so a liveview that returns clears the refusal with nothing rebound.
+    const answering = notResponding({ errorClass: this.hap.HapStatusError, unavailable: () => !this.isAvailable || !this.isSwitchCalledFor(id) });
+
+    // Activate or deactivate motion detection.
+    switchService.getCharacteristic(this.hap.Characteristic.On)
+      .onGet(answering(this.getSwitchState.bind(this, newAccessory.context.liveview ?? "")))
+      .onSet(answering(this.setSwitchState.bind(this, newAccessory)));
+
+    // Initialize the switch. We keep a saved liveview switch state because we want to account for edge cases where liveviews can disappear and we end up in a
+    // situation where motion detection is disabled without a way to enable it. By saving the switch state on the accessory, we can always initialize all
+    // motion-related accessories at startup as having motion enabled, and explicitly disable them here at startup when we restore state.
+    switchService.updateCharacteristic(this.hap.Characteristic.On, liveviewState);
+    this.setSwitchState(newAccessory, liveviewState);
+    this.isConfigured.add(id);
+
+    // Inform the user.
+    this.log.info("Configuring plugin-specific liveview switch: %s.", viewName);
+
+    this.platform.claimAccessory(newAccessory, this);
   }
 
   // Configure MQTT capabilities for the liveview switches.
@@ -236,17 +336,14 @@ export class ProtectLiveviews extends ProtectBase {
     this.isMqttConfigured = true;
 
     // Return the current status of all the liveviews.
-    this.subscribeGet("liveviews", "liveview scenes", () => {
+    this.subscribeGet(mqttTopics.liveviews.topic, mqttTopics.liveviews.label, () => this.liveviewsPayload);
 
-      // Get the list of this controller's liveviews.
-      const liveviews = this.platform.accessories.filter(x => this.isOwnedLiveviewSwitch(x))
-        .map(x => ({ name: x.context.liveview ?? "", state: x.getService(this.hap.Service.Switch)?.getCharacteristic(this.hap.Characteristic.On).value }));
-
-      return JSON.stringify(liveviews);
-    });
+    // Restate the whole list at the start of every later broker session. The owner is built in the same synchronous run that creates the MQTT client, so no session is
+    // held as it is built and it states nothing more then; registering behind the guard above keeps it to one registration however often the liveviews reconfigure.
+    this.restateOnConnect(() => this.publish(mqttTopics.liveviews.topic, this.liveviewsPayload));
 
     // Set the status of one or more liveviews.
-    this.subscribeSet("liveviews", "liveview scenes", (value: string, rawValue: string) => {
+    this.subscribeSet(mqttTopics.liveviews.topic, mqttTopics.liveviews.label, (_value: string, rawValue: string) => {
 
       interface mqttLiveviewJSON {
 
@@ -277,21 +374,25 @@ export class ProtectLiveviews extends ProtectBase {
         return;
       }
 
-      // Update state on the liveviews.
+      // Update state on the liveviews. The array check above confirms the payload's outer shape; individual entries are trusted as mqttLiveviewJSON without a
+      // per-entry shape guard, so a malformed entry (a missing name) surfaces as an unhandled exception rather than the validation error above.
       for(const entry of incomingPayload as mqttLiveviewJSON[]) {
 
         // Lookup this controller's liveview matching the requested name.
         const accessory = this.platform.accessories.find(x => this.isOwnedLiveviewSwitch(x) && ((x.context.liveview ?? "").toUpperCase() === entry.name.toUpperCase()));
 
-        // If we can't find it, move on.
-        if(!accessory) {
+        // A switch with no cameras behind it, its liveview deleted or empty, gives the set nothing to move, and moving on keeps it from logging a scene update that
+        // moved nothing.
+        if(!accessory || !this.getLiveviewCameras(accessory.context.liveview ?? "").length) {
 
           continue;
         }
 
-        // Drive the switch's own onSet with the coerced state so the scene actually applies to the member cameras, exactly as a HomeKit tap would - a status-only
-        // updateCharacteristic never runs the handler and cannot apply a scene.
-        accessory.getService(this.hap.Service.Switch)?.setCharacteristic(this.hap.Characteristic.On, !!entry.state);
+        // Run the switch's own set body with the coerced state so the scene actually applies to the member cameras, as a HomeKit tap would - a status-only
+        // updateCharacteristic never runs the body and cannot apply a scene. It runs through driveSet, so the value is stated once the body resolves and a body that
+        // throws costs this entry alone.
+        void this.driveSet({ characteristic: this.hap.Characteristic.On, service: accessory.getService(this.hap.Service.Switch),
+          set: (state) => this.setSwitchState(accessory, state), value: !!entry.state });
         this.log.info("Liveview scene updated via MQTT: %s.", accessory.context.liveview);
       }
     });
@@ -333,7 +434,7 @@ export class ProtectLiveviews extends ProtectBase {
 
       // Set the motion detection state. We do this after setting any motion detection switch in order to ensure we fire events in the right order for the motion
       // detection switch.
-      protectDevice.accessory.context.detectMotion = !!targetState;
+      this.platform.persistence.persist(protectDevice.accessory, { detectMotion: !!targetState });
 
       // Inform the user.
       this.log.info("%s -> %s: Motion detection %s.", liveviewSwitch.context.liveview, protectDevice.accessoryName,
@@ -341,10 +442,10 @@ export class ProtectLiveviews extends ProtectBase {
     }
 
     // Save our new state.
-    liveviewSwitch.context.liveviewState = !!targetState;
+    this.platform.persistence.persist(liveviewSwitch, { liveviewState: !!targetState });
 
     // Publish to MQTT, if configured.
-    this.publish("liveviews", JSON.stringify([{ name: liveviewSwitch.context.liveview ?? "", state: targetState }]));
+    this.publish(mqttTopics.liveviews.topic, JSON.stringify([{ name: liveviewSwitch.context.liveview ?? "", state: targetState }]));
   }
 
   // Get the current liveview switch state.
@@ -368,9 +469,8 @@ export class ProtectLiveviews extends ProtectBase {
   // Get the devices associated with a particular liveview.
   private getLiveviewCameras(liveviewName: string): string[] {
 
-    // Get the complete list of cameras in the liveview we're interested in. This cryptic line grabs the list of liveviews
-    // that have the name we're interested in (turns out, you can define multiple liveviews in Protect with the same name...who knew!),
-    // and then create a single list containing all of the cameras found.
+    // Collect every camera across every liveview matching this name - Protect allows multiple liveviews with the same name, so this returns the union of their
+    // member cameras rather than assuming a single match.
     return this.liveviews.filter(view => view.name.toUpperCase() === ("Protect-" + liveviewName).toUpperCase())
       .map(view => view.slots.map(slots => slots.cameras)).flat(2);
   }

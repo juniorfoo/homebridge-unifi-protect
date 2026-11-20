@@ -11,10 +11,10 @@ import { BackpressureWriter, HDSProtocolSpecificErrorReason, HKSV_TIMEOUT, guard
 import type { Clock, HomebridgePluginLogging, Nullable, RecordingProcess } from "homebridge-plugin-utils";
 import { PROTECT_HKSV_SHADOW_FLOOR_MS, PROTECT_HKSV_SHADOW_RECONNECT_MS, PROTECT_HKSV_SHADOW_SAFETY_MS } from "../settings.ts";
 import type { ProtectTimeshiftBuffer, SegmentRole } from "./timeshift.ts";
+import { recordingAudioMatches, sampleRateHzOf } from "./stream-delegate.ts";
 import type { ProtectAccessory } from "../types.ts";
 import type { ProtectCameraHost } from "./camera-host.ts";
 import type { ProtectTimeshiftSupervisor } from "./timeshift-supervisor.ts";
-import { livestreamAudioSampleRate } from "unifi-protect";
 
 // HKSV end-of-stream marker. A single zero byte yielded with `isLast=true` signals the end of a recording stream to HomeKit. Module-scoped so we allocate once
 // per process rather than per yield.
@@ -62,7 +62,7 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
   private abortController?: AbortController;
   private readonly accessory: ProtectAccessory;
   private readonly api: API;
-  // The injected wall-clock seam (production systemClock, a controllable TestClock under test). The delegate reads it for every time primitive - the per-event
+  // The injected wall-clock interface (production systemClock, a controllable TestClock under test). The delegate reads it for every time primitive - the per-event
   // pacingStartTime, the per-yield delivery anchor, the pacing-delay computation and await, and the early-end duration - so the whole pacing path is test-deterministic.
   private readonly clock: Clock;
   private ffmpegStream?: RecordingProcess;
@@ -117,8 +117,8 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
   // Apply a HomeKit recording-active change: record the demand, force the motion sensor off on a disable, and reconcile the timeshift buffer against the new demand.
   private async applyRecordingActive(active: boolean): Promise<void> {
 
-    // Log only on the active-to-inactive transition, not on idempotent "already inactive" calls. `this.isRecording` is still the pre-update value here since we
-    // haven't written `_isRecording` yet.
+    // Log only on the active-to-inactive transition, not on repeat "already inactive" calls that are no-ops. `this.isRecording` is still the pre-update value here since
+    // we haven't written `_isRecording` yet.
     if(!active && this.isRecording) {
 
       this.log.info("Disabling HomeKit Secure Video event recording.");
@@ -137,18 +137,10 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
 
     // Push the updated demand to the supervisor and reconcile the timeshift buffer against it. The demand setter owns the per-episode narration resets on the
     // disable edge, so they land synchronously with the demand write even when reconcile passes coalesce. The reconciler is bidirectional, concurrency-safe, and
-    // idempotent...see the supervisor for the invariants.
-    if(!(await this.supervisor.setRecordingDemand({ config: this.recordingConfig, isRecording: active }))) {
-
-      return;
-    }
-
-    // Nothing further to do when disabling recording...the reconciler has handled the teardown. The enable-acknowledgment log lives in the supervisor's
-    // successful-start path (its single source of truth - the configuration event), so it fires once per enable episode on whatever path first configures the timeshift.
-    if(!active) {
-
-      return;
-    }
+    // safe to call more than once...see the supervisor for the rules it holds to. On a disable the reconciler has handled the teardown, and the enable-acknowledgment
+    // log lives in the supervisor's successful-start path (its single source of truth - the configuration event), so it fires once per enable episode on whatever path
+    // first configures the timeshift.
+    await this.supervisor.setRecordingDemand({ config: this.recordingConfig, isRecording: active });
   }
 
   // Process updated recording configuration settings from HomeKit Secure Video.
@@ -176,17 +168,22 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
 
     let lastYieldTime = this.session.pacingStartTime;
 
-    // If we are recording HKSV events but the timeshift buffer is not currently running, reconcile now. This covers cases where an earlier configureTimeshifting
-    // attempt failed (offline camera, establishment timeout) and no subsequent lifecycle event re-triggered the reconciler.
+    /* If we are recording HKSV events but the timeshift buffer is not currently running, ask the supervisor to reconcile. This covers cases where an earlier start
+     * failed (offline camera, establishment timeout) and no subsequent lifecycle event re-triggered the reconciler, so the next event finds the buffer running.
+     *
+     * We never wait for the reconcile here. A buffer that starts now holds a fraction of a second of media, far short of the depth the transmit gate below requires, so
+     * this event declines whether or not the start succeeds...and waiting would hold HomeKit's recording stream open past its close for as long as the livestream takes
+     * to establish or give up. The reconcile's promise never rejects, so discarding it cannot float a rejection.
+     */
     if(!this.accessory.context.hksvRecordingDisabled && this.isRecording && !this.timeshift.isStarted) {
 
-      await this.configureTimeshifting();
+      void this.configureTimeshifting();
     }
 
     // If HKSV is disabled, the timeshift buffer is restarting, the camera is offline, the buffer isn't full, or transmission setup fails, we're done. The timeshift.time
-    // check covers both "timeshift never started" (time is zero) and "timeshift started but prebuffer not yet filled". The trailing !this.ffmpegStream is load-bearing
-    // for TypeScript narrowing at the subsequent direct access (the recording process's stream() invocation)...TypeScript does not track field assignments across method
-    // calls.
+    // check covers both "timeshift never started" (time is zero) and "timeshift started but prebuffer not yet filled". Removing the trailing !this.ffmpegStream check
+    // breaks TypeScript's narrowing at the subsequent direct access (the recording process's stream() invocation)...TypeScript does not track field assignments across
+    // method calls.
     if(this.accessory.context.hksvRecordingDisabled || this.timeshift.isRestarting || !this.protectCamera.isReachable ||
       (this.timeshift.time < this.timeshift.configuredDuration) || !this.startTransmitting() || !this.ffmpegStream) {
 
@@ -225,8 +222,8 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
     //   - "terminated": the subscription died out-of-band (the recovery give-up, a codec change, an unexpected iterator error). Terminal...we stop FFmpeg and exit
     //     the event. The timeshift has already self-cleaned its state, so there is no subscription to recover onto.
     //
-    // Both handlers call ffmpegStream.abort() and abort the combined signal to interrupt any in-flight pacing delay. The discriminator between "restart the
-    // loop" and "exit the loop" is which local flag the handler sets...the outer do-while's condition gates on isDiscontinuity, not isTerminated.
+    // Both handlers call ffmpegStream.abort() and abort the combined signal to interrupt any in-flight pacing delay. What tells apart "restart the
+    // loop" from "exit the loop" is which local flag the handler sets...the outer do-while's condition gates on isDiscontinuity, not isTerminated.
     let isDiscontinuity = false;
     let isTerminated = false;
 
@@ -302,11 +299,11 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
         // fragment each; we transmit both but count only media toward the transmitted-video tally, so a restarted process's fresh init segment is uncounted by
         // construction rather than requiring any compensating adjustment.
         // eslint-disable-next-line no-await-in-loop -- Intentional: the outer loop handles FFmpeg restarts on discontinuity.
-        for await (const segment of this.ffmpegStream.stream({ signal: combinedSignal })) {
+        for await(const segment of this.ffmpegStream.stream({ signal: combinedSignal })) {
 
           // If we've stopped transmitting, a discontinuity fired, or the recording is terminating, exit the segment loop. isDiscontinuity and isTerminated
           // are mutated asynchronously by the event listeners above.
-          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- The listeners set the event flags during the loop's awaits, unseen by TS narrowing.
           if(!this._isTransmitting || isDiscontinuity || isTerminated) {
 
             break;
@@ -326,7 +323,7 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
           // because a discontinuity abort should not prevent yielding...the current segment is valid pre-stall data that must be delivered before restarting FFmpeg.
           // `_isTransmitting` and `signal.aborted` can both mutate during the paceSegmentDelivery await above; TS flow narrows them after the earlier break check
           // and does not re-widen across the await.
-          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- The transmitting flag can change during the pacing wait, unseen by TS narrowing.
           if(!this._isTransmitting || signal.aborted) {
 
             break;
@@ -338,8 +335,7 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
           lastYieldTime = this.clock.now();
         }
 
-      // isDiscontinuity and isTerminated are mutated asynchronously by the event listeners above.
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- The event listeners set the event flags during the loop, unseen by TS narrowing.
       } while(isDiscontinuity && !isTerminated && this._isTransmitting);
     } finally {
 
@@ -357,12 +353,12 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
     //     not kick the wire from here. We just end this event with its final marker; the next event re-establishes a fresh FFmpeg pipeline.
     //
     // Normal completion (HAP-initiated close via signal.aborted or _isTransmitting false) falls through both branches...HAP already knows the stream is done
-    // and doesn't need a marker. The optional chain on ffmpegStream is load-bearing: the discontinuity-recovery path's startTransmitting(true) call inside
-    // the do/while above may have cleared the field, and TS does not track that across the method call.
+    // and doesn't need a marker. Removing the optional chain on ffmpegStream breaks this: the field is cleared when HomeKit closes the recording while the
+    // generator is suspended, and TS keeps its narrowing across that suspension.
     if(isTerminated) {
 
       yield { data: HKSV_END_OF_STREAM_MARKER, isLast: true };
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- HomeKit's close clears the FFmpeg stream while we are suspended, unseen by TS narrowing.
     } else if(this.ffmpegStream?.isTimedOut) {
 
       yield { data: HKSV_END_OF_STREAM_MARKER, isLast: true };
@@ -383,10 +379,10 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
     this.stopTransmitting(reason);
   }
 
-  // Reconcile the timeshift buffer against current demand - the delegate-facing join for the recording-request lazy backstop and the test suites. A direct
-  // synchronous return of the supervisor's promise: no async wrapper, so joining callers preserve the reconciler's check-and-set atomicity with no added
-  // microtask boundary.
-  public configureTimeshifting(): Promise<boolean> {
+  // Reconcile the timeshift buffer against current demand - the delegate-facing entry for the recording request's reconcile kick and the test suites. A direct
+  // synchronous return of the supervisor's promise: no async wrapper, so a caller joining here holds the very promise every other caller of the pass in flight
+  // holds, with no added microtask boundary.
+  public configureTimeshifting(): Promise<void> {
 
     return this.supervisor.reconcile();
   }
@@ -436,24 +432,30 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
     const alignment = this.timeshift.getKeyframeAlignedStart(this.recordingConfig.prebufferLength);
 
     // Start a new FFmpeg instance to transcode using HomeKit's requirements. Construction routes through the platform's recording-process factory, mirroring the
-    // streaming-delegate factory seam: the production factory's create is exactly the FfmpegRecordingProcess constructor call (so this is behavior-neutral), while a test
-    // substitutes an FFmpeg-free double. The homebridge-plugin-utils process spawns the child synchronously on construction, so there is no separate start() step...by
-    // the time create returns the FFmpeg child is already running. The recording options move into init.recording, the HomeKit recording configuration into
+    // streaming-delegate factory interface: the production factory's create is exactly the FfmpegRecordingProcess constructor call (so this is behavior-neutral), while a
+    // test substitutes an FFmpeg-free double. The homebridge-plugin-utils process spawns the child synchronously on construction, so there is no separate start()
+    // step...by the time create returns the FFmpeg child is already running. The recording options move into init.recording, the HomeKit recording configuration into
     // init.recordingConfig, and the debug flag into init.verbose.
     this.ffmpegStream = this.protectCamera.platform.recordingProcessFactory.create(this.protectCamera.stream.ffmpegOptions, {
 
       recording: {
 
-        // The input sample rate FFmpeg's audio filters operate on is the camera's livestream (fMP4) audio rate that livestreamAudioSampleRate owns. getAudioFilters
-        // validates each filter's frequency against that rate's Nyquist limit, so a doorbell's higher source rate keeps a user's 8-24 kHz highpass/lowpass from being
-        // silently dropped.
-        audioFilters: this.protectCamera.getAudioFilters(livestreamAudioSampleRate(this.protectCamera.ufp)),
+        // The audio filters run at the rate HomeKit selected for the recording, which the encoder converts to: the chain leads with a resample to that rate, and each
+        // filter's frequency is checked against that rate's Nyquist limit. Upstream types this samplerate as an intersection of the enum with a union that contains
+        // it, which the enum-assignment rule misreads as a foreign value.
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-enum-assignment
+        audioFilters: this.protectCamera.getAudioFilters(sampleRateHzOf(this.recordingConfig.audioCodec.samplerate)),
         audioStream: 0,
         codec: this.protectCamera.ufp.videoCodec,
         enableAudio: this.isAudioActive,
         fps: this.timeshift.channelProfile.channel.fps,
         timeshift: alignment?.seekOffsetMs ?? Math.max(this.timeshift.time - this.recordingConfig.prebufferLength, 0),
-        transcodeAudio: false
+
+        // A recording copies the stream's audio untouched when the stream already is the AAC format HomeKit selected, and transcodes it to that format otherwise: an
+        // Opus stream, a different rate, a second channel, or no readable audio track all transcode. The recording says nothing about which it did. Upstream types
+        // this codec's samplerate as an intersection of the enum with a union that contains it, which the enum-assignment rule misreads as a foreign value.
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-enum-assignment
+        transcodeAudio: !recordingAudioMatches(this.timeshift.audioFormat, this.recordingConfig.audioCodec)
       },
       recordingConfig: this.recordingConfig,
       verbose: this.protectCamera.hasFeature("Debug.Video.HKSV")
@@ -685,14 +687,33 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
       }
     }
 
-    // Let's figure out the reason why we're stopping, if we have one, and it's noteworthy.
+    // Let's describe why HomeKit ended the recording. Each reason HomeKit defines for ending a recording early has its own sentence, and the default covers any reason
+    // we don't recognize, so the early-end line below always says why.
     let reasonDescription;
 
     switch(reason) {
 
+      case HDSProtocolSpecificErrorReason.NOT_ALLOWED:
+
+        reasonDescription = "HomeKit stopped allowing the camera to record, as it does when the camera is turned off in the Home app.";
+
+        break;
+
+      case HDSProtocolSpecificErrorReason.BUSY:
+
+        reasonDescription = "HomeKit reported that it was busy.";
+
+        break;
+
       case HDSProtocolSpecificErrorReason.CANCELLED:
 
         reasonDescription = "HomeKit canceled the request.";
+
+        break;
+
+      case HDSProtocolSpecificErrorReason.UNSUPPORTED:
+
+        reasonDescription = "HomeKit reported that the recording request is unsupported.";
 
         break;
 
@@ -708,7 +729,27 @@ export class ProtectRecordingDelegate implements CameraRecordingDelegate {
 
         break;
 
+      case HDSProtocolSpecificErrorReason.BAD_DATA:
+
+        reasonDescription = "HomeKit could not use the recording data it received.";
+
+        break;
+
+      case HDSProtocolSpecificErrorReason.PROTOCOL_ERROR:
+
+        reasonDescription = "HomeKit reported a protocol error in the recording stream.";
+
+        break;
+
+      case HDSProtocolSpecificErrorReason.INVALID_CONFIGURATION:
+
+        reasonDescription = "HomeKit reported that the camera's recording configuration is invalid.";
+
+        break;
+
       default:
+
+        reasonDescription = "HomeKit did not report a reason we recognize.";
 
         break;
     }

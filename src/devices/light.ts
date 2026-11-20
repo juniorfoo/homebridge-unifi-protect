@@ -2,35 +2,13 @@
  *
  * light.ts: Light device class for UniFi Protect.
  */
-import type { Light, ProtectLightConfig } from "unifi-protect";
-import type { ProtectAccessory, WithoutIdentity } from "../types.ts";
 import type { CharacteristicValue } from "homebridge";
+import type { Light } from "unifi-protect";
 import { ProtectDevice } from "./device.ts";
-import type { ProtectNvr } from "../nvr/nvr.ts";
 import { ProtectReservedNames } from "../types.ts";
-import { deviceSelectors } from "unifi-protect";
+import { mqttTopics } from "../mqtt.ts";
 
-export class ProtectLight extends ProtectDevice {
-
-  // Narrow the inherited projection handle to the light projection so the read-through config getter resolves to ProtectLightConfig.
-  declare protected readonly device: Light;
-
-  // Create an instance.
-  constructor(nvr: ProtectNvr, accessory: ProtectAccessory, device: Light) {
-
-    super(nvr, accessory, device);
-
-    this.configureHints();
-    this.configureDevice();
-    this.spawnObservers();
-  }
-
-  // Read-through to the light projection's live STATE, narrowed to drop device identity (id/mac/modelKey). Identity flows through the dedicated non-throwing accessors
-  // (protectId/modelKey/.id/.mac), never this throwing config getter; this override mirrors the base getter's body and narrows only the surfaced return type.
-  public override get ufp(): Readonly<WithoutIdentity<ProtectLightConfig>> {
-
-    return this.device.config;
-  }
+export class ProtectLight extends ProtectDevice<Light> {
 
   // The light's power state, read non-throwing through the record. An absent record (a light lingering in the removal grace) reports off rather than throwing.
   private get isLightOn(): boolean {
@@ -46,7 +24,7 @@ export class ProtectLight extends ProtectDevice {
   }
 
   // Initialize and configure the light accessory for HomeKit.
-  private configureDevice(): boolean {
+  protected override configureDevice(): boolean {
 
     // Reset the persisted context to a clean slate, discarding any stray keys left over from a prior configuration of this same accessory, while preserving the user's
     // motion-detection choice across the restart - a persisted detectMotion of false must survive rather than being wiped back to the default.
@@ -74,91 +52,93 @@ export class ProtectLight extends ProtectDevice {
   }
 
   // Configure the light for HomeKit.
-  private configureLightbulb(): boolean {
+  private configureLightbulb(): void {
 
     // Acquire the service.
-    const service = this.acquireService(this.hap.Service.Lightbulb);
-
-    // Fail gracefully.
-    if(!service) {
-
-      this.log.error("Unable to add light.");
-
-      return false;
-    }
+    const { service } = this.acquireService({ serviceType: this.hap.Service.Lightbulb });
 
     // Turn the light on or off.
-    service.getCharacteristic(this.hap.Characteristic.On).onGet(() => {
+    service.getCharacteristic(this.hap.Characteristic.On).onGet(this.answering(() => {
 
       return this.isLightOn;
-    });
+    }));
 
-    service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue) => {
-
-      const lightState = value === true;
-
-      // Push the new power state to the controller, reporting any failure through the shared command-error helper.
-      if(!(await this.runDeviceCommand("turn the light " + (lightState ? "on" : "off"), () => this.device.update({ lightOnSettings: { isLedForceOn: lightState } })))) {
-
-        return;
-      }
-
-      // Publish our state.
-      this.publish("light", lightState ? "true" : "false");
-    });
+    service.getCharacteristic(this.hap.Characteristic.On).onSet(this.answering(async (value: CharacteristicValue) => this.setPower(value)));
 
     // Adjust the brightness of the light.
-    service.getCharacteristic(this.hap.Characteristic.Brightness).onGet(() => {
+    service.getCharacteristic(this.hap.Characteristic.Brightness).onGet(this.answering(() => {
 
       return this.ledBrightness;
-    });
+    }));
 
-    service.getCharacteristic(this.hap.Characteristic.Brightness).onSet(async (value: CharacteristicValue) => {
-
-      const brightness = this.brightnessToLedLevel(value as number);
-
-      // Push the new brightness to the controller, reporting any failure through the shared command-error helper.
-      if(!(await this.runDeviceCommand("adjust the brightness to " + (value as number).toString() + "%",
-        () => this.device.update({ lightDeviceSettings: { ledLevel: brightness } })))) {
-
-        return;
-      }
-
-      // Make sure we properly reflect what brightness we're actually at, given the differences in setting granularity between Protect and HomeKit.
-      setTimeout(() => service.updateCharacteristic(this.hap.Characteristic.Brightness, this.ledLevelToBrightness(brightness)), 50);
-
-      // Publish our state.
-      this.publish("light/brightness", this.ledLevelToBrightness(brightness).toString());
-    });
+    service.getCharacteristic(this.hap.Characteristic.Brightness).onSet(this.answering(async (value: CharacteristicValue) => this.setBrightness(value)));
 
     // Initialize the light.
     service.updateCharacteristic(this.hap.Characteristic.On, this.isLightOn);
     service.updateCharacteristic(this.hap.Characteristic.Brightness, this.ledBrightness);
+  }
 
-    return true;
+  // Turn the light on or off, the one body HomeKit's write and the MQTT set share.
+  private async setPower(value: CharacteristicValue): Promise<void> {
+
+    const lightState = value === true;
+
+    // Push the new power state to the controller, reporting any failure through the shared command-error helper.
+    await this.runDeviceCommand("turn the light " + (lightState ? "on" : "off"), () => this.device.update({ lightOnSettings: { isLedForceOn: lightState } }));
+  }
+
+  // Adjust the brightness of the light, the one body HomeKit's write and the MQTT set share.
+  private async setBrightness(value: CharacteristicValue): Promise<void> {
+
+    const brightness = this.brightnessToLedLevel(value as number);
+
+    // Push the new brightness to the controller, reporting any failure through the shared command-error helper.
+    if(!(await this.runDeviceCommand("adjust the brightness to " + (value as number).toString() + "%",
+      () => this.device.update({ lightDeviceSettings: { ledLevel: brightness } })))) {
+
+      return;
+    }
+
+    // Make sure we properly reflect what brightness we're actually at, given the differences in setting granularity between Protect and HomeKit.
+    this.reflectAfterSet(() => this.accessory.getService(this.hap.Service.Lightbulb)?.updateCharacteristic(this.hap.Characteristic.Brightness,
+      this.ledLevelToBrightness(brightness)));
+  }
+
+  // Publish the light's on state, the value its MQTT get answers, when it changed. The controller's reported change is the one publisher, so a change made here or in
+  // the Protect app publishes once, from the observer.
+  private publishLightState(): void {
+
+    this.publishState(mqttTopics.light.topic, this.isLightOn.toString());
+  }
+
+  // Publish the light's brightness percentage, the value its MQTT get answers, when it changed, from the observer that carries the controller's change.
+  private publishBrightnessState(): void {
+
+    this.publishState(mqttTopics.lightBrightness.topic, this.ledBrightness.toString());
   }
 
   // Configure MQTT capabilities of this light.
   private configureMqtt(): boolean {
 
     // Get the light state.
-    this.subscribeGet("light", "light status", () => {
+    this.subscribeGet(mqttTopics.light.topic, mqttTopics.light.label, () => {
 
       return this.isLightOn.toString();
     });
 
-    this.subscribeGet("light/brightness", "light brightness", () => {
+    this.subscribeGet(mqttTopics.lightBrightness.topic, mqttTopics.lightBrightness.label, () => {
 
       return this.ledBrightness.toString();
     });
 
-    // Control the light.
-    this.subscribeSet("light", "light", (value: string) => {
+    // Control the light. subscribeSet has already refused a set the light cannot take, so each runs its body directly rather than through the refusing handler.
+    this.subscribeSet(mqttTopics.light.topic, mqttTopics.light.label, (value: string) => {
 
-      this.accessory.getService(this.hap.Service.Lightbulb)?.setCharacteristic(this.hap.Characteristic.On, value === "true");
+      void this.driveSet({ characteristic: this.hap.Characteristic.On, service: this.accessory.getService(this.hap.Service.Lightbulb),
+        set: (lightState) => this.setPower(lightState), value: value === "true" });
     });
 
-    this.subscribeSet("light/brightness", "light brightness", (value: string) => {
+    this.subscribeSet(mqttTopics.lightBrightness.topic, mqttTopics.lightBrightness.label, (value: string) => {
 
       const brightness = parseInt(value);
 
@@ -168,19 +148,31 @@ export class ProtectLight extends ProtectDevice {
         return;
       }
 
-      this.accessory.getService(this.hap.Service.Lightbulb)?.setCharacteristic(this.hap.Characteristic.Brightness, brightness);
+      void this.driveSet({ characteristic: this.hap.Characteristic.Brightness, service: this.accessory.getService(this.hap.Service.Lightbulb),
+        set: (level) => this.setBrightness(level), value: brightness });
     });
+
+    // State the light's held state as it is set up, since its setup publishes nothing else, and again at the start of every later broker session, through the methods
+    // its observers publish with.
+    const restate = (): void => {
+
+      this.publishLightState();
+      this.publishBrightnessState();
+    };
+
+    restate();
+    this.restateOnConnect(restate);
 
     return true;
   }
 
-  // Spawn the light's narrow-selector observers. super spawns the two universal observers (name sync and firmware/device-info refresh); the light adds its four
-  // reactions, each waking only on its own slice through the store's reference dedup.
+  // Spawn the light's narrow-selector observers. super spawns the base class's universal observers (name sync and firmware/device-info refresh); the light adds its
+  // own narrow reactions below, each waking only on its own slice through the store's reference dedup.
   protected override spawnObservers(): void {
 
     super.spawnObservers();
 
-    const light = deviceSelectors.light.byId(this.device.id);
+    const light = this.nvr.client.state.selectors.light.byId(this.device.id);
 
     // Light motion, like sensor and camera motion, is a device-state field (lastMotion) the controller advances rather than a firehose occurrence, so observing the
     // timestamp is the single source for this device, firing only on a real (truthy) detection rather than re-synthesizing it from a held prior value.
@@ -196,12 +188,14 @@ export class ProtectLight extends ProtectDevice {
     this.observeState({ key: "light.isLightOn", selector: state => light(state)?.isLightOn, title: "the light" }, () => {
 
       this.accessory.getService(this.hap.Service.Lightbulb)?.updateCharacteristic(this.hap.Characteristic.On, this.isLightOn);
+      this.publishLightState();
     });
 
     // The light's LED level drives the Lightbulb Brightness, mapped from Protect's 1-6 scale to a HomeKit percentage.
     this.observeState({ key: "light.ledLevel", selector: state => light(state)?.lightDeviceSettings.ledLevel, title: "brightness" }, () => {
 
       this.accessory.getService(this.hap.Service.Lightbulb)?.updateCharacteristic(this.hap.Characteristic.Brightness, this.ledBrightness);
+      this.publishBrightnessState();
     });
 
     // The light's indicator setting drives the status-indicator switch, when that switch is configured.

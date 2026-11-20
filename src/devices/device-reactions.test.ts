@@ -3,36 +3,59 @@
  * device-reactions.test.ts: Unit tests for the pure decision functions the per-device state observers rest on.
  *
  * The device leaves themselves are not directly importable in a unit test - the camera leaf transitively drags the streaming stack, and the others stand up a HAP
- * accessory at construction - so the reaction decisions that warrant pinning are extracted as pure functions and exercised here in isolation. The camera-to-doorbell
- * reconcile decision lives in cameras/doorbell-reconcile-policy.ts (a poison-free, device-classification leaf reachable from a test); the sensor tamper-state mapping
- * lives in sensor.ts (which imports cleanly). Both are the single source of truth their observers and read-through getters consult, so pinning them here pins the
- * behavior the live observers deliver.
+ * accessory at construction - so the reaction decisions that warrant a regression assertion are extracted as pure functions and exercised here in isolation. The
+ * camera family's capability reconcile decisions, the reconcile action and the drain test its withdrawal narrators read, live in cameras/capability-reconcile-policy.ts
+ * (a poison-free leaf reachable from a test); the sensor tamper-state mapping lives in sensor.ts (which imports cleanly). Each is the single source of truth its
+ * observers and read-through getters consult, so asserting them here holds the behavior the live observers deliver.
  */
+import { capabilityReconcileAction, isFeatureFlagsDrain } from "./cameras/capability-reconcile-policy.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { doorbellReconcileAction } from "./cameras/doorbell-reconcile-policy.ts";
 import { sensorTamperState } from "./sensor.ts";
 
-describe("doorbell reconcile decision (doorbellReconcileAction)", () => {
+describe("capability reconcile decision (capabilityReconcileAction)", () => {
 
-  test("the exhaustive 2x2 over (hasCapability, isDoorbell) maps to the four live-attach actions", () => {
+  test("the exhaustive 2x2 over (attached, reported) maps to the four reconcile actions", () => {
 
-    // The full truth table over the two inputs: whether this camera already has a doorbell capability attached, and the camera's current featureFlags.isDoorbell. The
-    // live-attach model attaches the capability in place rather than tearing down and recreating, so the four actions are: a late-arriving doorbell flag on a plain
-    // camera attaches the capability; a withdrawn flag on a camera that still has one is reported (observability-only, nothing removed); a plain camera with no
-    // capability sweeps any stale doorbell-only services; and a steady doorbell (with its capability) or a steady plain camera (with none) is a no-op.
-    const cases: { expected: ReturnType<typeof doorbellReconcileAction>; hasCapability: boolean; isDoorbell: boolean }[] = [
+    // The exhaustive truth table over whether the capability already stands on the camera and whether the controller currently reports it. A gain composes the
+    // capability in place rather than tearing down and recreating, so every combination resolves to one of the reconcile actions: a capability the controller reports
+    // late attaches; a withdrawn one the camera still stands up is reported (observability-only, nothing removed); a camera with neither sweeps anything a withdrawal
+    // it never saw left behind; and a capability that stands while the controller reports it is a no-op.
+    const cases: { attached: boolean; expected: ReturnType<typeof capabilityReconcileAction>; reported: boolean }[] = [
 
-      { expected: "attach", hasCapability: false, isDoorbell: true },
-      { expected: "none", hasCapability: true, isDoorbell: true },
-      { expected: "report-withdrawn", hasCapability: true, isDoorbell: false },
-      { expected: "sweep-stale", hasCapability: false, isDoorbell: false }
+      { attached: false, expected: "attach", reported: true },
+      { attached: true, expected: "none", reported: true },
+      { attached: true, expected: "report-withdrawn", reported: false },
+      { attached: false, expected: "sweep-stale", reported: false }
     ];
 
-    for(const { expected, hasCapability, isDoorbell } of cases) {
+    for(const { attached, expected, reported } of cases) {
 
-      assert.equal(doorbellReconcileAction({ hasCapability, isDoorbell }), expected,
-        "hasCapability=" + String(hasCapability) + " isDoorbell=" + String(isDoorbell));
+      assert.equal(capabilityReconcileAction({ attached, reported }), expected, "attached=" + String(attached) + " reported=" + String(reported));
+    }
+  });
+});
+
+describe("featureFlags drain decision (isFeatureFlagsDrain)", () => {
+
+  test("a block is a drain exactly when it carries a top-level boolean and every top-level boolean reads false, reading nothing nested", () => {
+
+    // The controller's deep re-adopt delivers the whole block with every capability false. A single true flag makes the block a reading; a block with no boolean
+    // member at all carries nothing to judge, so it is a reading too; and the lists and nested objects are never read, so a true boolean nested under all-false
+    // top-level members leaves the block a drain.
+    const cases: { expected: boolean; featureFlags: Record<string, unknown>; label: string }[] = [
+
+      { expected: true, featureFlags: { hasMic: false, hasMotionDetection: false, isDoorbell: false, smartDetectTypes: ["person"] }, label: "every boolean false" },
+      { expected: false, featureFlags: { hasMic: true, hasMotionDetection: false, isDoorbell: false }, label: "one boolean true" },
+      { expected: false, featureFlags: { audioCodecs: ["aac"], smartDetectTypes: [] }, label: "no boolean member" },
+      { expected: false, featureFlags: {}, label: "an empty block" },
+      { expected: true, featureFlags: { hasMotionDetection: false, isDoorbell: false, privacyMaskCapability: { rectangleOnly: true } },
+        label: "a nested true boolean under all-false top-level members" }
+    ];
+
+    for(const { expected, featureFlags, label } of cases) {
+
+      assert.equal(isFeatureFlagsDrain(featureFlags), expected, label);
     }
   });
 });
