@@ -3,32 +3,29 @@
 /* eslint-disable camelcase, sort-imports */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { H264Level, H264Profile } from "homebridge-plugin-utils";
+import type { BackpressureWriter, FfmpegOptions } from "homebridge-plugin-utils";
+import { FfmpegOptions as FfmpegOptionsImpl, H264Level, H264Profile, HOMEKIT_IDR_INTERVAL } from "homebridge-plugin-utils";
 import type { StartStreamRequest } from "homebridge";
-import { makeTestCameraHost } from "../testing.helpers.ts";
-import type { TestCameraHost } from "../testing.helpers.ts";
+import { makeTestCameraHost } from "./testing.helpers.ts";
+import type { TestCameraHost } from "./testing.helpers.ts";
 import { createTsbSegmentWriterRail } from "./stream-live-feed.ts";
-import type { BackpressureWriter } from "homebridge-plugin-utils";
 import type { ProtectStreamingFfmpegProcess } from "./stream-ffmpeg-process.ts";
 import { TestLiveStreamingFfmpegProcess } from "./test-live-ffmpeg-process.ts";
-import { FfmpegOptions as FfmpegOptionsImpl } from "homebridge-plugin-utils";
-import type { FfmpegOptions } from "homebridge-plugin-utils";
-import { resolveStreamOutputFps } from "./stream-transcode-policy.ts";
-import { appendLiveVideoEncodeToFfmpegArgs, buildLiveVideoEncodeInput, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge,
-  refreshBufferBackedChannelProfileForEncode, resolveCopyEscalationKeyframePrimingBuffer, resolveFmp4InitForLiveDeclaredCheck, resolveStartStreamEncodePlan,
-  resolveStartStreamForceTranscodeDueToUserOption, resolveStreamEgressBitrateBps, resolveTimeshiftBufferLiveChannel,
-  shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
 import type { LiveVideoEncodeDecision } from "./stream-transcode-policy.ts";
+import { resolveStreamOutputFps, resolveVideoCopyExitBridgeAction } from "./stream-transcode-policy.ts";
+import { appendLiveVideoEncodeToFfmpegArgs, buildLiveVideoEncodeInput, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge,
+  refreshBufferBackedChannelProfileForEncode, resolveCopyEscalationKeyframePrimingBuffer, resolveFmp4InitForLiveDeclaredCheck, resolveLiveStreamTranscodePipelineOptions,
+  resolveStartStreamEncodePlan, resolveStartStreamForceTranscodeDueToUserOption, resolveStreamEgressBitrateBps, resolveTimeshiftBufferLiveChannel,
+  shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
+import type { LiveStreamEncoderPipelineOptions } from "./stream-live-wiring.ts";
 import type { ChannelProfile } from "./resolution.ts";
 import { parseH264AvcCFromFmp4Init } from "./h264-fmp4-avcc.ts";
 import { TEST_H264_MAIN_PPS, testH264SpsForProfileLevel } from "./h264-test-bytes.ts";
 import { makeChannel } from "../camera.fixtures.ts";
-import { HOMEKIT_IDR_INTERVAL } from "homebridge-plugin-utils";
-import { resolveVideoCopyExitBridgeAction } from "./stream-transcode-policy.ts";
 
 const stubChannel: ChannelProfile = {
 
-  channel: { bitrate: 4_000_000, fps: 15, height: 720, id: 1, name: "medium", width: 1280 },
+  channel: { bitrate: 4000000, fps: 15, height: 720, id: 1, name: "medium", width: 1280 },
   name: "medium"
 } as ChannelProfile;
 
@@ -112,6 +109,44 @@ const stubFfmpegOptions: FfmpegOptions = new FfmpegOptionsImpl({
   name: (): string => "stub-camera"
 });
 
+function makeAppleHardwareFfmpegOptions(): FfmpegOptions {
+
+  const base = new FfmpegOptionsImpl({
+
+    codecSupport: {
+
+      cpuGeneration: 3,
+      ffmpegAtLeast: (): boolean => true,
+      gpuMem: 0,
+      hasDecoder: (): boolean => true,
+      hasEncoder: (): boolean => true,
+      hasHwAccel: (): boolean => true,
+      hostSystem: "macOS.Apple"
+    } as never,
+    crop: undefined,
+    debug: false,
+    hardwareDecoding: true,
+    hardwareTranscoding: true,
+    log: { debug: (): void => undefined, error: (): void => undefined, info: (): void => undefined, warn: (): void => undefined },
+    name: (): string => "hardware-wiring-test"
+  });
+
+  return new Proxy(base, {
+
+    get(target, property, receiver): unknown {
+
+      if(property === "hardwareEncodes") {
+
+        return (): boolean => true;
+      }
+
+      const value: unknown = Reflect.get(target, property, receiver);
+
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+}
+
 function encodePlan(camera: TestCameraHost, init: Buffer | null, sessionSource: "buffer" | "rtsp", force = false): ReturnType<typeof resolveStartStreamEncodePlan> {
 
   return resolveStartStreamEncodePlan({ channelProfile: stubChannel, ffmpegOptions: stubFfmpegOptions, fmp4InitSegmentData: init,
@@ -125,11 +160,11 @@ describe("stream-live-wiring", () => {
 
     const camera = testCameraHost();
 
-    camera.hasFeature = (option) => option === "Video.Transcode";
+    camera.hasFeature = (option: string): boolean => option === "Video.Transcode";
 
     assert.equal(resolveStartStreamForceTranscodeDueToUserOption(camera, false), true);
 
-    camera.hasFeature = () => false;
+    camera.hasFeature = (): boolean => false;
     assert.equal(resolveStartStreamForceTranscodeDueToUserOption(camera, false), false);
   });
 
@@ -177,8 +212,8 @@ describe("stream-live-wiring", () => {
 
   test("resolveStreamEgressBitrateBps uses transcode target or source channel bitrate", () => {
 
-    assert.equal(resolveStreamEgressBitrateBps(true, 2000, 4_000_000), 2_000_000);
-    assert.equal(resolveStreamEgressBitrateBps(false, 2000, 4_000_000), 4_000_000);
+    assert.equal(resolveStreamEgressBitrateBps(true, 2000, 4000000), 2000000);
+    assert.equal(resolveStreamEgressBitrateBps(false, 2000, 4000000), 4000000);
   });
 
   test("createCopyEscalationTsbResume uses production writer rotation", () => {
@@ -213,14 +248,14 @@ describe("stream-live-wiring", () => {
 
     const liveChannel = makeChannel({ fps: 30, height: 720, id: 1, name: "medium", width: 1280 });
 
-    liveChannel.bitrate = 4_000_000;
+    liveChannel.bitrate = 4000000;
     camera.ufp = { ...camera.ufp, channels: [liveChannel] };
 
     const stale = stubChannel;
     const refreshed = refreshBufferBackedChannelProfileForEncode(camera, stale);
 
     assert.ok(refreshed);
-    assert.equal(refreshed?.channel.fps, 30);
+    assert.equal(refreshed.channel.fps, 30);
   });
 
   test("resolveTimeshiftBufferLiveChannel forces transcode on width-only geometry drift (X4)", () => {
@@ -228,7 +263,7 @@ describe("stream-live-wiring", () => {
     const camera = testCameraHost();
     const liveChannel = makeChannel({ fps: 15, height: 720, id: 1, name: "medium", width: 1280 });
 
-    liveChannel.bitrate = 4_000_000;
+    liveChannel.bitrate = 4000000;
     camera.ufp = { ...camera.ufp, channels: [liveChannel] };
     const bufferWide: ChannelProfile = { ...stubChannel, channel: { ...stubChannel.channel, width: 1920 } };
     const resolved = resolveTimeshiftBufferLiveChannel(bufferWide, camera);
@@ -242,7 +277,7 @@ describe("stream-live-wiring", () => {
     const camera = testCameraHost();
     const liveChannel = makeChannel({ fps: 15, height: 720, id: 1, name: "medium", width: 1280 });
 
-    liveChannel.bitrate = 4_000_000;
+    liveChannel.bitrate = 4000000;
     camera.ufp = { ...camera.ufp, channels: [liveChannel] };
     const bufferTall: ChannelProfile = { ...stubChannel, channel: { ...stubChannel.channel, height: 1080 } };
     const resolved = resolveTimeshiftBufferLiveChannel(bufferTall, camera);
@@ -256,7 +291,7 @@ describe("stream-live-wiring", () => {
     const camera = testCameraHost();
     const liveChannel = makeChannel({ fps: 15, height: 720, id: 1, name: "medium", width: 1280 });
 
-    liveChannel.bitrate = 4_000_000;
+    liveChannel.bitrate = 4000000;
     camera.ufp = { ...camera.ufp, channels: [liveChannel] };
     const buffer30: ChannelProfile = { ...stubChannel, channel: { ...stubChannel.channel, fps: 30 } };
     const resolved = resolveTimeshiftBufferLiveChannel(buffer30, camera);
@@ -276,7 +311,7 @@ describe("stream-live-wiring", () => {
 
     const liveChannel = makeChannel({ fps: 30, height: 720, id: 1, name: "medium", width: 1280 });
 
-    liveChannel.bitrate = 4_000_000;
+    liveChannel.bitrate = 4000000;
     camera.ufp = { ...camera.ufp, channels: [liveChannel] };
     const refreshed = refreshBufferBackedChannelProfileForEncode(camera, stubChannel);
     const init = buildFmp4Init(77, 31);
@@ -428,47 +463,9 @@ describe("appendLiveVideoEncodeToFfmpegArgs output fps", () => {
       }
     });
 
-    appendLiveVideoEncodeToFfmpegArgs(spyingOptions, args, transcodeDecision, channel, request, 800, useInterpolation, true);
+    appendLiveVideoEncodeToFfmpegArgs(spyingOptions, args, transcodeDecision, channel, request, 800, useInterpolation, true, testCameraHost());
 
     return { args: args, streamEncoderCalls: streamEncoderCalls };
-  }
-
-  function makeAppleHardwareFfmpegOptions(): FfmpegOptions {
-
-    const base = new FfmpegOptionsImpl({
-
-      codecSupport: {
-
-        cpuGeneration: 3,
-        ffmpegAtLeast: (): boolean => true,
-        gpuMem: 0,
-        hasDecoder: (): boolean => true,
-        hasEncoder: (): boolean => true,
-        hasHwAccel: (): boolean => true,
-        hostSystem: "macOS.Apple"
-      } as never,
-      crop: undefined,
-      debug: false,
-      hardwareDecoding: true,
-      hardwareTranscoding: true,
-      log: { debug: () => undefined, error: () => undefined, info: () => undefined, warn: () => undefined },
-      name: (): string => "hardware-wiring-test"
-    });
-
-    return new Proxy(base, {
-
-      get(target, property, receiver): unknown {
-
-        if(property === "hardwareEncodes") {
-
-          return (): boolean => true;
-        }
-
-        const value: unknown = Reflect.get(target, property, receiver);
-
-        return typeof value === "function" ? value.bind(target) : value;
-      }
-    });
   }
 
   const UPSTREAM_MINTERPOLATE_SUFFIX = ":mi_mode=mci:mc_mode=aobmc:me=fss:me_mode=bidir:vsbmc=1:scd=none";
@@ -636,5 +633,48 @@ describe("appendLiveVideoEncodeToFfmpegArgs output fps", () => {
     const { args } = appendEncodeArgs(15, 30, true);
 
     assert.equal(callerFpsFilterChain(filterArg(args)), null);
+  });
+});
+
+describe("resolveLiveStreamTranscodePipelineOptions — decoder/encoder object parity (upstream 5586429)", () => {
+
+  const transcodeDecision: LiveVideoEncodeDecision = { logReason: "wiring", mode: "transcode" };
+
+  function assertInterpolatingDecoderMatchesEncoder(inputCodec: string, sourceFps: number, requestFps: number): void {
+
+    const ffmpegOptions = makeAppleHardwareFfmpegOptions();
+    const camera = testCameraHost();
+
+    camera.ufp = { ...camera.ufp, videoCodec: inputCodec };
+
+    const channel = {
+
+      channel: { bitrate: 4000000, fps: sourceFps, height: 720, id: 1, name: "medium", width: 1280 },
+      name: "medium"
+    } as ChannelProfile;
+    const request = makeRequest();
+
+    request.video.fps = requestFps;
+
+    const pipelineOptions = resolveLiveStreamTranscodePipelineOptions(camera, transcodeDecision, channel, request, 800, true) as LiveStreamEncoderPipelineOptions;
+    const decoderArgs = ffmpegOptions.videoDecoder(pipelineOptions);
+    const encoderArgs = ffmpegOptions.streamEncoder(pipelineOptions);
+    const decoderInputCodecOnly = ffmpegOptions.videoDecoder({ inputCodec: inputCodec });
+
+    assert.equal(pipelineOptions.inputCodec, inputCodec);
+    assert.notDeepEqual(decoderArgs, decoderInputCodecOnly,
+      "interpolating transcode must not use a decoder bag with inputCodec alone (macOS Apple HW regression)");
+    assert.ok(encoderArgs.includes("-filter:v"), "encoder must receive interpolation filters when Apple interpolation is active");
+    assert.match(encoderArgs.join(" "), /minterpolate=/);
+  }
+
+  test("H.264 interpolating transcode shares one pipeline bag between decoder and encoder", () => {
+
+    assertInterpolatingDecoderMatchesEncoder("h264", 30, 15);
+  });
+
+  test("HEVC interpolating transcode shares one pipeline bag between decoder and encoder", () => {
+
+    assertInterpolatingDecoderMatchesEncoder("hevc", 30, 15);
   });
 });

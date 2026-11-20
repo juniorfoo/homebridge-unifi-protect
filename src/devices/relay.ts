@@ -2,42 +2,21 @@
  *
  * relay.ts: Relay device class for UniFi Protect.
  */
-import type { ProtectAccessory, WithoutIdentity } from "../types.ts";
 import type { ProtectRelayConfig, Relay } from "unifi-protect";
 import type { CharacteristicValue } from "homebridge";
 import { PROTECT_RELAY_COMMAND_TIMEOUT } from "../settings.ts";
 import { ProtectDevice } from "./device.ts";
-import type { ProtectNvr } from "../nvr/nvr.ts";
 import { ProtectReservedNames } from "../types.ts";
-import { deviceSelectors } from "unifi-protect";
+import { mqttTopics } from "../mqtt.ts";
+import { resolveMqttTopic } from "homebridge-plugin-utils";
 
-export class ProtectRelay extends ProtectDevice {
-
-  // Narrow the inherited projection handle to the relay projection so the read-through config getter resolves to ProtectRelayConfig.
-  declare protected readonly device: Relay;
+export class ProtectRelay extends ProtectDevice<Relay> {
 
   // The output id we most recently commanded, mapped to the state we are driving it toward. It exists to make the set-to-toggle decision latency-aware: a rapid second
   // tap compares against where the output is headed, not the pre-toggle controller value that lags until the broadcast lands. Cleared when the controller confirms the
   // intent (or a bounded safety timer fires), so a lost broadcast can never wedge the switch. This is transient runtime state, deliberately NOT persisted to
   // accessory.context.
   readonly #pendingDesired = new Map<number, boolean>();
-
-  // Create an instance.
-  constructor(nvr: ProtectNvr, accessory: ProtectAccessory, device: Relay) {
-
-    super(nvr, accessory, device);
-
-    this.configureHints();
-    this.configureDevice();
-    this.spawnObservers();
-  }
-
-  // Read-through to the relay projection's live STATE, narrowed to drop device identity (id/mac/modelKey). Identity flows through the dedicated non-throwing accessors
-  // (protectId/modelKey/.id/.mac), never this throwing config getter; this override mirrors the base getter's body and narrows only the surfaced return type.
-  public override get ufp(): Readonly<WithoutIdentity<ProtectRelayConfig>> {
-
-    return this.device.config;
-  }
 
   // The current on/off state of one relay output, read non-throwing through the record. An absent record (a relay lingering in the removal grace) reports off rather than
   // throwing, and an unknown output id likewise reports off.
@@ -62,11 +41,18 @@ export class ProtectRelay extends ProtectDevice {
   // The stable MQTT topic tail for one output, user-facing as 1-based. Single-sourced so the publish and the get/set subscriptions all address the identical topic.
   private outputTopic(id: number): string {
 
-    return "relay/" + (id + 1).toString();
+    return resolveMqttTopic(mqttTopics.relayOutput.topic, { output: (id + 1).toString() });
+  }
+
+  // The label one output's switch and command lines carry, read as the relay is configured and held for the life of this device object, so a rename on the controller
+  // leaves the switch and its failure lines naming what the switch was set up as.
+  private outputLabel({ id, name }: ProtectRelayConfig["outputs"][number]): string {
+
+    return name ?? ("Output " + (id + 1).toString());
   }
 
   // Initialize and configure the relay accessory for HomeKit.
-  private configureDevice(): boolean {
+  protected override configureDevice(): boolean {
 
     // Reset the persisted context to a clean slate and reseed identity. This accessory may be the object Homebridge restored from its persisted accessory cache, which
     // can still carry context keys left behind by an earlier plugin version or a different accessory type sharing this device's cached identity; the relay persists no
@@ -88,45 +74,41 @@ export class ProtectRelay extends ProtectDevice {
     return true;
   }
 
-  // Configure a HomeKit switch for each output the controller reports, iterating the live outputs array rather than hardcoding a fixed pair. Each output is keyed by its
-  // wire id (0-based, the stable identity) into a per-output service subtype, is user-visible as 1-based ("Output 1"), and is individually show/hide-able through its own
-  // feature option - hiding one output prunes exactly its switch and leaves the others intact. The visibility catalog enumerates each output the supported relay
-  // hardware reports; an output beyond the catalog has no per-output option and resolves hidden by the feature-option default, so a larger relay would need its catalog
-  // entries extended alongside this iteration.
+  /* Configure a HomeKit switch for each output the controller reports, iterating the live outputs array rather than hardcoding a fixed pair. Each output is keyed by its
+   * wire id (0-based, the stable identity) into a per-output service subtype and is user-visible as 1-based ("Output 1").
+   *
+   * Which outputs appear is a single selection over the relay's OWN reported outputs: the domain the user picks from is derived from the hardware in front of them, so
+   * a relay of any size offers every output it reports and defaults to showing all of them. Leaving one out prunes exactly its switch and leaves the others intact.
+   */
   private configureOutputs(): void {
+
+    // The outputs the user selected, resolved once for the whole pass against this relay's live output list, addressed by the 1-based numbers the user sees.
+    const visible = new Set(this.getFeatureList("Relay.Outputs", this.ufp.outputs.map((output) => (output.id + 1).toString())));
 
     for(const output of this.ufp.outputs) {
 
       const id = output.id;
-      const label = output.name ?? ("Output " + (id + 1).toString());
+      const label = this.outputLabel(output);
       const subtype = this.outputSubtype(id);
 
-      // Validate whether we should have this output's switch enabled, gating on the 1-based per-output feature option. This prunes exactly this output's subtyped switch
-      // when hidden, leaving the sibling outputs and the accessory intact.
-      if(!this.validService(this.hap.Service.Switch, this.hasFeature("Relay.Output." + (id + 1).toString()), subtype)) {
+      // Validate whether we should have this output's switch enabled, gating on the selection resolved above. This prunes exactly this output's subtyped switch when it
+      // is left out, leaving the sibling outputs and the accessory intact.
+      const { service } = this.validService({ name: this.accessoryName + " " + label, serviceType: this.hap.Service.Switch, subtype,
+        validate: visible.has((id + 1).toString()) });
 
-        continue;
-      }
-
-      // Acquire the service.
-      const service = this.acquireService(this.hap.Service.Switch, this.accessoryName + " " + label, subtype);
-
-      // Fail gracefully.
       if(!service) {
-
-        this.log.error("Unable to add the relay output switch for %s.", label);
 
         continue;
       }
 
       // Read the live controller output state when requested (controller is authority; the observe loop keeps the tile current between reads).
-      service.getCharacteristic(this.hap.Characteristic.On).onGet(() => this.outputState(id));
+      service.getCharacteristic(this.hap.Characteristic.On).onGet(this.answering(() => this.outputState(id)));
 
       // Drive the output toward the requested state through the set-to-toggle guard.
-      service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue) => {
+      service.getCharacteristic(this.hap.Characteristic.On).onSet(this.answering(async (value: CharacteristicValue) => {
 
         await this.setOutput(id, label, value === true);
-      });
+      }));
 
       // Initialize the switch from controller truth.
       service.updateCharacteristic(this.hap.Characteristic.On, this.outputState(id));
@@ -135,21 +117,22 @@ export class ProtectRelay extends ProtectDevice {
 
   // Drive one relay output toward a desired on/off state, reconciling HomeKit's set-state semantics against the controller's faithful toggle primitive. The controller
   // offers only toggleOutput - a flip that is write-through - so we record the state we are driving the output toward in #pendingDesired and decide against that intent
-  // rather than the pre-toggle controller value, which lags until the broadcast lands. This is what makes a rapid second tap resolve correctly. The toggle is not
-  // idempotent, so we must never re-issue toward a state we are already in or heading to.
+  // rather than the pre-toggle controller value, which lags until the broadcast lands. This is what makes a rapid second tap resolve correctly. Calling
+  // toggleOutput twice flips the output back to where it started, so we must never re-issue toward a state we are already in or heading to.
   private async setOutput(id: number, label: string, desired: boolean): Promise<void> {
 
     // Compare against the pending intent if one is outstanding, else the live controller state (both non-throwing reads).
     const current = this.#pendingDesired.get(id) ?? this.outputState(id);
 
-    // We are already in, or heading to, the desired state - re-issuing the non-idempotent toggle here would flip us the wrong way, so there is nothing to do.
+    // We are already in, or heading to, the desired state - re-issuing the toggle here would flip the output the wrong way, since a second call reverses it,
+    // so there is nothing to do.
     if(desired === current) {
 
       return;
     }
 
     // Record intent BEFORE dispatch and arm a bounded safety timer that drops the intent if the controller never confirms, so a lost broadcast cannot wedge the tap
-    // decision. No optimistic tile write is needed: HAP already holds the requested value on the characteristic through this non-throwing onSet, and the observe loop
+    // decision. No optimistic tile write is needed: the requested value lands on the characteristic once this resolves, whichever path called it, and the observe loop
     // reconciles to controller truth on the confirming broadcast.
     this.#pendingDesired.set(id, desired);
     this.timers.setTimeout(this.pendingTimerKey(id), () => this.#pendingDesired.delete(id), PROTECT_RELAY_COMMAND_TIMEOUT);
@@ -158,39 +141,73 @@ export class ProtectRelay extends ProtectDevice {
     if(!(await this.runDeviceCommand("turn " + label + " " + (desired ? "on" : "off"), () => this.device.toggleOutput(id)))) {
 
       // The command failed and the output never changed, so no broadcast will arrive to reconcile the tile. Drop the intent and cancel its safety timer, then reflect the
-      // true controller state back to the tile through a brief deferred bounce: a synchronous write here would be clobbered by HAP writing the requested value to the
-      // characteristic once this non-throwing onSet resolves, so we reflect just past that settle. The ~50ms cosmetic bounce is deliberately left out of this.timers, as
-      // the motion trigger's is; it need not survive cleanup().
+      // true controller state back to the tile.
       this.#pendingDesired.delete(id);
       this.timers.clear(this.pendingTimerKey(id));
 
       const service = this.accessory.getServiceById(this.hap.Service.Switch, this.outputSubtype(id));
 
-      setTimeout(() => service?.updateCharacteristic(this.hap.Characteristic.On, this.outputState(id)), 50);
+      this.reflectAfterSet(() => service?.updateCharacteristic(this.hap.Characteristic.On, this.outputState(id)));
+
+      return;
+    }
+  }
+
+  // Publish one output's on state, the value its MQTT get answers, when it changed. The controller's reported change is the one publisher of this topic, so a toggle
+  // made here, in the Protect app, or by a momentary output's self-revert each publishes once, from the observer. An output the user left out of Relay.Outputs has no
+  // switch, and with it no MQTT topic, so it publishes nothing.
+  private publishOutputState(id: number): void {
+
+    if(!this.hasOutputSwitch(id)) {
 
       return;
     }
 
-    // Publish our state on success.
-    this.publish(this.outputTopic(id), desired ? "true" : "false");
+    this.publishState(this.outputTopic(id), this.outputState(id).toString());
   }
 
-  // Configure MQTT capabilities of this relay. Each output exposes a get (the live output state) and a set (which drives the output switch's On characteristic,
-  // re-entering the single set-to-toggle path). We register for every output the hardware reports; a hidden output's set is a safe no-op (no switch to drive) while its
-  // get still reports the live controller state.
+  // Whether an output's Switch stands, the condition Relay.Outputs creates it under. An output's MQTT topic is part of the same capability, so its get, its set and its
+  // publishes all follow this one answer.
+  private hasOutputSwitch(id: number): boolean {
+
+    return this.accessory.getServiceById(this.hap.Service.Switch, this.outputSubtype(id)) !== undefined;
+  }
+
+  // Configure MQTT capabilities of this relay. Each output whose Switch stands exposes a get (the live output state) and a set (which runs the single set-to-toggle path
+  // directly, under the label the output's switch carries). An output the user left out of Relay.Outputs has no switch and no MQTT topic, so it registers neither.
   private configureMqtt(): void {
 
     for(const output of this.ufp.outputs) {
 
       const id = output.id;
+      const label = this.outputLabel(output);
 
-      this.subscribeGet(this.outputTopic(id), "relay output", () => this.outputState(id).toString());
+      if(!this.hasOutputSwitch(id)) {
 
-      this.subscribeSet(this.outputTopic(id), "relay output", (value: string) => {
+        continue;
+      }
 
-        this.accessory.getServiceById(this.hap.Service.Switch, this.outputSubtype(id))?.setCharacteristic(this.hap.Characteristic.On, value === "true");
+      this.subscribeGet(this.outputTopic(id), mqttTopics.relayOutput.label, () => this.outputState(id).toString());
+
+      this.subscribeSet(this.outputTopic(id), mqttTopics.relayOutput.label, (value: string) => {
+
+        void this.driveSet({ characteristic: this.hap.Characteristic.On, service: this.accessory.getServiceById(this.hap.Service.Switch, this.outputSubtype(id)),
+          set: (desired) => this.setOutput(id, label, desired === true), value: value === "true" });
       });
     }
+
+    // State each output's held state as the relay is set up, since its setup publishes nothing else, and again at the start of every later broker session, through the
+    // method its observers publish with.
+    const restate = (): void => {
+
+      for(const output of this.ufp.outputs) {
+
+        this.publishOutputState(output.id);
+      }
+    };
+
+    restate();
+    this.restateOnConnect(restate);
   }
 
   // Spawn the relay's narrow-selector observers. super spawns the universal observers (name sync and firmware/device-info refresh); the relay adds one observer per
@@ -199,7 +216,7 @@ export class ProtectRelay extends ProtectDevice {
 
     super.spawnObservers();
 
-    const relay = deviceSelectors.relay.byId(this.device.id);
+    const relay = this.nvr.client.state.selectors.relay.byId(this.device.id);
 
     // One observer per output, each selecting that output's own state. Because the store yields only on an Object.is change of the selected value, an observer wakes ONLY
     // when its own output's state changes: a sibling output's change (or any unrelated device patch) leaves this output's state primitive untouched and never wakes it.
@@ -222,8 +239,9 @@ export class ProtectRelay extends ProtectDevice {
           this.timers.clear(this.pendingTimerKey(id));
         }
 
-        // Push controller truth to this output's tile.
+        // Push controller truth to this output's tile, and on to MQTT.
         this.accessory.getServiceById(this.hap.Service.Switch, this.outputSubtype(id))?.updateCharacteristic(this.hap.Characteristic.On, actual);
+        this.publishOutputState(id);
       });
     }
 

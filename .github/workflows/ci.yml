@@ -31,6 +31,9 @@ jobs:
     steps:
       - name: Checkout the repository.
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Setup the node ${{ matrix.node-version }} environment.
         uses: actions/setup-node@v6
@@ -38,9 +41,19 @@ jobs:
           cache: npm
           node-version: ${{ matrix.node-version }}
 
+      - name: Fetch upstream release tags for sync guard.
+        run: |
+          git fetch --depth 1 https://github.com/hjdhjd/homebridge-unifi-protect.git \
+            refs/tags/v8.1.0:refs/tags/v8.1.0 \
+            refs/tags/v8.2.2:refs/tags/v8.2.2
+
       - name: Install dependencies and run tests.
         env:
           CI: true
         run: |
           npm ci
-          npm test
+          npm run build
+          npm run typecheck
+          npm run check-docs
+          python3 scripts/check-upstream-sync.py --self-test
+          node --test --experimental-test-coverage --test-timeout=120000 "src/**/*.test.ts"

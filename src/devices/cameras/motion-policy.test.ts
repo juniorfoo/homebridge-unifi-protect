@@ -1,14 +1,33 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * motion-policy.test.ts: Unit tests for the pure bare-motion delivery policy (shouldDeliverBareMotion) extracted to the importable leaf motion-policy.ts.
+ * motion-policy.test.ts: Unit tests for the pure motion policies (canBackHksv and shouldDeliverBareMotion) extracted to the importable leaf motion-policy.ts.
  *
- * shouldDeliverBareMotion is a pure free function - three camera facts in, a boolean out, no this, no HAP - so the natural coverage is to import the REAL leaf and drive
- * it directly, exactly as chime-volume.test.ts / smart-detect-metadata.test.ts import their pure leaves. Because the policy is a pure leaf type-importing nothing, it is
- * importable by both the camera leaf and this test, so this is real-code coverage of the shipping decision rather than a model that could drift.
+ * Each policy is a pure free function - camera facts in, a boolean out, no this, no HAP - so the natural coverage is to import the REAL leaf and drive it directly,
+ * exactly as chime-volume.test.ts / smart-detect-metadata.test.ts import their pure leaves. Because the policies are a pure leaf type-importing nothing, they are
+ * importable by both the camera leaf and this test, so this is real-code coverage of the shipping decisions rather than a model that could drift.
  */
+import { canBackHksv, shouldDeliverBareMotion } from "./motion-policy.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { shouldDeliverBareMotion } from "./motion-policy.ts";
+
+describe("HomeKit Secure Video eligibility (canBackHksv)", () => {
+
+  test("a camera can back HKSV exactly when Protect exposes a motion sensor for it", () => {
+
+    // The predicate is the controller's motion report alone: a camera Protect exposes a motion sensor for can back HKSV, and one it exposes none for cannot, whatever
+    // else the camera reports.
+    const cases: { expected: boolean; hasMotionDetection: boolean }[] = [
+
+      { expected: true, hasMotionDetection: true },
+      { expected: false, hasMotionDetection: false }
+    ];
+
+    for(const { expected, hasMotionDetection } of cases) {
+
+      assert.equal(canBackHksv({ featureFlags: { hasMotionDetection } }), expected, "hasMotionDetection=" + String(hasMotionDetection));
+    }
+  });
+});
 
 describe("bare-motion delivery policy (shouldDeliverBareMotion)", () => {
 

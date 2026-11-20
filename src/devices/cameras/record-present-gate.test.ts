@@ -7,19 +7,23 @@
  * SELF-VALIDATING: the positive liveness control (a present-record push reconciles and creates the sensor) proves the counter and the observer are live, so the
  * suppression assertion that follows cannot pass for the wrong reason. The global unhandledRejection channel and a loopFaultReporter spy are deliberately NOT consulted.
  */
-import { Service, TestCameraProjection, TestStateStore, makeCameraConfig, makeProtectState, makeTestAccessory, makeTestNvr, settle } from "../../testing.helpers.ts";
-import type { TestAccessory, TestProtectNvr } from "../../testing.helpers.ts";
+import { Characteristic, Service, TestStateStore, makeProtectState, makeTestAccessory } from "../../testing.helpers.ts";
+import { G2_PRO_CHANNELS, G6_PRO_ENTRY_CHANNELS } from "../../camera.fixtures.ts";
+import { TestCameraProjection, makeCameraConfig } from "../testing.helpers.ts";
 import { describe, test } from "node:test";
+import { settle, triggerSet } from "homebridge-plugin-utils/testing";
 import type { Camera } from "unifi-protect";
-import { G2_PRO_CHANNELS } from "../../camera.fixtures.ts";
-import type { ProtectAccessory } from "../../types.ts";
 import { ProtectCamera } from "./camera.ts";
 import type { ProtectNvr } from "../../nvr/nvr.ts";
+import type { TestProtectAccessory } from "../../testing.helpers.ts";
+import type { TestProtectNvr } from "../../nvr/testing.helpers.ts";
 import assert from "node:assert/strict";
+import { configured } from "../device-base.ts";
+import { makeTestNvr } from "../../nvr/testing.helpers.ts";
 
 // A ProtectCamera that counts its reconcileCapabilities invocations, so the test proves the async-void capability observer is LIVE (the count rises on a present-record
-// push, alongside the service that reconcile creates) and then SUPPRESSED once the record vanishes (the count holds). Construction's own reconcile is wiped from this
-// counter by the subclass field-define (the field initializes to 0 after super returns), so the count measures the live observer's invocations from a 0 baseline.
+// push, alongside the service that reconcile creates) and then SUPPRESSED once the record vanishes (the count holds). The setup pass's own reconcile is counted too,
+// so the count measures the live observer's invocations against the baseline read once setup has settled.
 class CountingCamera extends ProtectCamera {
 
   public reconcileCount = 0;
@@ -32,10 +36,10 @@ class CountingCamera extends ProtectCamera {
   }
 }
 
-// Construct a real CountingCamera, with the casts confined to this one seam - the instance under test is the production class and its real observe loops.
-function construct(nvr: TestProtectNvr, accessory: TestAccessory, projection: TestCameraProjection): CountingCamera {
+// Construct a real CountingCamera, with the casts confined to this one boundary - the instance under test is the production class and its real observe loops.
+function construct(nvr: TestProtectNvr, accessory: TestProtectAccessory, projection: TestCameraProjection): CountingCamera {
 
-  return new CountingCamera(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Camera);
+  return configured(new CountingCamera(nvr as unknown as ProtectNvr, accessory, projection as unknown as Camera));
 }
 
 describe("the observeState recordPresent gate during the removal grace", () => {
@@ -45,15 +49,15 @@ describe("the observeState recordPresent gate during the removal grace", () => {
     // A camera adopted WITHOUT the lux capability, so the ambient light sensor is absent at adoption - its later appearance is the observable proof the observer ran.
     const cameraConfig = makeCameraConfig({ channels: G2_PRO_CHANNELS, featureFlags: { hasLuxCheck: false } });
     const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
-    const { nvr } = makeTestNvr({ store });
-    const accessory = makeTestAccessory("Test Camera", "uuid:record-present-gate-1");
+    const { controller, nvr } = makeTestNvr({ store });
+    const accessory = makeTestAccessory("Test Camera", cameraConfig.mac);
     const camera = construct(nvr, accessory, new TestCameraProjection(cameraConfig.id, store));
 
     await settle();
 
     try {
 
-      // The baseline after construction (the construct reconcile is wiped from the counter by the subclass field-define), and the camera's full set of observe loops.
+      // The baseline after setup (the construct reconcile already counted), and the camera's full set of observe loops.
       const baseline = camera.reconcileCount;
       const observerCount = store.observerCount;
 
@@ -82,22 +86,23 @@ describe("the observeState recordPresent gate during the removal grace", () => {
         "the recordPresent gate suppressed the async-void capability observer once the record vanished - reconcileCapabilities was not invoked");
       assert.equal(store.observerCount, observerCount,
         "every observe loop stayed subscribed across the vanished record (continue, not break) so a re-adoption resumes them - the survival " +
-        "invariant (the reconcileCount assertion above is the gate's discriminator)");
+        "guarantee (the reconcileCount assertion above is what tells the two apart)");
     } finally {
 
       camera.cleanup();
+      controller.abort();
     }
   });
 
   // #17/G2-D1: the camera capability getters read the throwing ufp projection, and the reconcile pass reads them on every kick - including after an await where the
-  // record can vanish. Hardened through fromRecord, they must report safe defaults over a vanished record rather than throwing. Pre-fix the raw ufp read threw
-  // ReferenceError, which the supervisor's reconcile pass then floated through its many fire-and-forget kicks.
+  // record can vanish. Hardened through fromRecord, they report safe defaults over a vanished record rather than throwing, which keeps the supervisor's reconcile
+  // pass safe across its many fire-and-forget kicks.
   test("the camera capability getters return safe defaults over a vanished record instead of throwing", async () => {
 
     const cameraConfig = makeCameraConfig({ channels: G2_PRO_CHANNELS });
     const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
-    const { nvr } = makeTestNvr({ store });
-    const accessory = makeTestAccessory("Test Camera", "uuid:record-present-gate-getters");
+    const { controller, nvr } = makeTestNvr({ store });
+    const accessory = makeTestAccessory("Test Camera", cameraConfig.mac);
     const camera = construct(nvr, accessory, new TestCameraProjection(cameraConfig.id, store));
 
     await settle();
@@ -118,6 +123,39 @@ describe("the observeState recordPresent gate during the removal grace", () => {
     } finally {
 
       camera.cleanup();
+      controller.abort();
+    }
+  });
+
+  test("with name syncing on and the doorbell's record gone, a rename of its package camera's tile is put back with the package's suffix once", async () => {
+
+    // The record vanishes for the doorbell and its package camera alike, since they share one projection, so the package's watch reads its owned name from the name its
+    // own accessory carries, which already ends in the display suffix.
+    const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { hasPackageCamera: true, isDoorbell: true }, name: "Front Door" });
+    const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
+    const { controller, nvr } = makeTestNvr({ store, userOptions: ["Enable.Device.SyncName"] });
+    const camera = construct(nvr, makeTestAccessory("Front Door", cameraConfig.mac), new TestCameraProjection(cameraConfig.id, store));
+
+    await settle();
+
+    try {
+
+      const info = camera.packageCamera?.accessory.getService(Service.AccessoryInformation);
+
+      assert.ok(info, "the package camera stands with its information service");
+      assert.equal(info.getCharacteristic(Characteristic.ConfiguredName).value, "Front Door Package Camera", "precondition: the package carries its suffixed name");
+
+      store.removeCameraRecord(cameraConfig.id);
+
+      await settle();
+      await triggerSet(info.getCharacteristic(Characteristic.ConfiguredName), "Den Camera");
+      await settle();
+
+      assert.equal(info.getCharacteristic(Characteristic.ConfiguredName).value, "Front Door Package Camera", "the restore put the name back with the suffix once");
+    } finally {
+
+      camera.cleanup();
+      controller.abort();
     }
   });
 });

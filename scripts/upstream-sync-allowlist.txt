@@ -1,0 +1,139 @@
+# path:line:reason — deliberate fork deltas vs upstream v8.2.2
+LOST:docs/FeatureOptions.md:203:upstream v8.2.2 Transcode.Bitrate row ignores HomeKit bitrate; HEAD row matches fork options.ts (zero hint uses HomeKit request, capped at source)
+LOST:docs/FeatureOptions.md:205:upstream v8.2.2 HighLatency.Bitrate row ignores HomeKit; HEAD row matches fork options.ts zero-hint + cap semantics
+LOST:src/media/stream.ts:7:upstream v8.2.2 import list differs after stream-live extraction and policy modules
+LOST:src/media/stream.ts:8:upstream v8.2.2 import line absent on fork head after stream-live module extraction (import block differs)
+LOST:src/media/stream.ts:9:upstream v8.2.2 import line absent on fork head after stream-live module extraction (import block differs)
+LOST:src/media/stream.ts:12:upstream v8.2.2 import list differs after stream-live extraction and policy modules
+LOST:src/media/stream.ts:19:upstream factors transcode + high-latency via resolveTranscodeDecision; fork inlines packet_time and crop hints in startStream
+LOST:src/media/stream.ts:213:upstream v8.2.2 streaming delegate constructor carries derived-audio probe default; fork ctor shape differs (not copy-first start-only)
+LOST:src/media/stream.ts:214:upstream v8.2.2 constructor closing default for derived probe; fork delegate ctor differs
+LOST:src/media/stream.ts:216:upstream v8.2.2 comment not on fork head: The recording audio format we advertise, computed from the stream the derivation read
+LOST:src/media/stream.ts:485:upstream always constructs RtpDemuxer inline; fork prepareStream prefers streamTestOptions.substituteRtpDemuxer harness hook then falls back
+LOST:src/media/stream.ts:579:upstream transcode-default line missing on fork copy-first head: for await(const segment of subscription) {
+LOST:src/media/stream.ts:638:upstream v8.2.2 comment not on fork head: The moment HomeKit's start request reached us, which is when HAP's own timer for answ
+LOST:src/media/stream.ts:665:upstream factors transcode + high-latency via resolveTranscodeDecision; fork inlines packet_time and crop hints in startStream
+LOST:src/media/stream.ts:667:upstream transcode-default line missing on fork copy-first head: crop: this.protectCamera.hints.crop,
+LOST:src/media/stream.ts:668:upstream transcode-default line missing on fork copy-first head: packetTime: request.audio.packet_time,
+LOST:src/media/stream.ts:669:upstream transcode-default line missing on fork copy-first head: transcode: this.protectCamera.hints.transcode,
+LOST:src/media/stream.ts:670:upstream transcode-default line missing on fork copy-first head: transcodeHighLatency: this.protectCamera.hints.transcodeHighLatency,
+LOST:src/media/stream.ts:736:upstream v8.2.2 comment not on fork head: Find the best RTSP stream based on what we're looking for. The dimensions and the pos
+LOST:src/media/stream.ts:737:upstream v8.2.2 comment not on fork head: a hardware capability rather than a decision, applied with the higher posture alone -
+LOST:src/media/stream.ts:738:upstream transcode-default channel pick uses resolveChannelRequest bias/maxPixels helper
+LOST:src/media/stream.ts:740:upstream transcode-default line missing on fork copy-first head: isTranscoding,
+LOST:src/media/stream.ts:741:upstream transcode-default line missing on fork copy-first head: requestHeight: request.video.height,
+LOST:src/media/stream.ts:742:upstream transcode-default line missing on fork copy-first head: requestWidth: request.video.width,
+LOST:src/media/stream.ts:743:upstream transcode-default line missing on fork copy-first head: usesHardwareEncoder
+LOST:src/media/stream.ts:746:upstream transcode-default line missing on fork copy-first head: channelProfile ??= this.protectCamera.selectChannel(channelRequest.width, channelRequ
+LOST:src/media/stream.ts:747:upstream transcode-default line missing on fork copy-first head: { bias: channelRequest.bias, maxPixels: (channelRequest.bias === "higher") ? this.ffm
+LOST:src/media/stream.ts:762:upstream v8.2.2 comment not on fork head: Decide how the video reaches HomeKit - copied from the camera or re-encoded - and the
+LOST:src/media/stream.ts:763:upstream v8.2.2 comment not on fork head: controller in bits per second and the policy works in kbps throughout, so we convert
+LOST:src/media/stream.ts:764:upstream delegates encode mode/argv to resolveVideoEncoding policy vs fork resolveStartStreamEncodePlan
+LOST:src/media/stream.ts:766:upstream transcode-default line missing on fork copy-first head: channelBitrate: channelProfile.channel.bitrate / 1000,
+LOST:src/media/stream.ts:767:upstream transcode-default line missing on fork copy-first head: channelFps: channelProfile.channel.fps,
+LOST:src/media/stream.ts:768:upstream transcode-default line missing on fork copy-first head: cpuGeneration: this.platform.codecSupport.cpuGeneration,
+LOST:src/media/stream.ts:769:upstream transcode-default line missing on fork copy-first head: hostSystem: this.platform.codecSupport.hostSystem,
+LOST:src/media/stream.ts:770:upstream transcode-default line missing on fork copy-first head: isHighLatency,
+LOST:src/media/stream.ts:772:upstream transcode-default line missing on fork copy-first head: isTranscoding,
+LOST:src/media/stream.ts:773:upstream transcode-default line missing on fork copy-first head: requestBitrate: request.video.max_bit_rate,
+LOST:src/media/stream.ts:774:upstream transcode-default line missing on fork copy-first head: requestFps: request.video.fps,
+LOST:src/media/stream.ts:775:upstream transcode-default line missing on fork copy-first head: requestHeight: request.video.height,
+LOST:src/media/stream.ts:776:upstream transcode-default line missing on fork copy-first head: requestLevel: request.video.level,
+LOST:src/media/stream.ts:777:upstream transcode-default line missing on fork copy-first head: requestProfile: request.video.profile,
+LOST:src/media/stream.ts:778:upstream transcode-default line missing on fork copy-first head: requestWidth: request.video.width,
+LOST:src/media/stream.ts:779:upstream transcode-default line missing on fork copy-first head: transcodeBitrate: this.protectCamera.hints.transcodeBitrate,
+LOST:src/media/stream.ts:780:upstream transcode-default line missing on fork copy-first head: transcodeHighLatencyBitrate: this.protectCamera.hints.transcodeHighLatencyBitrate,
+LOST:src/media/stream.ts:781:upstream transcode-default line missing on fork copy-first head: useTsb,
+LOST:src/media/stream.ts:827:upstream passes encoderOptions into videoDecoder/encoder chain (5586429); fork copy path differs
+LOST:src/media/stream.ts:881:upstream transcode logging adds HARDWARE_TRANSCODE_MARKER hint when hardware encode
+LOST:src/media/stream.ts:895:upstream transcode-default line missing on fork copy-first head: formatBps(encoding.targetBitrate * 1000), channelProfile.name, this.protectCamera.vid
+LOST:src/media/stream.ts:900:upstream transcode-default line missing on fork copy-first head: formatBps(encoding.targetBitrate * 1000));
+LOST:src/media/stream.ts:902:upstream v8.2.2 comment not on fork head: Render the encoding the policy resolved. The decision is already made - all that happ
+LOST:src/media/stream.ts:903:upstream transcode-default line missing on fork copy-first head: if(encoding.mode === "transcode") {
+LOST:src/media/stream.ts:906:upstream passes encoderOptions into videoDecoder/encoder chain (5586429); fork copy path differs
+LOST:src/media/stream.ts:918:upstream transcode-default line missing on fork copy-first head: if(encoding.transmux) {
+LOST:src/media/stream.ts:1004:upstream refuses live start when HomeKit IPv6 address includes zone ID (cad126f)
+LOST:src/media/stream.ts:1006:upstream transcode-default line missing on fork copy-first head: this.log.error(errorMessage, { address: sessionInfo.address });
+LOST:src/media/stream.ts:1174:upstream v8.2.2 comment not on fork head: -map 0:a:0             Select the single incoming audio track from the SDP input befo
+LOST:src/media/stream.ts:1441:upstream v8.2.2 comment not on fork head: Shut down all our video streams and end this camera's probesize self-tuning with them
+LOST:src/media/stream.ts:1443:upstream v8.2.2 comment not on fork head: Every path that calls shutdown is ending this instance's service life, so the teardow
+LOST:src/media/stream.ts:1444:upstream v8.2.2 comment not on fork head: still establishing, and the self-tuning story ends with them. A pending auto-reset ti
+LOST:src/media/stream.ts:1445:upstream v8.2.2 comment not on fork head: window, and resetProbesizeOverride owns the clear-and-reset, so the tuning state and
+LOST:src/media/stream.ts:1447:upstream v8.2.2 comment not on fork head: Safe to call more than once - a repeat call finds no sessions and nothing to reset. T
+LOST:src/media/stream.ts:1448:upstream v8.2.2 comment not on fork head: the first call, and the reset assigns fixed values, so a latch field here would add s
+LOST:src/media/stream.ts:1457:upstream v8.2.2 comment not on fork head: A session still mid-establishment holds a spawned FFmpeg, an RTP demuxer, port reserv
+LOST:src/media/stream.ts:1458:upstream v8.2.2 comment not on fork head: loop above walks only the registered ongoing sessions. Routing each pending session t
+LOST:src/media/stream.ts:1459:upstream v8.2.2 comment not on fork head: same "shutdown" reason stopStream uses, so neither a session resource nor a later "fa
+LOST:src/media/stream.ts:1460:upstream v8.2.2 comment not on fork head: during the iteration is safe, as is calling the helper more than once. Each disposal
+LOST:src/media/stream.ts:1461:upstream v8.2.2 comment not on fork head: failure strands neither the sessions behind it nor the reset below.
+LOST:src/media/stream.ts:1486:upstream v8.2.2 comment not on fork head: Reset the probesize self-tuning back to this camera's baseline.
+LOST:src/media/stream.ts:1488:upstream v8.2.2 comment not on fork head: This is the single owner of the clear-and-reset: the override, its retry count, and a
+LOST:src/media/stream.ts:1489:upstream v8.2.2 comment not on fork head: tuning wound back routes through this one body rather than reaching for the timer its
+LOST:src/media/stream.ts:1490:upstream v8.2.2 comment not on fork head: estimate the stream rate, and at the permanent ceiling (PROTECT_PROBESIZE_OVERRIDE_PE
+LOST:src/media/stream.ts:1491:upstream v8.2.2 comment not on fork head: probesize - and the startup latency it costs - otherwise persists for the whole life
+LOST:src/media/stream.ts:1493:upstream v8.2.2 comment not on fork head: A controller reboot restarts this camera's stream from scratch, the natural boundary
+LOST:src/media/stream.ts:1494:upstream v8.2.2 comment not on fork head: the reboot edge, where the trade-off is one possibly-wasted baseline spawn on a chron
+LOST:src/media/stream.ts:1495:upstream v8.2.2 comment not on fork head: probesize is read only when ffmpegArgs is built at spawn, so this never disturbs an i
+LOST:src/media/stream.ts:1496:upstream v8.2.2 comment not on fork head: shutdown is the terminal role instead: nothing re-arms afterward, and the point of th
+LOST:src/media/stream.ts:1511:upstream v8.2.2 comment not on fork head: Wait for a livestream to establish, giving up at a deadline. The establishment's own
+LOST:src/media/stream.ts:1512:upstream v8.2.2 comment not on fork head: false, so a caller holding a time budget treats a livestream that is late exactly as
+LOST:src/media/stream.ts:1513:upstream v8.2.2 comment not on fork head: so an establishment that answers in time leaves nothing armed behind it.
+LOST:src/media/stream.ts:1515:upstream v8.2.2 comment not on fork head: @param options             - Wait inputs.
+LOST:src/media/stream.ts:1516:upstream v8.2.2 comment not on fork head: @param options.clock       - The clock the deadline is armed on.
+LOST:src/media/stream.ts:1517:upstream v8.2.2 comment not on fork head: @param options.established - The livestream's establishment answer.
+LOST:src/media/stream.ts:1518:upstream waitForLivestreamEstablishment JSDoc + deadline helper vs fork inlined waiter
+LOST:src/media/stream.ts:1520:upstream v8.2.2 comment not on fork head: @returns Whether the livestream established before the deadline.
+RESURRECTED:src/media/stream.ts:998:fork reads HomeKit packet_time >= 60 locally instead of resolveTranscodeDecision output
+RESURRECTED:src/media/stream.ts:1005:fork seeds targetBitrate before channel/encode policy on copy-first path
+RESURRECTED:src/media/stream.ts:1109:fork transcode channel select caps at 3840x2160 when host hardware encoder available
+RESURRECTED:src/media/stream.ts:1110:fork transcode channel select caps at 3840x2160 when host hardware encoder available
+RESURRECTED:src/media/stream.ts:1201:fork line resurrected vs upstream removal: const useInterpolationFilter = useTsb && !isPackageCameraContext(this.protectCamera.a
+RESURRECTED:src/media/stream.ts:1202:fork line resurrected vs upstream removal: ((this.platform.codecSupport.hostSystem === "macOS.Apple") && (this.platform.codecSup
+LOST:src/media/testing.helpers.ts:278:fork fragment builders for fanout/FO2 segment injection tests not in upstream harness
+LOST:src/media/testing.helpers.ts:281:fork fragment builders for fanout/FO2 segment injection tests not in upstream harness
+LOST:src/media/testing.helpers.ts:282:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:284:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:299:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:301:fork fragment builders for fanout/FO2 segment injection tests not in upstream harness
+LOST:src/media/testing.helpers.ts:414:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:415:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:416:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:417:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:418:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:420:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:421:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:422:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:423:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:424:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:426:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:427:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:428:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:433:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:434:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:439:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:440:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:441:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:445:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:446:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:447:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:449:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:450:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:451:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:454:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:455:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:457:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:459:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:463:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:464:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:471:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:472:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:510:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:511:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:513:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:514:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:516:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:553:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:554:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:556:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:561:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/media/testing.helpers.ts:562:fork testing.helpers fanout livestream double vs upstream slim harness

@@ -3,10 +3,10 @@
  * device-hints.test.ts: The base-capability concern net for the shared ProtectDevice feature-option hints derivation, netted once family-agnostically.
  *
  * configureHints (device.ts) is a BASE ProtectDevice behavior every family runs at construction: it derives its hints from feature options (enabled, logMotion,
- * motionDuration, occupancyDuration, smartOccupancy, standalone, syncName), clamps the durations to their floors (motionDuration >= 2, occupancyDuration >= 60), and
- * logs deviations from the defaults. Per the two-layer test architecture the base derivation/clamp/log logic is netted ONCE here against the shared minimal
- * TestBaseDevice vehicle (the all-quiet makeSensorConfig carrier) rather than re-asserted inside each family suite: every concern test builds the device with a
- * userOptions set, calls the test-only configureHintsFor window, and asserts the resulting hints + the deviation logs.
+ * motionDuration, nameOverride, nameOwned, occupancyDuration, smartOccupancy, standalone), clamps the durations to their floors (motionDuration >= 2,
+ * occupancyDuration >= 60), and logs deviations from the defaults. Per the two-layer test architecture the base derivation/clamp/log logic is netted ONCE here
+ * against the shared minimal TestBaseDevice vehicle (the all-quiet makeSensorConfig carrier) rather than re-asserted inside each family suite: every concern test
+ * builds the device with a userOptions set, calls the test-only configureHintsFor window, and asserts the resulting hints + the deviation logs.
  *
  * configureHints's PRODUCT is the hints object - a PUBLIC field (device.ts) consumed across the class hierarchy, the same field doorbell-construction.test.ts
  * reads directly - plus the user-visible deviation logs. So this suite reads device.hints DIRECTLY (typed Readonly<ProtectHints> at the read site for read-only intent)
@@ -14,52 +14,62 @@
  * hardwareDecoding, hardwareTranscoding, highResSnapshots, and the rest) are set by the CAMERA family's configureHints OVERRIDE - family-owned and out of scope here;
  * this nets the hints the BASE sets and the clamps.
  *
- * The value-option override syntax (load-bearing, verified against homebridge-plugin-utils featureOptions.js): Motion.Duration and Motion.OccupancySensor.Duration are
+ * The value-option override syntax (these duration assertions depend on it staying correct, verified against homebridge-plugin-utils featureOptions.js): Motion.Duration
+ * and Motion.OccupancySensor.Duration are
  * value-centric options (default: true, defaultValue 10 / 300). The global value override is Enable.<Option>.<N> - a single trailing numeric segment parsed as the value
  * - so Enable.Motion.Duration.20 sets the value to 20 and Enable.Motion.Duration.1 sets it to 1 (then the clamp raises it to 2). Each duration / clamp test asserts the
  * EXACT resulting device.hints value, so a no-op override (the value staying at its default) fails loudly rather than passing vacuously.
  *
- * The syncName deviation log routes through scope: the test vehicle steers Device.SyncName via the GLOBAL userOption "Enable.Device.SyncName", which resolves to scope
- * "global" - so logFeature (device.ts) routes to nvr.logFeature, which emits the PLURAL "Syncing Protect device names to HomeKit." message (not the singular device
- * line). The syncName test asserts that plural line AND device.hints.syncName === true (the robust core, independent of the log path). The singular "Not syncing this
- * Protect device name to HomeKit." else-branch (device.ts) fires only when Device.SyncName is DEVICE-scoped; this vehicle uses global userOptions, so that branch is
- * acknowledged-conditional, not driven here.
+ * The name-sync line comes from the level that set the option, through the real engine's logFeature: the plugin's logger for a global entry, the controller's for a
+ * controller entry and the device's for a device entry, once at each level. The rows read every line off the one recorder the double hands every logger, so the
+ * prefix each logger writes is what tells them apart, and makeTestNvr's controllerPrefix gives the controller's logger one to write.
  *
  * The isolation model is per-test-fresh: each test calls buildHintsDevice with its own userOptions, and an afterEach unwinds the device's per-accessory abort.
  * configureHints is synchronous and observer-free (no observeState, no services, no commands, no MQTT), so there is no observer-wake subscription and no settle() here -
  * the hints are read and the logs are asserted immediately after the synchronous configureHintsFor call.
  */
-import type { TestAccessory, TestLogEntry } from "../testing.helpers.ts";
-import { TestBaseDevice, TestSensorProjection, TestStateStore, makeProtectState, makeSensorConfig, makeTestAccessory, makeTestNvr } from "../testing.helpers.ts";
+import { TestBaseDevice, TestSensorProjection, makeSensorConfig } from "./testing.helpers.ts";
+import { TestStateStore, makeProtectState, makeTestAccessory } from "../testing.helpers.ts";
 import { afterEach, describe, test } from "node:test";
-import type { ProtectAccessory } from "../types.ts";
+import { formatLogEntry, loggedAt } from "homebridge-plugin-utils/testing";
 import type { ProtectHints } from "./device.ts";
 import type { ProtectNvr } from "../nvr/nvr.ts";
 import type { Sensor } from "unifi-protect";
+import type { TestLogEntry } from "homebridge-plugin-utils/testing";
+import type { TestProtectAccessory } from "../testing.helpers.ts";
 import assert from "node:assert/strict";
+import { makeTestNvr } from "../nvr/testing.helpers.ts";
 
-// The device logger prefixes every line with the device name; the harness renders what the real Homebridge logger would emit into entry.formatted (for example
-// "Test Sensor: Motion event duration set to 20 seconds."), so a log assertion matches a substring of that rendered line at the given level, mirroring the
-// device-motion / device-statusled suites' helper.
-function loggedAt(entries: TestLogEntry[], level: TestLogEntry["level"], substring: string): boolean {
+// Every harness controller this suite opens, drained in afterEach so the controller lifetime signal bounds each test's constructions rather than the file's. The builder
+// is the single push site, so a construction inside a test body is captured exactly as the fixture's is.
+const controllers: AbortController[] = [];
 
-  return entries.some((entry) => (entry.level === level) && entry.formatted.includes(substring));
-}
+// The identifiers the carrier and its controller resolve feature options at, named here so a scoped fixture below addresses the very device the read runs against.
+const CONTROLLER_MAC = "74ACB9FFFFFF";
+const SENSOR_MAC = "74ACB9000401";
+const SECOND_SENSOR_MAC = "74ACB9000402";
+
+// The log prefix the carrier's own logger writes.
+const DEVICE_PREFIX = "Test Sensor [Test Sensor Model]";
 
 // The reusable construction helper: build a REAL TestBaseDevice (a concrete ProtectDevice leaf whose ctor only super()s) against the harness doubles, seeded with the
-// all-quiet sensor carrier, then run the production base configureHints through the configureHintsFor window. The casts are confined to the construction seam exactly as
-// the device-motion / device-statusled suites do; the instance under test is the production base, running its real configureHints derivation / clamp / log paths. The
+// all-quiet sensor carrier, then run the production base configureHints through the configureHintsFor window. The casts are confined to the point of construction exactly
+// as the device-motion / device-statusled suites do; the instance under test is the production base, running its real configureHints derivation / clamp / log paths. The
 // userOptions thread into the REAL FeatureOptions engine, so the supplied Enable.* / Disable.* strings - and only those - move the hints off their defaults. There is no
 // projection recorder, no MQTT, and no observer wiring: configureHints reads only feature options (resolved against the carrier's MAC), so a plain TestSensorProjection
 // supplies the read-through identity and nothing more.
-function buildHintsDevice(harnessOptions: { userOptions?: string[] } = {}): { accessory: TestAccessory; device: TestBaseDevice; logEntries: TestLogEntry[] } {
+function buildHintsDevice(harnessOptions: { userOptions?: string[] } = {}):
+{ accessory: TestProtectAccessory; device: TestBaseDevice; logEntries: readonly TestLogEntry[] } {
 
   const sensorConfig = makeSensorConfig();
   const store = new TestStateStore(makeProtectState({ sensors: [sensorConfig] }));
-  const { logEntries, nvr } = makeTestNvr({ mqtt: true, store, userOptions: harnessOptions.userOptions });
-  const accessory = makeTestAccessory("Test Sensor", "uuid:test-sensor");
+  const { controller, logEntries, nvr } = makeTestNvr({ mqtt: true, store, userOptions: harnessOptions.userOptions });
+
+  controllers.push(controller);
+
+  const accessory = makeTestAccessory("Test Sensor", sensorConfig.mac);
   const projection = new TestSensorProjection(sensorConfig.id, store);
-  const device = new TestBaseDevice(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Sensor);
+  const device = new TestBaseDevice(nvr as unknown as ProtectNvr, accessory, projection as unknown as Sensor);
 
   // Run the base hints derivation the way a family leaf does at construction: a single synchronous configureHintsFor. Whether each hint moves off its default is then
   // governed entirely by the userOptions threaded into the REAL FeatureOptions engine.
@@ -77,11 +87,18 @@ describe("base ProtectDevice feature-option hints derivation (device-hints conce
 
     device?.cleanup();
     device = undefined;
+
+    for(const controller of controllers) {
+
+      controller.abort();
+    }
+
+    controllers.length = 0;
   });
 
   describe("the defaults (no userOptions)", () => {
 
-    test("the seven base hints take their option defaults and no deviation log fires", () => {
+    test("the base hints take their option defaults and no deviation log fires", () => {
 
       const built = buildHintsDevice();
 
@@ -98,16 +115,17 @@ describe("base ProtectDevice feature-option hints derivation (device-hints conce
       assert.equal(hints.occupancyDuration, 300, "occupancyDuration defaults to PROTECT_OCCUPANCY_DURATION (300)");
       assert.deepEqual(hints.smartOccupancy, [], "smartOccupancy seeds to an empty array (the base sets [], the camera family populates it)");
       assert.equal(hints.standalone, false, "standalone defaults to false (Device.Standalone defaults false)");
-      assert.equal(hints.syncName, false, "syncName defaults to false (Device.SyncName defaults false)");
+      assert.equal(hints.nameOwned, false, "nameOwned defaults to false (no custom name, and Device.SyncName defaults false)");
 
       // No hint deviated from its default, so none of the deviation logs fire.
       assert.equal(loggedAt(built.logEntries, "info", "Motion event duration set to"), false, "no motion-duration deviation log at the defaults");
       assert.equal(loggedAt(built.logEntries, "info", "Occupancy event duration set to"), false, "no occupancy-duration deviation log at the defaults");
-      assert.equal(loggedAt(built.logEntries, "info", "Syncing Protect device name"), false, "no syncName deviation log at the defaults (singular nor plural)");
+      assert.equal(loggedAt(built.logEntries, "info", "Protect name sync"), false, "no name-sync line at the defaults");
+      assert.equal(loggedAt(built.logEntries, "info", "Custom HomeKit name set to"), false, "no custom-name log at the defaults");
     });
   });
 
-  describe("the boolean toggles (each discriminating - moved off its default)", () => {
+  describe("the boolean toggles (each moved off its default, so a hard-coded derivation fails)", () => {
 
     test("Disable.Device drives enabled false while the other hints stay at their defaults", () => {
 
@@ -125,7 +143,7 @@ describe("base ProtectDevice feature-option hints derivation (device-hints conce
       assert.equal(hints.motionDuration, 10, "motionDuration stays at its default");
       assert.equal(hints.occupancyDuration, 300, "occupancyDuration stays at its default");
       assert.equal(hints.standalone, false, "standalone stays at its default");
-      assert.equal(hints.syncName, false, "syncName stays at its default");
+      assert.equal(hints.nameOwned, false, "nameOwned stays at its default");
     });
 
     test("Enable.Log.Motion drives logMotion true while the other hints stay at their defaults", () => {
@@ -142,7 +160,7 @@ describe("base ProtectDevice feature-option hints derivation (device-hints conce
       assert.equal(hints.motionDuration, 10, "motionDuration stays at its default");
       assert.equal(hints.occupancyDuration, 300, "occupancyDuration stays at its default");
       assert.equal(hints.standalone, false, "standalone stays at its default");
-      assert.equal(hints.syncName, false, "syncName stays at its default");
+      assert.equal(hints.nameOwned, false, "nameOwned stays at its default");
     });
 
     test("Enable.Device.Standalone drives standalone true while the other hints stay at their defaults", () => {
@@ -159,10 +177,10 @@ describe("base ProtectDevice feature-option hints derivation (device-hints conce
       assert.equal(hints.logMotion, false, "logMotion stays at its default");
       assert.equal(hints.motionDuration, 10, "motionDuration stays at its default");
       assert.equal(hints.occupancyDuration, 300, "occupancyDuration stays at its default");
-      assert.equal(hints.syncName, false, "syncName stays at its default");
+      assert.equal(hints.nameOwned, false, "nameOwned stays at its default");
     });
 
-    test("Enable.Device.SyncName drives syncName true and emits the global-scope plural log while the other hints stay at their defaults", () => {
+    test("Enable.Device.SyncName drives nameOwned true while the other hints stay at their defaults", () => {
 
       const built = buildHintsDevice({ userOptions: ["Enable.Device.SyncName"] });
 
@@ -170,19 +188,92 @@ describe("base ProtectDevice feature-option hints derivation (device-hints conce
 
       const hints: Readonly<ProtectHints> = device.hints;
 
-      // The robust core, asserted independently of the log path: the global userOption drives syncName true.
-      assert.equal(hints.syncName, true, "Enable.Device.SyncName drives syncName true");
-
-      // The global userOption resolves to scope "global", so logFeature routes to nvr.logFeature, which emits the PLURAL message (not the singular device line).
-      assert.ok(loggedAt(built.logEntries, "info", "Syncing Protect device names to HomeKit."), "the global-scope syncName routes to the plural nvr message");
-      assert.equal(loggedAt(built.logEntries, "info", "Syncing Protect device name to HomeKit."), false,
-        "the singular device line does NOT fire (the userOption is global-scoped, not device-scoped)");
+      // The robust core, asserted independently of the log path: the global userOption hands the plugin the device's name with no custom name set.
+      assert.equal(hints.nameOwned, true, "Enable.Device.SyncName drives nameOwned true");
 
       assert.equal(hints.enabled, true, "enabled stays at its default (true)");
       assert.equal(hints.logMotion, false, "logMotion stays at its default");
       assert.equal(hints.motionDuration, 10, "motionDuration stays at its default");
       assert.equal(hints.occupancyDuration, 300, "occupancyDuration stays at its default");
       assert.equal(hints.standalone, false, "standalone stays at its default");
+    });
+  });
+
+  describe("the name-sync line (Device.SyncName)", () => {
+
+    // Stand devices on one controller double, whose logger carries a prefix over the one recorder, and read the name-sync lines each logger wrote.
+    const nameSyncLines = (userOptions: string[], macs: string[] = [SENSOR_MAC]): string[] => {
+
+      const store = new TestStateStore(makeProtectState({ sensors: macs.map((mac) => makeSensorConfig({ id: "sensor-" + mac, mac })) }));
+      const { controller, logEntries, nvr } = makeTestNvr({ controllerPrefix: "Test Controller", mqtt: true, store, userOptions });
+
+      controllers.push(controller);
+
+      for(const mac of macs) {
+
+        new TestBaseDevice(nvr as unknown as ProtectNvr, makeTestAccessory("Test Sensor", mac),
+          new TestSensorProjection("sensor-" + mac, store) as unknown as Sensor).configureHintsFor();
+      }
+
+      return logEntries.filter(({ level }) => level === "info").map(formatLogEntry).filter((line) => line.includes("name sync"));
+    };
+
+    test("the defaults write no line", () => {
+
+      assert.deepEqual(nameSyncLines([]), [], "no level differs from the catalog default");
+    });
+
+    test("a global entry writes the plugin's line, once across devices, and no other", () => {
+
+      assert.deepEqual(nameSyncLines(["Enable.Device.SyncName"], [ SENSOR_MAC, SECOND_SENSOR_MAC ]), ["Protect name sync enabled."]);
+    });
+
+    test("a controller entry writes the controller's line, once across devices", () => {
+
+      assert.deepEqual(nameSyncLines(["Enable.Device.SyncName." + CONTROLLER_MAC], [ SENSOR_MAC, SECOND_SENSOR_MAC ]), ["Test Controller: Protect name sync enabled."]);
+    });
+
+    test("a device entry writes that device's line", () => {
+
+      assert.deepEqual(nameSyncLines(["Enable.Device.SyncName." + SENSOR_MAC]), [DEVICE_PREFIX + ": Protect name sync enabled."]);
+    });
+
+    test("a device entry disabling beneath a global enable writes the device's disabled line", () => {
+
+      assert.deepEqual(nameSyncLines([ "Enable.Device.SyncName", "Disable.Device.SyncName." + SENSOR_MAC ]), [DEVICE_PREFIX + ": Protect name sync disabled."]);
+    });
+  });
+
+  describe("the custom name (Device.Name)", () => {
+
+    // The option is scoped to the device alone, so each fixture addresses the carrier's own MAC, and the engine hands the hint the value it stored, trimmed at its edges.
+    test("a custom name set on the device resolves into nameOverride", () => {
+
+      const built = buildHintsDevice({ userOptions: ["Enable.Device.Name." + SENSOR_MAC + "=  Kitchen Sensor  "] });
+
+      device = built.device;
+
+      assert.equal(device.hints.nameOverride, "Kitchen Sensor", "the custom name resolves into the hint");
+    });
+
+    // An emoji alone is a name HomeKit's naming rules leave nothing of, so HBPU's custom-name rule counts it as no custom name and the device keeps its own name.
+    test("a custom name HomeKit can carry nothing of resolves to no custom name", () => {
+
+      const built = buildHintsDevice({ userOptions: ["Enable.Device.Name." + SENSOR_MAC + "=🙂"] });
+
+      device = built.device;
+
+      assert.equal(device.hints.nameOverride, null, "an emoji-only custom name resolves to null");
+      assert.equal(loggedAt(built.logEntries, "info", "Custom HomeKit name set to"), false, "and no custom-name log fires for it");
+    });
+
+    test("an unset custom name resolves to no custom name", () => {
+
+      const built = buildHintsDevice();
+
+      device = built.device;
+
+      assert.equal(device.hints.nameOverride, null, "no custom name resolves to null");
     });
   });
 
@@ -289,6 +380,111 @@ describe("base ProtectDevice feature-option hints derivation (device-hints conce
         "no occupancy-duration deviation log (the constant fallback equals the default)");
 
       assert.equal(hints.motionDuration, 10, "motionDuration stays at its default");
+    });
+  });
+  /* The list-read wrapper (getFeatureList), which every picker-shaped option resolves through. Four readings have to stay apart from one another, and only the last two
+   * of them are the engine's own: an option DISABLED anywhere in the hierarchy selects nothing; an option enabled with NO stored value keeps the meaning a bare enable
+   * has always had and resolves the registered default; an option carrying an EXPLICIT EMPTY payload is the selection the user emptied on purpose and resolves to
+   * nothing at all; and a stored value the device does not offer drops rather than falling back to anything. Collapsing any pair of those would either lose a user's
+   * deliberate choice or invent one they never made.
+   */
+  describe("the multiple-choice list read (getFeatureList)", () => {
+
+    // The types the carrier offers these reads, in the wire casing the controller reports them in.
+    const DOMAIN = [ "face", "person", "vehicle" ];
+
+    test("a disabled option selects nothing", () => {
+
+      const built = buildHintsDevice({ userOptions: ["Disable.Motion.OccupancySensor"] });
+
+      device = built.device;
+
+      assert.deepEqual(device.getFeatureList("Motion.OccupancySensor", DOMAIN), [], "an option turned off selects nothing at all");
+    });
+
+    // The unconfigured case belongs to the ENGINE's own resolution rather than to the wrapper's fallback, and it lands on the disabled reading here because this option
+    // is off by default: a camera nobody asked for an occupancy sensor on carries no selection at all, and the registered default is the pre-fill for when they do.
+    test("an unconfigured option selects nothing, because it is off by default", () => {
+
+      const built = buildHintsDevice();
+
+      device = built.device;
+
+      assert.deepEqual(device.getFeatureList("Motion.OccupancySensor", DOMAIN), [], "an option nobody enabled resolves through the engine as disabled");
+    });
+
+    test("an option enabled with no stored value resolves the registered default", () => {
+
+      const built = buildHintsDevice({ userOptions: ["Enable.Motion.OccupancySensor"] });
+
+      device = built.device;
+
+      assert.deepEqual(device.getFeatureList("Motion.OccupancySensor", DOMAIN), [ "face", "person" ], "a bare enable keeps the meaning it has always had");
+    });
+
+    test("an explicit empty payload resolves the empty selection rather than the default", () => {
+
+      const built = buildHintsDevice({ userOptions: ["Enable.Motion.OccupancySensor="] });
+
+      device = built.device;
+
+      assert.deepEqual(device.getFeatureList("Motion.OccupancySensor", DOMAIN), [], "the user emptied the selection, so nothing is selected");
+    });
+
+    test("a stored value matches the domain without regard to casing and answers in the domain's spelling", () => {
+
+      const built = buildHintsDevice({ userOptions: ["Enable.Motion.OccupancySensor=PERSON,Vehicle"] });
+
+      device = built.device;
+
+      assert.deepEqual(device.getFeatureList("Motion.OccupancySensor", DOMAIN), [ "person", "vehicle" ], "both entries match and come back in the domain's casing");
+    });
+
+    test("a stored value the domain does not carry drops rather than falling back", () => {
+
+      const built = buildHintsDevice({ userOptions: ["Enable.Motion.OccupancySensor=package"] });
+
+      device = built.device;
+
+      assert.deepEqual(device.getFeatureList("Motion.OccupancySensor", DOMAIN), [], "an unoffered value selects nothing, and the default does not stand in for it");
+    });
+
+    /* The overlay branch, asserted with a SCOPE-DIVERGENT fixture written in the retired per-type grammar. The controller subtracts
+     * face and the camera adds vehicle, so the overlay's answer and the engine's
+     * post-translation reading of the same configuration genuinely differ - a rewrite composed without topology reads each scope against the global level alone. A
+     * wrapper that quietly fell through to the engine's reading would answer the camera's own composition and fail this row; a single-scope fixture resolves the same
+     * way down either path and could not tell them apart.
+     */
+    test("the overlay answers a controller-plus-device retired composition, where the engine's own reading differs", () => {
+
+      const built = buildHintsDevice({ userOptions: [ "Enable.Motion.OccupancySensor." + CONTROLLER_MAC, "Disable.Motion.OccupancySensor.Face." + CONTROLLER_MAC,
+        "Enable.Motion.OccupancySensor.Vehicle." + SENSOR_MAC ] });
+
+      device = built.device;
+
+      assert.deepEqual(device.getFeatureList("Motion.OccupancySensor", DOMAIN), [ "person", "vehicle" ],
+        "the overlay composes the controller's subtraction with the device's addition");
+      assert.equal(device.getFeatureValue("Motion.OccupancySensor"), "person",
+        "the engine's own post-translation reading of the same configuration inherits the controller's composition alone, missing the camera's own addition - which " +
+        "is what makes this row tell the two paths apart");
+    });
+
+    /* The overlay's empty answer, asserted with a fixture in the same retired per-type grammar, where the engine's own reading selects something. The controller
+     * enables the option and subtracts face, and the device subtracts person, so the overlay composes the empty selection while the engine's post-translation reading
+     * inherits the controller's composition alone and answers person. A wrapper that fell through to the engine on an empty overlay answer would select person here
+     * and fail this row.
+     */
+    test("an overlaid empty selection stays empty, where the engine's own reading selects something", () => {
+
+      const built = buildHintsDevice({ userOptions: [ "Enable.Motion.OccupancySensor." + CONTROLLER_MAC, "Disable.Motion.OccupancySensor.Face." + CONTROLLER_MAC,
+        "Disable.Motion.OccupancySensor.Person." + SENSOR_MAC ] });
+
+      device = built.device;
+
+      assert.deepEqual(device.getFeatureList("Motion.OccupancySensor", DOMAIN), [],
+        "the overlay composes the device's subtraction over the controller's, leaving nothing selected");
+      assert.equal(device.getFeatureValue("Motion.OccupancySensor"), "person",
+        "the engine's own post-translation reading inherits the controller's composition alone, which is what tells the kept empty selection from a fallback");
     });
   });
 });

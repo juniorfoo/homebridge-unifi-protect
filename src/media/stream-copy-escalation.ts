@@ -156,6 +156,7 @@ export async function replaceFailedCopyWithTranscode(input: CopyEscalationReplac
     input.log.warn("H.264 copy path failed; escalating to transcode: %s.", input.transcodeReason);
 
     let channelProfile = rebuild.channelProfile;
+    // copy-time argv below is RTSP-only; TSB escalation rebuilds in spawnLiveVideo (stream.ts).
     let ffmpegArgsThroughVideoMap = rebuild.ffmpegArgsThroughVideoMap;
     let transcodeTargetBitrate = rebuild.transcodeTargetBitrate;
 

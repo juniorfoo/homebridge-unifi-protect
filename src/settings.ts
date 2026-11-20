@@ -8,13 +8,6 @@ export const PLUGIN_NAME = "homebridge-unifi-protect";
 // The platform the plugin creates.
 export const PLATFORM_NAME = "UniFi Protect";
 
-// Maximum number of consecutive authentication failures tolerated while establishing the initial connection before we stop retrying. A controller that is still sorting
-// out its own authentication state at startup recovers within this budget, while genuinely-incorrect credentials fail fast instead of looping forever. Any non-
-// authentication fault (network, transient) resets the budget, so a slow-to-appear controller is retried without bound until it answers. The unifi-protect client owns
-// the periodic device refresh through its StateStore refresh failsafe. The plugin's own connect() method orchestrates the initial connection's retry and backoff through
-// createConnectRetryPolicy and the homebridge-plugin-utils retry() utility, using this constant to bound the authentication-failure budget.
-export const PROTECT_AUTH_FAILURE_LIMIT = 3;
-
 // Default delay, in seconds, before removing Protect devices that no longer exist.
 export const PROTECT_DEVICE_REMOVAL_DELAY_INTERVAL = 60;
 
@@ -27,6 +20,10 @@ export const PROTECT_DOORBELL_CHIME_DURATION_DIGITAL = 1000;
 // Default duration, in milliseconds, to wait before allowing another trigger of the buzzer or speaker on the chime.
 export const PROTECT_DOORBELL_CHIME_SPEAKER_DURATION = 3500;
 
+// Suggested ring-suppression window, in seconds, pre-filled when a user enables the doorbell ring delay option. The option itself defaults off, so a configuration that
+// never enables it keeps today's behavior of delivering every ring event as it arrives.
+export const PROTECT_DOORBELL_RING_DELAY = 15;
+
 // Default duration, in milliseconds, of the trigger switch for a Protect doorbell, primarily for automation purposes.
 export const PROTECT_DOORBELL_TRIGGER_DURATION = 5000;
 
@@ -38,6 +35,22 @@ export const PROTECT_FFMPEG_AUDIO_FILTER_HIGHPASS = 150;
 
 // FFmpeg lowpass audio filter defaults - this setting attenuates (eliminates) frequencies above the value.
 export const PROTECT_FFMPEG_AUDIO_FILTER_LOWPASS = 9000;
+
+// Delay, in milliseconds, before a deferred write reflects a characteristic's true state back to HomeKit after a set handler returns. It only has to clear HAP's own
+// write of the requested value, so it stays short enough that the correction reads as part of the tap.
+export const PROTECT_HOMEKIT_REFLECT_DELAY = 50;
+
+// Ceiling, in bytes, on the probesize a camera's self-tuning will ever elevate to. This sits far above any probesize FFmpeg has needed in practice, so it bounds the
+// repeated doubling without meaningfully limiting our ability to recover from a difficult stream.
+export const PROTECT_PROBESIZE_OVERRIDE_MAX = 5000000;
+
+// Number of probesize adjustments, over the life of a camera's streaming delegate, after which the elevated probesize stays in place for good. Enough attempts to tell
+// a one-off hiccup apart from a persistently flaky stream, before we stop paying the cost of resetting the override on every attempt.
+export const PROTECT_PROBESIZE_OVERRIDE_PERMANENT_THRESHOLD = 10;
+
+// Delay, in milliseconds, before a temporary probesize override clears itself back to the camera's baseline - long enough for a transient stream irregularity to have
+// passed, so the next stream attempt is not still paying the elevated probesize's startup latency for a problem that is over.
+export const PROTECT_PROBESIZE_OVERRIDE_RESET_MS = 1000 * 60 * 10;
 
 // Protect's native I-frame interval can vary, but the livestream API seems to default to 5 seconds at most, though it depends on camera type and stream quality selected.
 export const PROTECT_LIVESTREAM_API_IDR_INTERVAL = 5;
@@ -56,6 +69,12 @@ export const PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_MS = 0;
 // detection floors at max(urgency, 2000ms), so 2000ms holds idle detection exactly at the established 2-second stall window - a larger value would loosen idle
 // stall detection past that window.
 export const PROTECT_LIVESTREAM_IDLE_TOLERANCE_MS = 2000;
+
+// How long a live view waits for its livestream to deliver video, in milliseconds, measured from HomeKit's start request. HAP answers a start request we have not
+// answered within nine seconds with a timeout of its own, so we give up a second ahead of it and answer HomeKit with an error ourselves...the margin covers the
+// teardown and the answer on a slow host, while the window leaves generous room for a slow network or a busy controller. A healthy livestream delivers its first video
+// well inside it.
+export const PROTECT_LIVE_VIEW_START_DEADLINE_MS = 8000;
 
 // Shadow reserve-depth urgency telemetry parameters for HKSV recovery. These constants are NOT a live recovery policy: they exist only so the telemetry
 // teardown log can report, side by side with the shipped fixed urgency, what a reserve-depth-adaptive urgency would have declared given the reserve depth the
@@ -82,11 +101,21 @@ export const PROTECT_HKSV_SHADOW_FLOOR_MS = PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_
 export const PROTECT_TIMESHIFT_BUFFER_MAXDURATION = PROTECT_LIVESTREAM_API_IDR_INTERVAL * 1000 * 2;
 
 // The channel-selection target for a pixel-constrained hardware encoder (such as a Raspberry Pi): the substrate channel policy picks the highest-quality channel at or
-// below this on such a host. Deliberately not named with "RESOLUTION" - in this file that word denotes the buffer's time-granularity, not a pixel dimension.
+// below this by pixel count on such a host. Deliberately not named with "RESOLUTION" - in this file that word denotes the buffer's time-granularity, not a pixel
+// dimension.
 export const PROTECT_TIMESHIFT_CONSTRAINED_HOST_TARGET = { height: 1080, width: 1920 };
+
+// The richest source we ever ask a camera for when we are hunting a maximum-quality channel rather than one matched to a requested size. Shared by the transcode
+// dimension bias (a hardware encoder performs better fed a high-bitrate source) and the high-resolution snapshot path, so both hunt against the same ceiling.
+export const PROTECT_MAX_SOURCE_HEIGHT = 2160;
+export const PROTECT_MAX_SOURCE_WIDTH = 3840;
 
 // Default port to use to publish an M3U playlist for use in other apps that can consume one to make camera livestreams available, such as Channels DVR.
 export const PROTECT_M3U_PLAYLIST_PORT = 10110;
+
+// The oldest major version of UniFi Protect the plugin supports. A controller below it is refused at connect, and there is no upper limit, so a later major version needs
+// no change here.
+export const PROTECT_MINIMUM_MAJOR_VERSION = 7;
 
 // Default duration, in seconds, of motion events. Setting this too low will potentially cause a lot of notification spam.
 export const PROTECT_MOTION_DURATION = 10;
@@ -115,10 +144,6 @@ export const PROTECT_NVR_REBOOT_INTERVAL = 6;
 // Minimum interval, in hours, allowed for scheduled NVR reboots.
 export const PROTECT_NVR_REBOOT_MIN_INTERVAL = 1;
 
-// Settle delay, in milliseconds, before a globally-disabled controller unregisters its cached accessories. A named thirty-second settle window gives all the
-// accessories a chance to finish loading at startup before we tear them down.
-export const PROTECT_NVR_CONTROLLER_DISABLED_SETTLE_DELAY = 30000;
-
 // Grace period, in milliseconds, to confirm a reboot command actually took effect. A genuine reboot drops the controller's realtime connection within seconds, so 60 s
 // is generous headroom over the real drop latency yet far below the recovery track's first probe. This is a "did the command take effect" latency, NOT a recovery
 // deadline: if, after this grace, the connection is still perfectly healthy, the controller never restarted (a silent no-op accept) and we resume normal monitoring.
@@ -128,13 +153,17 @@ export const PROTECT_NVR_REBOOT_CONFIRM_GRACE_MS = 60000;
 // reboot fires regardless of in-flight recordings - we cannot let an open-ended series of HKSV events postpone a controller reboot indefinitely.
 export const PROTECT_NVR_REBOOT_DEFERRAL_MAX = 15 * 60;
 
-// Window, in milliseconds, after the plugin observes a controller reboot within which a per-camera livestream interruption is treated as that reboot's tail -
-// quieted to debug, since a reboot blips every camera and is already narrated once at the controller level - rather than a genuine single-camera drop that
-// warns. Measured from our OWN observation of the reboot (the library's jitter-thresholded `controllerRebooted` event), not the controller's self-reported boot
-// time. The live trace showed roughly twelve seconds from the observed reboot to the camera's re-establishment edge, so sixty seconds covers slower
-// re-establishment while keeping the suppression window tight (the accepted false-negative: a genuinely dead camera's "interrupted" warn is held for this
-// window after a reboot, which is exactly when a camera most often fails to return; a tight window minimizes that, and a dead camera is surfaced elsewhere
-// through reachability and the HKSV deferred-offline warn).
+// Cadence, in milliseconds, at which a deferred or failed scheduled reboot re-checks whether it can proceed. It paces the chain the ceiling above bounds: each check
+// either finds the recordings finished and reboots, or defers again until that ceiling elapses. The initial-delay floor happens to share this value but is a different
+// concept - the settling room a freshly-connected plugin gives a long-up controller - so it stays inline with the arithmetic that applies it.
+export const PROTECT_NVR_REBOOT_CHECK_INTERVAL = 60000;
+
+// Window, in milliseconds, after the plugin observes a controller reboot within which the reboot's after-effects are treated as that reboot's settling tail rather than
+// as anything wrong with an individual camera. It carries both halves of that idea: a disruption inside the window is expected, so it stays quiet instead of warning,
+// and a camera still away when the window expires has stopped being explainable by the reboot and is the exception worth telling the user about. Measured from our OWN
+// observation of the reboot (the library's jitter-thresholded `controllerRebooted` event), not the controller's self-reported boot time. The live trace showed roughly
+// twelve seconds from the observed reboot to the camera's re-establishment edge, so sixty seconds covers slower re-establishment while keeping the window tight - which
+// matters in both directions, since the same window decides how long a genuine single-camera drop is held quiet and how long a camera has to come back before we say so.
 export const PROTECT_NVR_REBOOT_RECENCY_MS = 60000;
 
 // Minimum duration, in milliseconds, that the controller must be continuously available and healthy before the plugin will perform any destructive device
@@ -144,3 +173,7 @@ export const PROTECT_NVR_REMOVAL_STABILITY_WINDOW = 600000;
 
 // Bitrate, in kilobits per second, to use when transcoding to high-latency clients.
 export const PROTECT_TRANSCODE_HIGH_LATENCY_BITRATE = 1000;
+
+// The marker for an encode running on the host's hardware encoder, the lightning bolt in its emoji presentation. It follows the HKSV acknowledgment's label and opens
+// the streaming request line when their encode runs on that encoder.
+export const HARDWARE_TRANSCODE_MARKER = "\u{26A1}\u{FE0F}";

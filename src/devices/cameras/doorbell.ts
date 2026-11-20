@@ -2,20 +2,22 @@
  *
  * doorbell.ts: Doorbell capability for UniFi Protect.
  */
-import type { AcquireServiceTarget, HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import type { Camera, DeepPartial, ProtectCameraConfig, ProtectCameraLcdMessageConfig } from "unifi-protect";
-import type { CharacteristicValue, HAP, Service, WithUUID } from "homebridge";
+import type { CharacteristicValue, HAP, Service } from "homebridge";
+import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import { PACKAGE_CAMERA_NAME_SUFFIX, ProtectReservedNames, packageCameraId } from "../../types.ts";
 import { PLATFORM_NAME, PLUGIN_NAME, PROTECT_DOORBELL_CHIME_DURATION_DIGITAL } from "../../settings.ts";
 import type { ProtectAccessory, ProtectAccessoryContext, WithoutIdentity } from "../../types.ts";
-import { acquireService, composeSignals, sanitizeName, toStartCase, validService } from "homebridge-plugin-utils";
-import { guardedPublish, mqttTopic } from "../../mqtt.ts";
-import { ProtectBase } from "../device-base.ts";
+import { chimeRingFor, chimeVolumeFor } from "./chime-volume.ts";
+import { mqttTopic, sanitizeName, toStartCase } from "homebridge-plugin-utils";
 import type { ProtectCamera } from "./camera.ts";
 import type { ProtectCameraPackage } from "./camera-package.ts";
+import { ProtectDeviceCapability } from "../device-capability.ts";
 import type { ProtectNvr } from "../../nvr/nvr.ts";
-import { chimeVolumeFor } from "./chime-volume.ts";
-import { deviceSelectors } from "unifi-protect";
+import { configured } from "../device-base.ts";
+import { isFeatureFlagsDrain } from "./capability-reconcile-policy.ts";
+import { isolateAccessoryChange } from "../../nvr/nvr-accessory-change.ts";
+import { mqttTopics } from "../../mqtt.ts";
 
 // A doorbell message entry.
 interface MessageInterface {
@@ -65,43 +67,31 @@ export function effectiveLcdMessage(options: { lcdMessage: DeepPartial<ProtectCa
   return lcdMessage;
 }
 
-/* The doorbell capability composed onto a ProtectCamera. It extends ProtectBase - the shared observe / MQTT / command spine - rather than ProtectCamera, because
- * doorbell-ness is temporally dynamic capability state, not a static identity: the camera the controller late-flips to a doorbell stays the same instance, and this
- * capability attaches to it live. The capability owns the doorbell services (LCD message switches, physical chimes, the chime-volume lightbulb, the auth sensor), the
- * read-through settings getters, the doorbell observers, the doorbell MQTT topics, and the package-camera lifecycle. The camera-coupling is localized to a
- * private block of delegating accessors below, so each doorbell body resolves its this.ufp / this.accessory / this.hasFeature reads through the camera. The capability
- * holds its own composed AbortController so a future detach unwinds exactly its observers and MQTT registrations, the owner-lifetime idiom one level up.
+/* The doorbell capability composed onto a ProtectCamera. It extends ProtectDeviceCapability - the composed-capability contract over the shared observe / MQTT / command
+ * spine - rather than ProtectCamera, because doorbell-ness is temporally dynamic capability state, not a static identity: the camera the controller late-flips to a
+ * doorbell stays the same instance, and this capability attaches to it live. The capability owns the doorbell services (LCD message switches, physical chimes, the
+ * chime-volume lightbulb, the auth sensor), the read-through settings getters, the doorbell observers, the doorbell MQTT topics, and the package-camera lifecycle. Of the
+ * contract's detachability policies it holds both: the capability itself is promotion-only, while the package camera it owns follows the
+ * graced-cycle child-detach checklist, because a package camera genuinely comes and goes.
  */
-export class DoorbellCapability extends ProtectBase {
+export class DoorbellCapability extends ProtectDeviceCapability<ProtectCamera> {
 
-  readonly #controller = new AbortController();
-  readonly camera: ProtectCamera;
   readonly #device: Camera;
   private messageSwitches = new Map<string, MessageSwitchInterface>();
-
-  // The self-re-syncing expiry timer for the active LCD message. The controller signals a message's expiry by patching lcdMessage, an empty-object patch the store
-  // cannot observe, so the capability schedules its own re-sync at the message's resetAt deadline. Owned outright here and cleared in cleanup(), where the capability's
-  // whole lifecycle ends - the state lives exactly where its owner's teardown runs, so demotion (which has no detach) needs no separate handling.
-  #lcdMessageExpiryTimer: Nullable<NodeJS.Timeout> = null;
   public packageCamera: Nullable<ProtectCameraPackage> = null;
-  readonly #signal: AbortSignal;
 
   // Construct the capability against its owning camera. The camera passes itself, its own live projection handle, and its protected per-accessory signal from inside
-  // its own class body, so no visibility widening is needed. The capability's signal composes its own controller with the camera's, so aborting either tears the
-  // capability down.
-  constructor(nvr: ProtectNvr, init: { camera: ProtectCamera; device: Camera; signal: AbortSignal }) {
+  // its own class body, so no visibility widening is needed.
+  constructor(nvr: ProtectNvr, init: { device: Camera; host: ProtectCamera; signal: AbortSignal }) {
 
-    super(nvr);
+    super(nvr, { host: init.host, signal: init.signal });
 
-    this.camera = init.camera;
     this.#device = init.device;
-    this.#signal = composeSignals(this.#controller.signal, init.signal);
   }
 
-  /* The delegating accessors that localize the camera-coupling to one block. Each doorbell body reads this.ufp / this.accessory / this.hasFeature and the rest, which
-   * ProtectBase does not provide, so routing those reads through these private accessors over the camera keeps the coupling in one place. The acquireService /
-   * validService wrappers are thin re-bindings to the homebridge-plugin-utils free functions over the camera's accessory (the same homebridge-plugin-utils SSOT the
-   * camera's own wrappers delegate to), not logic duplication.
+  /* The capability-held projection handle and the live-state view it serves. Every other device-level read a doorbell body performs - the accessory, the accessory name,
+   * the feature-option scope, the service wrappers, the MQTT scope, the wake attribution - is inherited from the contract. What stays here is the one piece a capability
+   * genuinely owns rather than borrows: each capability holds and types its own projection.
    */
 
   // The owning camera projection's live STATE, narrowed to drop device identity (id/mac/modelKey) - that immutable identity flows through the dedicated accessors, never
@@ -109,85 +99,6 @@ export class DoorbellCapability extends ProtectBase {
   private get ufp(): Readonly<WithoutIdentity<ProtectCameraConfig>> {
 
     return this.#device.config;
-  }
-
-  // The owning camera's accessory.
-  private get accessory(): ProtectAccessory {
-
-    return this.camera.accessory;
-  }
-
-  // The owning camera's accessory name.
-  private get accessoryName(): string {
-
-    return this.camera.accessoryName;
-  }
-
-  // Feature-option reads delegate to the camera, which scopes against the camera MAC and the controller MAC.
-  private hasFeature(option: string): boolean {
-
-    return this.camera.hasFeature(option);
-  }
-
-  private getFeatureNumber(option: string): Nullable<number | undefined> {
-
-    return this.camera.getFeatureNumber(option);
-  }
-
-  // Reserved-name check delegates to the camera's public helper.
-  private isReservedName(name?: string): boolean {
-
-    return this.camera.isReservedName(name);
-  }
-
-  // Acquire a service on the camera's accessory, a thin re-binding to the homebridge-plugin-utils free function (the SSOT the camera's own wrapper also delegates to).
-  private acquireService(serviceType: AcquireServiceTarget, name = this.accessoryName, subtype?: string, onServiceCreate?: (svc: Service) => void): Nullable<Service> {
-
-    return acquireService(this.accessory, serviceType, name, subtype, onServiceCreate);
-  }
-
-  // Validate a service on the camera's accessory, the same thin re-binding to the homebridge-plugin-utils free function. The validate argument accepts either a plain
-  // boolean or a presence-aware predicate, mirroring the free function: the predicate receives the service's current presence so a gate can keep an already-present
-  // service while refusing to create a new one.
-  private validService(serviceType: WithUUID<typeof Service>, validate: boolean | ((hasService: boolean) => boolean), subtype?: string): boolean {
-
-    return validService(this.accessory, serviceType, validate, subtype);
-  }
-
-  // The seam overrides, each varying exactly what ProtectBase's shared spine reads by leaf.
-
-  // The log prefix and diagnostics name: delegate to the camera's name. The camera's name getter resolves to the live controller projection name, so log prefixes track
-  // the controller's current name for the device. NOT accessoryName (the cached HomeKit Name), which would diverge.
-  public override get name(): string {
-
-    return this.camera.name;
-  }
-
-  // The owner-lifetime signal scoping the capability's observers and MQTT registrations: the composed signal (the capability's own controller plus the camera's), so a
-  // capability cleanup or a camera teardown unwinds exactly the capability's loops and releases exactly its MQTT handlers.
-  protected override get observeSignal(): AbortSignal {
-
-    return this.#signal;
-  }
-
-  // The MQTT topic scope: the camera's MAC, so the doorbell topics (chime, message) ride the same wire scope as the camera.
-  protected override get mqttId(): string {
-
-    return this.camera.mac;
-  }
-
-  // Whether the backing camera record is present, delegated to the owning camera (the capability extends ProtectBase, not ProtectDevice, so it has no record of its own).
-  // This drives the inherited observeState gate, so the doorbell observers no-op during the parent's removal grace exactly as the camera's own do.
-  protected override get recordPresent(): boolean {
-
-    return this.camera.recordPresent;
-  }
-
-  // Wake attribution: the capability has no accessory identity of its own, so it delegates to the camera's single publishObserverWake seam, keeping one publisher keyed
-  // on the camera's accessory UUID. The doorbell.* keys remain diagnostics-visible under the camera's accessory.
-  protected override onObserverWake(key: string): void {
-
-    this.camera.publishObserverWake(key);
   }
 
   /* The doorbell settings below are live read-through getters rather than stored fields, deliberately. Deriving each setting on read from its single source of truth -
@@ -226,16 +137,16 @@ export class DoorbellCapability extends ProtectBase {
     return this.#device.peek()?.chimeDuration ?? 0;
   }
 
-  // Configure the doorbell capability for HomeKit. The configure order is: the package camera, the Doorbell service (through the camera's seam, at the package-to-service
-  // point), the auth sensor, the LCD messages, the physical chimes, the chime volume, then the MQTT topics and the observers. The Doorbell service is stood up
-  // through the camera's configureDoorbellService seam here, so the camera does not separately call it on attach.
-  public configure(): void {
+  // Configure the doorbell capability for HomeKit. The configure order is: the package camera, the Doorbell service (through the camera's own configureDoorbellService
+  // call, at the package-to-service point), the auth sensor, the LCD messages, the physical chimes, the chime volume, then the MQTT topics and the observers. The
+  // Doorbell service is stood up through the camera's configureDoorbellService call here, so the camera does not separately call it on attach.
+  public override configure(): void {
 
     // Configure our package camera, if we have one.
     this.configurePackageCamera();
 
     // Ensure the camera's Doorbell service exists and is primary.
-    this.camera.configureDoorbellService();
+    this.host.configureDoorbellService();
 
     // Configure the authentication sensor, if enabled.
     this.configureAuthSensor();
@@ -249,17 +160,18 @@ export class DoorbellCapability extends ProtectBase {
     // Configure volume control, if enabled.
     this.configureProtectChimeLightbulb();
 
-    // Configure the doorbell MQTT topics (chime and message get/set). These ride the capability's observeSignal through the inherited subscribe wrappers; the camera
-    // registers its own MQTT separately, so there is no super-MQTT to resolve here.
+    // Configure the doorbell MQTT topics (chime and message get/set). These go through the inherited subscribe wrappers on the capability's observeSignal, and each is
+    // registered only while its feature stands; the camera registers its own MQTT separately, so there is no super-MQTT to resolve here.
     this.configureMqtt();
 
     // Spawn the doorbell observers on the capability's own signal.
     this.spawnObservers();
   }
 
-  // Cleanup the capability: tear down the package camera first, then abort the capability's own controller, which releases its observers and exactly its MQTT
-  // handlers on the shared parent-MAC tuple.
-  public cleanup(): void {
+  // Cleanup the capability: tear down the owned package camera first, then let the contract's cleanup abort this capability's controller, which releases its observers,
+  // exactly its MQTT handlers on the shared parent-MAC tuple, and its timers together. The message expiry timer needs no explicit clear because it lives in the inherited
+  // registry, which that same abort drains.
+  public override cleanup(): void {
 
     if(this.packageCamera) {
 
@@ -267,15 +179,7 @@ export class DoorbellCapability extends ProtectBase {
       this.packageCamera = null;
     }
 
-    // Clear the message expiry timer alongside the controller abort - the capability's whole lifecycle ends here, so this timer must not fire against a torn-down
-    // capability.
-    if(this.#lcdMessageExpiryTimer) {
-
-      clearTimeout(this.#lcdMessageExpiryTimer);
-      this.#lcdMessageExpiryTimer = null;
-    }
-
-    this.#controller.abort();
+    super.cleanup();
   }
 
   // Refresh the doorbell's physical-chime switch states. Composed by the camera's updateDevice, which calls this when a capability is attached.
@@ -289,7 +193,8 @@ export class DoorbellCapability extends ProtectBase {
   // motion are firehose occurrences the router handles, not observed here.
   private spawnObservers(): void {
 
-    const cam = deviceSelectors.camera.byId(this.#device.id);
+    const cam = this.nvr.client.state.selectors.camera.byId(this.#device.id);
+    const chimes = this.nvr.client.state.selectors.chime.all;
     const id = this.#device.id;
 
     // Reflect the controller's current LCD message across the doorbell's message switches, re-deriving expiry each time the message slice changes.
@@ -308,8 +213,11 @@ export class DoorbellCapability extends ProtectBase {
     // the volume Lightbulb. The selector returns the computed mean volume across the doorbell's assigned chimes, so the store's value dedup wakes this only on a real
     // ring-volume change, not on every unrelated chime patch, and the push keeps the volume Lightbulb consistent with the onGet. The id is hoisted to the plain string
     // here, alongside cam, because a selector runs inside the store's dispatch, where a projection read against a removed record throws.
-    this.observeState({ key: "doorbell.chimeVolume", selector: state => chimeVolumeFor(deviceSelectors.chime.all(state), id), title: "the chime volume" },
-      () => this.updateChimeVolume());
+    this.observeState({ key: "doorbell.chimeVolume", selector: state => chimeVolumeFor(chimes(state), id), title: "the chime volume" }, () => {
+
+      this.updateChimeVolume();
+      this.publishChimeVolumeState();
+    });
   }
 
   // Configure our access to the doorbell LCD screen.
@@ -321,7 +229,7 @@ export class DoorbellCapability extends ProtectBase {
       return false;
     }
 
-    // Walk the consolidated list of messages from the doorbell and the user's configuration, registering a switch in HomeKit for each.
+    // Walk the doorbell's saved messages from the controller, registering a switch in HomeKit for each.
     for(const entry of this.getMessages()) {
 
       // Truncate anything longer than the character limit that the doorbell will accept.
@@ -347,15 +255,7 @@ export class DoorbellCapability extends ProtectBase {
       this.log.info("Enabled doorbell message switch%s: %s.", entry.duration ? " (" + (entry.duration / 1000).toString() + " seconds)" : "", entry.text);
 
       // Acquire the service. Each message cannot exceed 30 characters, but given that HomeKit allows for strings to be up to 64 characters long, this should be fine.
-      const service = this.acquireService(this.hap.Service.Switch, entry.text, switchIndex);
-
-      // Fail gracefully.
-      if(!service) {
-
-        this.log.error("Unable to add doorbell message switch: %s.", entry.text);
-
-        return false;
-      }
+      const { service } = this.acquireService({ name: entry.text, serviceType: this.hap.Service.Switch, subtype: switchIndex });
 
       const duration = "duration" in entry ? entry.duration : this.defaultMessageDuration;
 
@@ -363,7 +263,9 @@ export class DoorbellCapability extends ProtectBase {
       this.messageSwitches.set(switchIndex, { duration: duration, service: service, state: false, text: entry.text, type: entry.type });
 
       // Configure the message switch.
-      service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue) => {
+      this.answerHeld(service, this.hap.Characteristic.On);
+
+      service.getCharacteristic(this.hap.Characteristic.On).onSet(this.answering(async (value: CharacteristicValue) => {
 
         // Lookup the message switch.
         const messageSwitch = this.messageSwitches.get(switchIndex);
@@ -375,8 +277,9 @@ export class DoorbellCapability extends ProtectBase {
         }
 
         // Set the message and sync our states.
-        await this.setMessage((value === true) ? { duration: messageSwitch.duration, text: messageSwitch.text, type: messageSwitch.type } : { resetAt: Date.now() });
-      });
+        await this.setMessage((value === true) ? { duration: messageSwitch.duration, text: messageSwitch.text, type: messageSwitch.type } :
+          { resetAt: this.platform.clock.now() });
+      }));
     }
 
     // Synchronize the message switch state with the controller's current LCD message, arming the expiry timer if the current message is still active. On a restart after
@@ -404,9 +307,22 @@ export class DoorbellCapability extends ProtectBase {
       return true;
     }
 
+    /* The whole add runs through the shared isolation, the registration included, because a bridge already holding as many accessories as HomeKit allows refuses
+     * another with a throw. Every caller is a pass that a throw would cost far more than the package camera: this doorbell's own configure, and with it the parent
+     * camera's add, the package camera observer's loop, and the stability sweep's timer. The package camera is held only once its add returns, so a failed add leaves
+     * it null, and the next change to the package camera flag or the next stability sweep retries it.
+     */
+    this.packageCamera = isolateAccessoryChange({ act: "add", change: () => this.#addPackageCamera(), log: this.log, name: "the package camera" });
+
+    return this.packageCamera !== null;
+  }
+
+  // Find or create the package camera's accessory, registering one it creates, and stand the package camera up on it.
+  #addPackageCamera(): ProtectCameraPackage {
+
     // Generate a UUID for the package camera, seeded by the package camera's identity - the parent's MAC address plus the persistence-critical identity suffix. We derive
     // the id through the shared leaf function rather than the package class, so the capability consumes the package's identity without value-importing its sibling class.
-    // The bare MAC comes from the raw record (present at configure time), not the narrowed live-state projection that no longer carries identity.
+    // The bare MAC comes from the raw record (present at configure time), not the narrowed live-state projection, which carries no identity.
     const uuid = this.hap.uuid.generate(packageCameraId(this.#device.config.mac));
 
     // Let's find it if we've already created it.
@@ -418,7 +334,8 @@ export class DoorbellCapability extends ProtectBase {
       // The camera's MAC address plus the identity suffix gives our UUID seed the guaranteed uniqueness we need.
       packageCameraAccessory = new this.api.platformAccessory<ProtectAccessoryContext>(sanitizeName(this.accessoryName + PACKAGE_CAMERA_NAME_SUFFIX), uuid);
 
-      // Register this accessory with homebridge and add it to the accessory array so we can track it.
+      // Register this accessory with homebridge and add it to the accessory array so we can track it. We mark it as well, so the save that closes this window carries
+      // what the package camera's configure pass below sets up on it.
       if(this.hasFeature("Device.Standalone")) {
 
         this.api.publishExternalAccessories(PLUGIN_NAME, [packageCameraAccessory]);
@@ -428,37 +345,43 @@ export class DoorbellCapability extends ProtectBase {
       }
 
       this.platform.accessories.push(packageCameraAccessory);
-      this.api.updatePlatformAccessories(this.platform.accessories);
+      this.platform.persistence.persist(packageCameraAccessory);
     }
 
     // Now create the package camera accessory through the NVR composition root. The package camera is a HomeKit sub-view of this same physical device, so it shares our
     // live camera projection rather than holding a synthesized config snapshot. It is self-observing: its display name is the parent's name plus the display suffix,
-    // applied through its syncedName seam, and its own name, firmware, and availability observers keep it tracking the shared device live - this capability owns only its
-    // lifecycle (the WHEN, the observers, the sweep triggers), never its construction; only the new lives at the composition root, so no sibling-class value-import.
-    this.packageCamera = this.nvr.createPackageCamera(packageCameraAccessory, this.#device);
-
-    return true;
+    // applied through its homeKitName delegation, and its own name, firmware, and availability observers keep it tracking the shared device live - this capability owns
+    // only its lifecycle (the WHEN, the observers, the sweep triggers), never its construction; only the new lives at the composition root, so no sibling-class
+    // value-import. A package camera whose setup threw is released by configured() rather than left running unowned.
+    return configured(this.nvr.createPackageCamera(packageCameraAccessory, this.#device));
   }
 
-  /* Reconcile the package camera's lifecycle against the controller's live capability flag, idempotently in both directions. The hasPackageCamera observer drives
-   * this on a flag change, and the NVR's stability sweep drives it at every stability return - the sweep is both the construction-time arm (a capability withdrawn
-   * while the plugin was down leaves a cached BRIDGED package accessory that no other removal path can ever reach, since the orphan sweep keys on a mac the package
-   * deliberately lacks and the orphan guard refuses parent-alive packages) and the re-arm (a detach grace dropped by a stability loss, or a fire that failed its
-   * stability re-check, is re-scheduled once the controller settles). STANDALONE EXCLUSION: homebridge never restores external accessories at startup, so a
-   * standalone package ghost after a restart is invisible here - we cannot know one existed, its HomeKit-side pairing cleanup is inherently the user's, and no
-   * speculative guidance is emitted.
+  /* Reconcile the package camera's lifecycle against the controller's live capability flag, as a no-op in both directions when nothing has changed. The
+   * hasPackageCamera observer drives this on a flag change, and the NVR's stability sweep drives it at every stability return - the sweep is both the construction-time
+   * arm (a capability withdrawn while the plugin was down leaves a cached BRIDGED package accessory that no other removal path can ever reach, since the orphan sweep
+   * keys on a mac the package deliberately lacks and the orphan guard refuses parent-alive packages) and the re-arm (a detach grace dropped by a stability loss, or a
+   * fire that failed its stability re-check, is re-scheduled once the controller settles). STANDALONE EXCLUSION: homebridge never restores external accessories at
+   * startup, so a standalone package ghost after a restart is invisible here - we cannot know one existed, its HomeKit-side pairing cleanup is inherently the user's,
+   * and no speculative guidance is emitted.
    */
   public reconcilePackageCamera(): void {
 
-    // The bare MAC comes from the raw record, not the narrowed live-state projection that no longer carries identity.
+    // The bare MAC comes from the raw record, not the narrowed live-state projection, which carries no identity.
     const uuid = this.hap.uuid.generate(packageCameraId(this.#device.config.mac));
 
     // The capability is present: cancel any pending detach grace first (a flap back during the grace window must actually cancel the timer - configurePackageCamera's
     // instance guard would otherwise short-circuit before any cancellation could happen), then bring the package camera into being if it is not already.
     if(this.ufp.featureFlags.hasPackageCamera) {
 
-      this.nvr.cancelDeviceRemovalFor(uuid);
+      this.nvr.removals.cancelFor(uuid);
       this.configurePackageCamera();
+
+      return;
+    }
+
+    // The controller's drain frame reads the package camera absent alongside every other flag, so an all-false block is no reading and schedules nothing. The real
+    // values follow it, and the attach arm above already cancels a grace a genuine withdrawal had pending when they report the package camera again.
+    if(isFeatureFlagsDrain(this.ufp.featureFlags)) {
 
       return;
     }
@@ -471,17 +394,17 @@ export class DoorbellCapability extends ProtectBase {
       return;
     }
 
-    // Schedule the graced, stability-gated detach through the NVR's removal chokepoint. The stillGone predicate must be absence-tolerant: the fire runs on a bare
-    // timer where a throw would crash Homebridge, and the parent projection's config getter throws once the parent record itself has been removed - so we capture the
-    // projection's plain id field at schedule time and re-read the record through the selector, treating an absent parent as gone.
+    // Schedule the graced, stability-gated detach through the NVR's removal chokepoint. The stillGone predicate must be absence-tolerant: the gate reports a throw
+    // from it as a failed removal and detaches nothing, and the parent projection's config getter throws once the parent record itself has been removed - so we
+    // capture the projection's plain id field at schedule time and re-read the record through the selector, treating an absent parent as gone.
     const id = this.#device.id;
 
-    this.nvr.scheduleDeviceRemoval({
+    this.nvr.removals.schedule({
 
       accessory: accessory,
       reason: "The controller no longer reports a package camera on " + this.accessoryName + "; removing its package camera accessory.",
       remove: () => this.detachPackageCamera(),
-      stillGone: () => !deviceSelectors.camera.byId(id)(this.nvr.client.state.snapshot())?.featureFlags.hasPackageCamera
+      stillGone: () => !this.nvr.client.state.selectors.camera.byId(id)(this.nvr.client.state.snapshot())?.featureFlags.hasPackageCamera
     });
   }
 
@@ -510,7 +433,7 @@ export class DoorbellCapability extends ProtectBase {
     // composes from the persisted MAC rather than the publish wrapper, whose topic scope reads the live projection.
     if(this.nvr.events.clearEventTimersForDevice(packageId) && !this.nvr.events.hasInflightMotion(mac)) {
 
-      guardedPublish(this.log, this.nvr.mqtt, mqttTopic(mac, "motion"), "false");
+      this.nvr.mqtt?.publishGuarded(mqttTopic(mac, mqttTopics.motion.topic), "false");
     }
 
     // Tear down the live instance, if any.
@@ -522,10 +445,12 @@ export class DoorbellCapability extends ProtectBase {
       return;
     }
 
-    // Remove the accessory through the shared, presence-guarded tail.
+    // Remove the accessory through the shared, presence-guarded tail. Where it lived is read first, because unregistering a bridged accessory takes it off the bridge.
+    const bridged = accessory._associatedHAPAccessory.bridged;
+
     this.nvr.removeAccessoryFromHomeKit(accessory);
 
-    if(!accessory._associatedHAPAccessory.bridged) {
+    if(!bridged) {
 
       this.log.info("You will need to manually delete the package camera accessory in the Home app to complete the removal.");
     }
@@ -544,38 +469,29 @@ export class DoorbellCapability extends ProtectBase {
 
       // Validate whether we should have this service enabled.
       // If we don't have the physical capabilities or the feature option enabled, disable the switch and we're done.
-      if(!this.validService(this.hap.Service.Switch, this.ufp.featureFlags.hasChime && this.hasFeature("Doorbell.PhysicalChime"), physicalChimeType)) {
+      const { service } = this.validService({ serviceType: this.hap.Service.Switch, subtype: physicalChimeType, suffix: " Physical Chime " + toStartCase(chimeSetting),
+        validate: this.ufp.featureFlags.hasChime && this.hasFeature("Doorbell.PhysicalChime") });
 
-        continue;
-      }
-
-      // Acquire the service.
-      const service = this.acquireService(this.hap.Service.Switch, this.accessoryName + " Physical Chime " + toStartCase(chimeSetting), physicalChimeType);
-
-      // Fail gracefully.
       if(!service) {
-
-        this.log.error("Unable to add physical chime switch: %s.", chimeSetting);
 
         continue;
       }
 
       // Get the current status of the physical chime mode on the doorbell.
-      service.getCharacteristic(this.hap.Characteristic.On).onGet(() => {
+      service.getCharacteristic(this.hap.Characteristic.On).onGet(this.answering(() => {
 
         return this.chimeDuration === this.getPhysicalChimeDuration(physicalChimeType);
-      });
+      }));
 
       // Activate the appropriate physical chime mode on the doorbell.
-      service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue) => {
+      service.getCharacteristic(this.hap.Characteristic.On).onSet(this.answering(async (value: CharacteristicValue) => {
 
         // We only want to do something if we're being activated. Turning off the switch would really be an undefined state given that there are three different settings
         // one can choose from. Instead, we do nothing and leave it to the user to choose what state they really want to set.
         if(!value) {
 
-          // Let HomeKit's optimistic write settle, then re-assert the switches' real state through updateDevice. The 50ms is a cosmetic revert nudge, not a
-          // functional delay.
-          setTimeout(() => this.updateDevice(), 50);
+          // Re-assert the switches' real state through updateDevice.
+          this.reflectAfterSet(() => this.updateDevice());
 
           return;
         }
@@ -602,7 +518,7 @@ export class DoorbellCapability extends ProtectBase {
 
         // Inform the user, and we're done.
         this.log.info("Physical chime type set to %s.", chimeSetting);
-      });
+      }));
 
       // Initialize the physical chime switch state.
       service.updateCharacteristic(this.hap.Characteristic.On, this.chimeDuration === this.getPhysicalChimeDuration(physicalChimeType));
@@ -621,47 +537,31 @@ export class DoorbellCapability extends ProtectBase {
   // Configure the dimmer for HomeKit to control the volume.
   private configureProtectChimeLightbulb(): boolean {
 
+    this.host.announceFeature({ kindLabel: "Protect chime volume controls", label: "Protect chime volume control", option: "Doorbell.Volume.Dimmer" });
+
     // Validate whether we should have this service enabled.
-    if(!this.validService(this.hap.Service.Lightbulb, this.hasFeature("Doorbell.Volume.Dimmer"), ProtectReservedNames.LIGHTBULB_DOORBELL_VOLUME)) {
-
-      return false;
-    }
-
-    // Acquire the service.
-    const service = this.acquireService(this.hap.Service.Lightbulb, this.accessoryName + " Chime Volume", ProtectReservedNames.LIGHTBULB_DOORBELL_VOLUME);
+    const { service } = this.validService({ serviceType: this.hap.Service.Lightbulb, subtype: ProtectReservedNames.LIGHTBULB_DOORBELL_VOLUME, suffix: " Chime Volume",
+      validate: this.hasFeature("Doorbell.Volume.Dimmer") });
 
     if(!service) {
-
-      this.log.error("Unable to add chime volume control.");
 
       return false;
     }
 
     // Turn the chime on or off.
-    service.getCharacteristic(this.hap.Characteristic.On).onGet(() => this.chimeVolume > 0);
+    service.getCharacteristic(this.hap.Characteristic.On).onGet(this.answering(() => this.chimeVolume > 0));
 
-    service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue) => {
-
-      // We really only want to act when the volume is zero. Otherwise, it's handled by the brightness event.
-      if(value) {
-
-        return;
-      }
-
-      await this.setChimeVolume(0);
-    });
+    service.getCharacteristic(this.hap.Characteristic.On).onSet(this.answering(async (value: CharacteristicValue) => this.setChimeVolumeOn(value)));
 
     // Return the volume level of the chime.
-    service.getCharacteristic(this.hap.Characteristic.Brightness).onGet(() => this.chimeVolume);
+    service.getCharacteristic(this.hap.Characteristic.Brightness).onGet(this.answering(() => this.chimeVolume));
 
     // Adjust the volume of the chime by adjusting brightness of the light.
-    service.getCharacteristic(this.hap.Characteristic.Brightness).onSet(async (value: CharacteristicValue) => this.setChimeVolume(value as number));
+    service.getCharacteristic(this.hap.Characteristic.Brightness).onSet(this.answering(async (value: CharacteristicValue) => this.setChimeVolume(value as number)));
 
     // Initialize the chime.
     service.updateCharacteristic(this.hap.Characteristic.On, this.chimeVolume > 0);
     service.updateCharacteristic(this.hap.Characteristic.Brightness, this.chimeVolume);
-
-    this.log.info("Enabling Protect chime volume control.");
 
     return true;
   }
@@ -669,44 +569,79 @@ export class DoorbellCapability extends ProtectBase {
   // Configure the contact sensor to indicate authentication success.
   private configureAuthSensor(): boolean {
 
-    // Validate whether we should have this service enabled.
-    // The authentication contact sensor is disabled by default unless the user enables it. We only make it available if we have at least one of the
-    // fingerprint sensor or the NFC sensor available.
-    if(!this.validService(this.hap.Service.ContactSensor, this.hasFeature("Doorbell.AuthSensor") && (this.ufp.enableNfc || this.ufp.featureFlags.hasFingerprintSensor),
-      ProtectReservedNames.CONTACT_AUTHSENSOR)) {
+    // The authentication contact sensor is disabled by default unless the user enables it. We only make it available if we have at least one of the fingerprint sensor or
+    // the NFC sensor available, so a doorbell with neither says nothing about it.
+    const hasAuthHardware = this.ufp.enableNfc || this.ufp.featureFlags.hasFingerprintSensor;
 
-      return false;
+    if(hasAuthHardware) {
+
+      this.host.announceFeature({ kindLabel: "Protect authentication contact sensors", label: "Protect authentication contact sensor", option: "Doorbell.AuthSensor" });
     }
 
-    // Acquire the service.
-    const service = this.acquireService(this.hap.Service.ContactSensor, this.accessoryName + " Authenticated", ProtectReservedNames.CONTACT_AUTHSENSOR);
+    // Validate whether we should have this service enabled.
+    const { service } = this.validService({ serviceType: this.hap.Service.ContactSensor, subtype: ProtectReservedNames.CONTACT_AUTHSENSOR, suffix: " Authenticated",
+      validate: this.hasFeature("Doorbell.AuthSensor") && hasAuthHardware });
 
     if(!service) {
-
-      this.log.error("Unable to add authentication sensor.");
 
       return false;
     }
 
     // Initialize the authentication contact sensor.
     service.updateCharacteristic(this.hap.Characteristic.ContactSensorState, this.hap.Characteristic.ContactSensorState.CONTACT_DETECTED);
-
-    this.log.info("Enabling Protect authentication contact sensor.");
+    this.answerHeld(service, this.hap.Characteristic.ContactSensorState);
 
     return true;
   }
 
-  // Configure MQTT capabilities for the doorbell: the chime volume and the doorbell message get/set. These ride the capability's observeSignal through the inherited
-  // subscribe wrappers, scoped under the camera's MAC. The camera registers its own MQTT separately, so there is no parent camera-MQTT to resolve here.
+  // Configure MQTT capabilities for the doorbell: the chime volume and the doorbell message get/set. These go through the inherited subscribe wrappers, bound to the
+  // capability's observeSignal and scoped under the camera's MAC. The camera registers its own MQTT separately, so there is no parent camera-MQTT to resolve here.
   private configureMqtt(): boolean {
 
-    // Get and set the chime volume.
-    this.subscribeGet("chime", "chime volume", (): string => {
+    this.configureChimeVolumeMqtt();
+    this.configureMessageMqtt();
+
+    // State the chime volume as the doorbell is set up, since its setup publishes nothing for it. The message switch sync that ran earlier in this configure pass
+    // has already stated a showing message that matches a configured switch, so the current message is stated here only when no switch is on, which covers a message
+    // that matches none and keeps one that does to a single statement.
+    this.publishChimeVolumeState();
+
+    if(![...this.messageSwitches.values()].some(entry => entry.state)) {
+
+      this.publishLcdMessageState();
+    }
+
+    // Restate the chime volume and the current message at the start of every later broker session, through the same methods.
+    this.restateOnConnect(() => {
+
+      this.publishChimeVolumeState();
+      this.publishLcdMessageState();
+    });
+
+    return true;
+  }
+
+  // Whether the chime volume dimmer stands, the condition Doorbell.Volume.Dimmer creates it under. The chime volume's MQTT topic is part of the same capability, so its
+  // get, its set and its publishes all follow this one answer.
+  private get hasVolumeDimmer(): boolean {
+
+    return this.accessory.getServiceById(this.hap.Service.Lightbulb, ProtectReservedNames.LIGHTBULB_DOORBELL_VOLUME) !== undefined;
+  }
+
+  // Get and set the chime volume, only while the volume dimmer stands, because a feature the user has not enabled in HomeKit has no MQTT topic.
+  private configureChimeVolumeMqtt(): void {
+
+    if(!this.hasVolumeDimmer) {
+
+      return;
+    }
+
+    this.subscribeGet(mqttTopics.chime.topic, mqttTopics.chime.label, (): string => {
 
       return this.chimeVolume.toString();
     });
 
-    this.subscribeSet("chime", "chime volume", (value: string) => {
+    this.subscribeSet(mqttTopics.chime.topic, mqttTopics.chime.label, (value: string) => {
 
       const volume = parseInt(value);
 
@@ -716,30 +651,25 @@ export class DoorbellCapability extends ProtectBase {
         return;
       }
 
-      // We explicitly want to trigger our set event handler, which will complete this action.
-      this.accessory.getServiceById(this.hap.Service.Lightbulb, ProtectReservedNames.LIGHTBULB_DOORBELL_VOLUME)
-        ?.setCharacteristic(this.hap.Characteristic.Brightness, volume);
-      this.accessory.getServiceById(this.hap.Service.Lightbulb, ProtectReservedNames.LIGHTBULB_DOORBELL_VOLUME)
-        ?.setCharacteristic(this.hap.Characteristic.On, volume > 0);
+      // The dimmer's own set bodies complete this action, and they run directly rather than through the refusing handlers. Each begins in this turn.
+      const service = this.accessory.getServiceById(this.hap.Service.Lightbulb, ProtectReservedNames.LIGHTBULB_DOORBELL_VOLUME);
+
+      void this.driveSet({ characteristic: this.hap.Characteristic.Brightness, service, set: (level) => this.setChimeVolume(level as number), value: volume });
+      void this.driveSet({ characteristic: this.hap.Characteristic.On, service, set: (on) => this.setChimeVolumeOn(on), value: volume > 0 });
     });
+  }
+
+  // Get and set the doorbell message, only while Doorbell.Messages is on, because a feature the user has not enabled in HomeKit has no MQTT topic. Setting a message
+  // from MQTT is part of that feature, so with it off no MQTT message reaches the doorbell's screen.
+  private configureMessageMqtt(): void {
+
+    if(!this.isMessagesEnabled) {
+
+      return;
+    }
 
     // Get the current message on the doorbell.
-    this.subscribeGet("message", "doorbell message", (): string => {
-
-      // Read the LCD message non-throwing through the live camera record - an absent record (a doorbell lingering in the removal grace) reads as no message - and run it
-      // through the shared expiry predicate, so an expired message reports no message rather than a stale negative duration.
-      const lcdMessage = effectiveLcdMessage({ lcdMessage: this.#device.peek()?.lcdMessage ?? {}, nowMs: Date.now() });
-
-      if(!Object.keys(lcdMessage).length) {
-
-        return "";
-      }
-
-      const doorbellDuration = (typeof lcdMessage.resetAt === "number") ? Math.round((lcdMessage.resetAt - Date.now()) / 1000) : 0;
-
-      // Return the current message.
-      return JSON.stringify({ duration: doorbellDuration, message: lcdMessage.text ?? "" });
-    });
+    this.subscribeGet(mqttTopics.message.topic, mqttTopics.message.label, (): string => this.lcdMessagePayload);
 
     // We support the ability to set the doorbell message like so:
     //
@@ -748,7 +678,7 @@ export class DoorbellCapability extends ProtectBase {
     // If duration is omitted, we assume the default duration.
     // If duration is 0, we assume it's not expiring.
     // If the message is blank, we assume we're resetting the doorbell message.
-    this.subscribeSet("message", "doorbell message", (_value: string, rawValue: string) => {
+    this.subscribeSet(mqttTopics.message.topic, mqttTopics.message.label, (_value: string, rawValue: string) => {
 
       interface mqttMessageJSON {
 
@@ -795,7 +725,7 @@ export class DoorbellCapability extends ProtectBase {
       // No message defined...we assume we're resetting the message.
       if(!inboundPayload.message.length) {
 
-        outboundPayload = { resetAt: Date.now() };
+        outboundPayload = { resetAt: this.platform.clock.now() };
         this.log.info("Received MQTT doorbell message reset.");
       } else {
 
@@ -808,8 +738,40 @@ export class DoorbellCapability extends ProtectBase {
       // Send it to the doorbell and we're done.
       void this.setMessage(outboundPayload);
     });
+  }
 
-    return true;
+  /* The doorbell's current message as its MQTT topic carries it: JSON holding the message text and the seconds remaining before it clears, `0` for a message that
+   * never expires, or the empty string when no message shows. The get answers it and every publish of the topic carries it, so the topic has one payload shape
+   * wherever it is read. The LCD message is read non-throwing through the live camera record, so an absent record (a doorbell lingering in the removal grace) reads as
+   * no message, and through the shared expiry predicate, so an expired message reads as none rather than a stale negative duration.
+   */
+  private get lcdMessagePayload(): string {
+
+    const nowMs = this.platform.clock.now();
+    const lcdMessage = effectiveLcdMessage({ lcdMessage: this.#device.peek()?.lcdMessage ?? {}, nowMs });
+
+    if(!Object.keys(lcdMessage).length) {
+
+      return "";
+    }
+
+    const duration = (typeof lcdMessage.resetAt === "number") ? Math.round((lcdMessage.resetAt - nowMs) / 1000) : 0;
+
+    return JSON.stringify({ duration, message: lcdMessage.text ?? "" });
+  }
+
+  // State the doorbell's current message while the Doorbell.Messages feature is on and a message shows. The topic belongs to the message feature, so a doorbell
+  // without it states nothing, and a doorbell with no message states nothing rather than an empty payload.
+  private publishLcdMessageState(): void {
+
+    const payload = this.lcdMessagePayload;
+
+    if(!this.isMessagesEnabled || !payload) {
+
+      return;
+    }
+
+    this.publish(mqttTopics.message.topic, payload);
   }
 
   // Push the physical-chime switch states from the doorbell's current chime duration, when the doorbell has a chime and the switches are configured. Driven by the
@@ -852,10 +814,10 @@ export class DoorbellCapability extends ProtectBase {
     }
   }
 
-  // Get the list of messages from the doorbell and the user configuration.
+  // Get the list of messages saved on the controller, which is where a doorbell's message set lives.
   private getMessages(): MessageInterface[] {
 
-    // First, we get the controller's doorbell settings, the source for its builtin messages.
+    // The controller's doorbell settings, the source for its saved messages.
     const doorbellSettings = this.nvr.ufp.doorbellSettings;
 
     // Something's not right with the configuration...we're done.
@@ -866,29 +828,13 @@ export class DoorbellCapability extends ProtectBase {
 
     let doorbellMessages: MessageInterface[] = [];
 
-    // Grab any messages that the user has configured.
-    if(this.nvr.config.doorbellMessages) {
-
-      for(const configEntry of this.nvr.config.doorbellMessages) {
-
-        let duration = this.defaultMessageDuration;
-
-        // If we've set a duration, let's honor it. If it's less than zero, use the default duration.
-        if(("duration" in configEntry) && !isNaN(configEntry.duration) && (configEntry.duration >= 0)) {
-
-          duration = configEntry.duration * 1000;
-        }
-
-        // Add it to our list.
-        doorbellMessages.push({ duration: duration, text: configEntry.message, type: "CUSTOM_MESSAGE" });
-      }
-    }
-
     // If we've got messages on the controller, let's configure those, unless the user has disabled that feature.
     if(this.isMessagesFromControllerEnabled) {
 
-      // The controller's allMessages may omit the duration field that MessageInterface declares; the switch-build loop tolerates that with its "duration" in entry
-      // fallback to defaultMessageDuration, which is what makes this cast safe.
+      /* The controller's allMessages may omit the duration field that MessageInterface declares; the switch-build loop tolerates that with its "duration" in entry
+       * fallback to defaultMessageDuration, which is what makes this cast safe. concat rather than a direct assignment because it hands back a fresh array: the
+       * controller's own message array is the library's to own, and a caller that reorders or trims what we return must never reach into it.
+       */
       doorbellMessages = (doorbellSettings.allMessages as MessageInterface[]).concat(doorbellMessages);
     }
 
@@ -905,38 +851,36 @@ export class DoorbellCapability extends ProtectBase {
     for(const switchService of this.accessory.services.filter(service => (service.UUID === this.hap.Service.Switch.UUID) && service.subtype &&
       !this.isReservedName(service.subtype) && !this.messageSwitches.has(service.subtype))) {
 
-      // The message has been deleted on the doorbell - remove it from HomeKit and inform the user about it.
+      // The message has been deleted on the doorbell - remove it from HomeKit, mark the accessory for the next save, and inform the user about it.
       this.log.info("Removing saved doorbell message: %s.", switchService.subtype?.slice(switchService.subtype.indexOf(".") + 1));
-      this.accessory.removeService(switchService);
+      this.host.removeService(switchService);
     }
   }
 
   /* Synchronize the message switches with the controller's current LCD message, re-deriving expiry each time. Invoked by the lcdMessage observer, by the configure-time
    * sync, and by the expiry timer's own callback, so all three read one truth. The live slice is read non-throwing - an absent record (a doorbell in the removal grace)
    * reads as a clear, which is exactly right mid-removal - and passes through the shared expiry predicate, so an expired message blanks the switches while an active one
-   * sets them. We then arm or clear the local expiry timer from the effective payload: the controller signals expiry by patching lcdMessage, but the store cannot
-   * observe an empty-object patch (its structural sharing returns the same record), so the plugin re-synchronizes itself at the resetAt deadline it already knows.
-   * Because the timer's callback re-enters here, an expiry fires as a re-read of live truth: an already-replaced message re-asserts the replacement rather than
-   * blanking, an expired one clears, and a wire clear that landed first makes the re-sync a harmless repeat. The leg is capped at the largest delay a timer expresses
-   * exactly (Node clamps a larger delay to about a millisecond, which would spin a tight refire loop for a beyond-24.8-day message), so the re-entrant re-arm sleeps in
-   * legs until the real deadline.
+   * sets them. We then arm or clear the keyed expiry timer in the capability's own registry from the effective payload: the controller signals expiry by patching
+   * lcdMessage, but the store cannot observe an empty-object patch (its structural sharing returns the same record), so the plugin re-synchronizes itself at the resetAt
+   * deadline it already knows. Because the timer's callback re-enters here, an expiry fires as a re-read of live truth: an already-replaced message re-asserts the
+   * replacement rather than blanking, an expired one clears, and a wire clear that landed first makes the re-sync a harmless repeat. The timer waits the full time
+   * remaining until the deadline, however far off it lies, because the platform's clock carries a delay of any length.
    */
   private syncLcdMessageState(): void {
 
-    const nowMs = Date.now();
+    const nowMs = this.platform.clock.now();
     const effective = effectiveLcdMessage({ lcdMessage: this.#device.peek()?.lcdMessage ?? {}, nowMs });
 
     this.updateLcdSwitch(effective);
 
-    if(this.#lcdMessageExpiryTimer) {
-
-      clearTimeout(this.#lcdMessageExpiryTimer);
-      this.#lcdMessageExpiryTimer = null;
-    }
+    // Clear unconditionally, then arm when the effective message carries a deadline. The registry's own replace-on-register would make the clear redundant on the arming
+    // path, but the clearing path is real: an effective message with no deadline must leave nothing armed. The timer drains structurally through the capability's
+    // composed lifetime, so teardown safety does not depend on this clear.
+    this.timers.clear("lcdMessageExpiry");
 
     if(typeof effective.resetAt === "number") {
 
-      this.#lcdMessageExpiryTimer = setTimeout(() => this.syncLcdMessageState(), Math.min(effective.resetAt - nowMs, 2147483647));
+      this.timers.setTimeout("lcdMessageExpiry", () => this.syncLcdMessageState(), effective.resetAt - nowMs);
     }
   }
 
@@ -984,10 +928,10 @@ export class DoorbellCapability extends ProtectBase {
       entry.service.updateCharacteristic(this.hap.Characteristic.On, true);
 
       this.log.info("Doorbell message set%s: %s.",
-        payload.resetAt !== null ? " (" + Math.round(((payload.resetAt ?? 0) - Date.now()) / 1000).toString() + " seconds)" : "", payload.text);
+        (typeof payload.resetAt === "number") ? " (" + Math.round((payload.resetAt - this.platform.clock.now()) / 1000).toString() + " seconds)" : "", payload.text);
 
-      // Publish to MQTT, if the user has configured it.
-      this.publish("message", JSON.stringify({ duration: entry.duration / 1000, message: entry.text }));
+      // Publish to MQTT, if the user has configured it, in the shape the topic's get answers.
+      this.publish(mqttTopics.message.topic, this.lcdMessagePayload);
     }
   }
 
@@ -997,7 +941,7 @@ export class DoorbellCapability extends ProtectBase {
     // If a duration was given, translate it into the resetAt timestamp Protect expects and drop the duration field, which the controller does not understand.
     if("duration" in payload) {
 
-      payload.resetAt = payload.duration ? Date.now() + payload.duration : null;
+      payload.resetAt = payload.duration ? this.platform.clock.now() + payload.duration : null;
       delete payload.duration;
     }
 
@@ -1005,43 +949,70 @@ export class DoorbellCapability extends ProtectBase {
     return this.runDeviceCommand("set the doorbell message", () => this.#device.update({ lcdMessage: payload }));
   }
 
-  // This doorbell's effective chime volume, read through the live chime projections. We delegate to the shared chimeVolumeFor helper over deviceSelectors.chime.all of
-  // the current snapshot - the identical input the volume observer reduces - so the read-through getter and the reactive push share one definition of "this doorbell's
-  // volume". The catalog's chime.all is always an array post-connect.
+  // This doorbell's effective chime volume, read through the live chime projections. We delegate to the shared chimeVolumeFor helper over
+  // client.state.selectors.chime.all of the current snapshot - the identical input the volume observer reduces - so the read-through getter and the reactive push share
+  // one definition of "this doorbell's volume". The catalog's chime.all is always an array post-connect.
   private get chimeVolume(): number {
 
-    return chimeVolumeFor(deviceSelectors.chime.all(this.nvr.client.state.snapshot()), this.#device.id);
+    return chimeVolumeFor(this.nvr.client.state.selectors.chime.all(this.nvr.client.state.snapshot()), this.#device.id);
+  }
+
+  // Turn the chime volume dimmer on or off, the one body HomeKit's write and the MQTT set share. We really only want to act when the volume is zero. Otherwise, it's
+  // handled by the brightness event.
+  private async setChimeVolumeOn(value: CharacteristicValue): Promise<void> {
+
+    if(value) {
+
+      return;
+    }
+
+    await this.setChimeVolume(0);
   }
 
   private async setChimeVolume(value: number): Promise<void> {
 
-    // Clamp to a non-negative volume.
-    value = Math.max(value, 0);
-
     // A chime can be assigned to multiple doorbells, so update the ring entry for THIS doorbell on every chime that serves it. The controller is the single,
     // immutable source of state, so each update is write-through only: we send the PATCH and let the reducer's stream reflect the change once it arrives. We send a
     // single-entry ringSettings array carrying only the modified ring, matching the controller's expected payload.
-    for(const chime of this.nvr.client.chimes.filter(chime => chime.config.cameraIds.includes(this.#device.id))) {
+    for(const chime of this.nvr.client.chimes) {
 
-      const ring = chime.config.ringSettings.find(setting => setting.cameraId === this.#device.id);
+      const ring = chimeRingFor(chime.config, this.#device.id);
 
       if(!ring) {
 
         continue;
       }
 
-      // eslint-disable-next-line no-await-in-loop
+      // eslint-disable-next-line no-await-in-loop -- The chimes are updated one at a time by intent, and the first failed command ends the loop.
       if(!(await this.runDeviceCommand("set the chime volume", () => chime.update({ ringSettings: [{ ...ring, volume: value }] })))) {
 
         return;
       }
     }
+  }
 
-    this.publish("chime", value.toString());
+  // Publish this doorbell's chime volume, the value its MQTT get answers, when it changed. The controller's reported change is the one publisher, so a volume set here,
+  // in the Protect app, or on a chime shared with another doorbell publishes from the observer once each assigned chime confirms it. The topic belongs to the volume
+  // dimmer, so a doorbell without the Doorbell.Volume.Dimmer feature publishes nothing, and a volume needs a chime that rings for this doorbell, so with none assigned
+  // the 0 the volume reads stands for no setting and publishes nothing either.
+  private publishChimeVolumeState(): void {
+
+    if(!this.hasVolumeDimmer || !this.hasChimeRing) {
+
+      return;
+    }
+
+    this.publishState(mqttTopics.chime.topic, this.chimeVolume.toString());
+  }
+
+  // Whether any chime assigned to this doorbell carries a ring for it, read over the same chime projection the volume reduces and through the same ring lookup.
+  private get hasChimeRing(): boolean {
+
+    return this.nvr.client.state.selectors.chime.all(this.nvr.client.state.snapshot()).some(chime => chimeRingFor(chime, this.#device.id) !== undefined);
   }
 
   // Push the chime-volume projection onto the doorbell's volume Lightbulb. Shares the read path (chimeVolume / chimeVolumeFor) with the onGet handlers, so the displayed
-  // volume and the live value never disagree. Idempotent - HomeKit coalesces an unchanged write.
+  // volume and the live value never disagree. A no-op on an unchanged write - HomeKit coalesces it.
   private updateChimeVolume(): void {
 
     const volume = this.chimeVolume;
@@ -1055,10 +1026,13 @@ export class DoorbellCapability extends ProtectBase {
    * runs when a demoted-while-down doorbell reconstructs as a plain camera, where today's doorbell-only services would otherwise linger forever. Removes the reserved
    * doorbell subtypes (the three physical-chime switches, the chime-volume lightbulb, the auth contact sensor) and the non-reserved message-switch Switch services
    * (whose subtype is shaped "type.text", never a reserved name). Deliberately does NOT remove the Doorbell service (configureDoorbellTrigger's existing arm owns its
-   * removal for non-doorbell hardware), the mute switch, the HKSV-recording switch, or the three UFP-recording switches - those are camera-level or owned elsewhere.
-   * Static and accessory-scoped because it runs without a live capability (none is attached when this fires).
+   * removal for non-doorbell hardware), the mute switch, the HKSV-recording switch, or the UFP-recording switches - those are camera-level or owned elsewhere.
+   * Static and accessory-scoped because it runs without a live capability (none is attached when this fires). It answers whether it removed anything, so the caller
+   * marks the accessory for a save only when the sweep changed it, and a steady plain camera's sweep marks nothing.
    */
-  public static removeServices(accessory: ProtectAccessory, hap: HAP, log: HomebridgePluginLogging): void {
+  public static removeServices(accessory: ProtectAccessory, hap: HAP, log: HomebridgePluginLogging): boolean {
+
+    let removed = false;
 
     // Remove the reserved doorbell-only subtypes.
     for(const subtype of DOORBELL_RESERVED_SUBTYPES) {
@@ -1070,6 +1044,7 @@ export class DoorbellCapability extends ProtectBase {
 
         log.info("Removing stale doorbell service: %s.", subtype);
         accessory.removeService(service);
+        removed = true;
       }
     }
 
@@ -1079,6 +1054,9 @@ export class DoorbellCapability extends ProtectBase {
 
       log.info("Removing stale doorbell message switch: %s.", switchService.subtype?.slice(switchService.subtype.indexOf(".") + 1));
       accessory.removeService(switchService);
+      removed = true;
     }
+
+    return removed;
   }
 }

@@ -9,12 +9,12 @@
  * SET (the value !== "true" gate routing to the stream's snapshot request), and the /doorbell ring SET (the value !== "true" gate routing to doorbellEventHandler). The
  * captured-handler idiom is the established one (chime.test.ts, viewer.test.ts, sensor.test.ts): find by topic / kind, then invoke the closure and assert its effect.
  *
- * The vacuity gate is two-part (carried from the device-* law): every gated handler HARD-asserts its captured subscription EXISTS as the FIRST discriminator (a
+ * The vacuity gate is two-part (carried from the device-* law): every gated handler HARD-asserts its captured subscription EXISTS as the first check (a
  * non-optional assert.ok on the closure) before any behavior assertion - a find(...) returning undefined whose closure is then optional-chained would let the test pass
  * vacuously. The ring's feature-gated registration is paired with a without-gate test that proves no /doorbell subscription is registered on a plain camera.
  *
  * The ring is captured through a TEST-LOCAL ProtectEventDispatch subclass that overrides doorbellEventHandler into a recording array (the pattern
- * doorbell-effects.test.ts established), injected through makeTestNvr's dispatch seam and read back off nvr.events - NOT the shared TestRecordingDispatch, which
+ * doorbell-effects.test.ts established), injected through makeTestNvr's dispatch hook and read back off nvr.events - NOT the shared TestRecordingDispatch, which
  * overrides only motionEventHandler. The override captures the routing (which device the ring fired for); it deliberately does not re-test the handler's HomeKit effects,
  * which are event-dispatch.ts's own concern, and it arms no reset timer, so cleanup leaks no handle.
  *
@@ -22,14 +22,19 @@
  */
 import type { Camera, ProtectCameraConfig } from "unifi-protect";
 import { G2_PRO_CHANNELS, MIXED_RTSP_DISABLED_CHANNELS } from "../../camera.fixtures.ts";
-import type { TestAccessory, TestLogEntry, TestMqttClient, TestProtectNvr } from "../../testing.helpers.ts";
-import { TestCameraProjection, TestStateStore, makeCameraConfig, makeProtectState, makeTestAccessory, makeTestNvr, settle } from "../../testing.helpers.ts";
+import { TestCameraProjection, makeCameraConfig } from "../testing.helpers.ts";
+import type { TestLogEntry, TestMqttClient } from "homebridge-plugin-utils/testing";
+import { TestStateStore, makeProtectState, makeTestAccessory } from "../../testing.helpers.ts";
 import { afterEach, describe, mock, test } from "node:test";
-import type { ProtectAccessory } from "../../types.ts";
 import { ProtectCamera } from "./camera.ts";
 import { ProtectEventDispatch } from "../../nvr/event-dispatch.ts";
 import type { ProtectNvr } from "../../nvr/nvr.ts";
+import type { TestProtectAccessory } from "../../testing.helpers.ts";
+import type { TestProtectNvr } from "../../nvr/testing.helpers.ts";
 import assert from "node:assert/strict";
+import { configured } from "../device-base.ts";
+import { makeTestNvr } from "../../nvr/testing.helpers.ts";
+import { settle } from "homebridge-plugin-utils/testing";
 
 // One captured doorbell-ring routing. The /doorbell SET body's observable effect is which device it routed to, so this is the shape the recording subclass captures - the
 // same posture doorbell-effects.test.ts uses for its own routing assertions.
@@ -55,20 +60,20 @@ class RecordingRingDispatch extends ProtectEventDispatch {
 // surface every body is found through; the build narrows the Nullable<TestMqttClient> before returning, so the non-null double is what every test invokes against.
 interface BuiltCamera {
 
-  accessory: TestAccessory;
+  accessory: TestProtectAccessory;
   camera: ProtectCamera;
   cameraConfig: ProtectCameraConfig;
   controller: AbortController;
-  logEntries: TestLogEntry[];
+  logEntries: readonly TestLogEntry[];
   mqtt: TestMqttClient;
   nvr: TestProtectNvr;
 }
 
 // Build a REAL plain ProtectCamera against the doubles, exactly as camera-onsets.test.ts's buildCamera assembles it, with the additions this suite needs: mqtt is always
 // threaded true (the captured subscriptions are the surface under test), and an optional dispatch factory installs the recording ring double. The casts are confined to
-// this seam - the instance is the production ProtectCamera and everything it runs is the production path. makeTestNvr returns mqtt as Nullable<TestMqttClient>, so the
-// helper narrows it (a throwing guard, exactly as buildDoorbell / buildLight do) before returning the non-null double; otherwise every mqtt.subscriptions.find is a
-// strict-null TS error.
+// this construction boundary - the instance is the production ProtectCamera and everything it runs is the production path. makeTestNvr returns mqtt as
+// Nullable<TestMqttClient>, so the helper narrows it (a throwing guard, exactly as buildDoorbell / buildLight do) before returning the non-null double; otherwise every
+// mqtt.subscriptions.find is a strict-null TS error.
 async function buildCamera(options: { channels?: ProtectCameraConfig["channels"]; dispatch?: (nvr: ProtectNvr) => ProtectEventDispatch;
   featureFlags?: Partial<ProtectCameraConfig["featureFlags"]>; userOptions?: string[]; } = {}): Promise<BuiltCamera> {
 
@@ -77,9 +82,9 @@ async function buildCamera(options: { channels?: ProtectCameraConfig["channels"]
   const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
   const { controller, logEntries, mqtt, nvr } = makeTestNvr({ ...(options.dispatch ? { dispatch: options.dispatch } : {}), mqtt: true, store,
     userOptions: options.userOptions });
-  const accessory = makeTestAccessory("Test Camera", "uuid:74ACB9000001");
+  const accessory = makeTestAccessory("Test Camera", "74ACB9000001");
   const projection = new TestCameraProjection(cameraConfig.id, store);
-  const camera = new ProtectCamera(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Camera);
+  const camera = configured(new ProtectCamera(nvr as unknown as ProtectNvr, accessory, projection as unknown as Camera));
 
   // Settle the floating configure IIFE and the observe loops' lazy registration before any drive so the camera is fully wired (the stream is stood up, the subscriptions
   // are registered) when a handler is invoked.
@@ -116,14 +121,14 @@ describe("camera-leaf MQTT handler bodies (camera-mqtt concern net)", () => {
       const { cameraConfig, mqtt } = built = await buildCamera();
 
       // HARD-assert the /rtsp GET subscription exists FIRST: an absent subscription whose getValue is optional-chained would let the parse / deepEqual pass vacuously.
-      const rtsp = mqtt.subscriptions.find((subscription) => (subscription.kind === "get") && (subscription.topic === cameraConfig.mac + "/rtsp"));
+      const rtsp = mqtt.subscriptions.find((subscription) => (subscription.kind === "get") && (subscription.topic === cameraConfig.mac + "/rtsp/get"));
 
-      assert.ok(rtsp?.getValue, "the camera registered a /rtsp GET subscription");
+      assert.ok(rtsp, "the camera registered a /rtsp GET subscription");
 
       // G2_PRO_CHANNELS carries three RTSP-enabled channels (High / Medium / Low, aliases alias0 / alias1 / alias2). makeCameraConfig seeds connectionHost to the fixture
       // host, and makeNvrConfig seeds the secure rtsps port to FIXTURE_RTSPS_PORT (7441), so the body composes rtsps://<connectionHost>:<rtsps-port>/<alias>?enableSrtp
       // through the shared rtspUrl SSOT (secure scheme on the secure port). The URL string is the contract the body promises, so we assert it literally.
-      const urls = JSON.parse(rtsp.getValue()) as Record<string, string>;
+      const urls = JSON.parse(await mqtt.invokeGet(cameraConfig.mac + "/rtsp/get") ?? "") as Record<string, string>;
 
       assert.deepEqual(urls, {
 
@@ -139,11 +144,11 @@ describe("camera-leaf MQTT handler bodies (camera-mqtt concern net)", () => {
       // channel.isRtspEnabled) must drop Medium, so the URL map has no Medium key - a mutation removing the filter would re-include it, which this asserts against.
       const { cameraConfig, mqtt } = built = await buildCamera({ channels: MIXED_RTSP_DISABLED_CHANNELS });
 
-      const rtsp = mqtt.subscriptions.find((subscription) => (subscription.kind === "get") && (subscription.topic === cameraConfig.mac + "/rtsp"));
+      const rtsp = mqtt.subscriptions.find((subscription) => (subscription.kind === "get") && (subscription.topic === cameraConfig.mac + "/rtsp/get"));
 
-      assert.ok(rtsp?.getValue, "the camera registered a /rtsp GET subscription");
+      assert.ok(rtsp, "the camera registered a /rtsp GET subscription");
 
-      const urls = JSON.parse(rtsp.getValue()) as Record<string, string>;
+      const urls = JSON.parse(await mqtt.invokeGet(cameraConfig.mac + "/rtsp/get") ?? "") as Record<string, string>;
 
       assert.equal(urls["Medium"], undefined, "the RTSP-disabled Medium channel is filtered out of the URL map");
       assert.equal(urls["High"], "rtsps://camera.test:7441/alias0?enableSrtp", "the RTSP-enabled High channel is present with its composed URL");
@@ -161,9 +166,9 @@ describe("camera-leaf MQTT handler bodies (camera-mqtt concern net)", () => {
       // spy would record nothing, passing the gate test vacuously.
       assert.ok(camera.stream, "the camera's streaming delegate stood up at configure");
 
-      const snapshot = mqtt.subscriptions.find((subscription) => (subscription.kind === "set") && (subscription.topic === cameraConfig.mac + "/snapshot"));
+      const snapshot = mqtt.subscriptions.find((subscription) => (subscription.kind === "set") && (subscription.topic === cameraConfig.mac + "/snapshot/set"));
 
-      assert.ok(snapshot?.setValue, "the camera registered a /snapshot SET subscription");
+      assert.ok(snapshot, "the camera registered a /snapshot SET subscription");
 
       // Spy on the stream's snapshot entry point so we observe the body's routing by call count rather than any controller effect (the stub takes no snapshots).
       const spy = mock.method(camera.stream, "handleSnapshotRequest");
@@ -171,14 +176,14 @@ describe("camera-leaf MQTT handler bodies (camera-mqtt concern net)", () => {
       try {
 
         // The "true" value passes the value !== "true" gate and routes to the snapshot request exactly once.
-        await snapshot.setValue("true", "true");
+        await mqtt.invokeSet(cameraConfig.mac + "/snapshot/set", "true");
         await settle();
 
         assert.equal(spy.mock.callCount(), 1, "a \"true\" value triggered exactly one snapshot request");
 
         // A non-"true" value (and the numeric-string "1", which is also not the literal "true") is gated out and triggers no further request.
-        await snapshot.setValue("false", "false");
-        await snapshot.setValue("1", "1");
+        await mqtt.invokeSet(cameraConfig.mac + "/snapshot/set", "false");
+        await mqtt.invokeSet(cameraConfig.mac + "/snapshot/set", "1");
         await settle();
 
         assert.equal(spy.mock.callCount(), 1, "a non-\"true\" value is gated out and triggers no additional snapshot request");
@@ -201,9 +206,9 @@ describe("camera-leaf MQTT handler bodies (camera-mqtt concern net)", () => {
 
       // HARD-assert the /doorbell SET subscription exists FIRST: with Enable.Doorbell.Trigger it registers, and an absent subscription would let the ring assertions pass
       // vacuously.
-      const doorbell = mqtt.subscriptions.find((subscription) => (subscription.kind === "set") && (subscription.topic === cameraConfig.mac + "/doorbell"));
+      const doorbell = mqtt.subscriptions.find((subscription) => (subscription.kind === "set") && (subscription.topic === cameraConfig.mac + "/doorbell/set"));
 
-      assert.ok(doorbell?.setValue, "Enable.Doorbell.Trigger registers a /doorbell SET subscription on the plain camera");
+      assert.ok(doorbell, "Enable.Doorbell.Trigger registers a /doorbell SET subscription on the plain camera");
 
       const ring = nvr.events as unknown as RecordingRingDispatch;
 
@@ -211,7 +216,7 @@ describe("camera-leaf MQTT handler bodies (camera-mqtt concern net)", () => {
 
       // The "true" value passes the value !== "true" gate and fires this.nvr.events.doorbellEventHandler(this) - no accessory.context write, no controller write. The
       // recording override captures the routing. The body is synchronous, but we settle anyway as a harmless belt.
-      await doorbell.setValue("true", "true");
+      await mqtt.invokeSet(cameraConfig.mac + "/doorbell/set", "true");
       await settle();
 
       assert.equal(ring.rings.length, 1, "the \"true\" value fired exactly one ring through doorbellEventHandler");
@@ -224,14 +229,14 @@ describe("camera-leaf MQTT handler bodies (camera-mqtt concern net)", () => {
 
       const { cameraConfig, mqtt, nvr } = built = await buildCamera({ dispatch, userOptions: ["Enable.Doorbell.Trigger"] });
 
-      const doorbell = mqtt.subscriptions.find((subscription) => (subscription.kind === "set") && (subscription.topic === cameraConfig.mac + "/doorbell"));
+      const doorbell = mqtt.subscriptions.find((subscription) => (subscription.kind === "set") && (subscription.topic === cameraConfig.mac + "/doorbell/set"));
 
-      assert.ok(doorbell?.setValue, "the /doorbell SET subscription registered");
+      assert.ok(doorbell, "the /doorbell SET subscription registered");
 
       const ring = nvr.events as unknown as RecordingRingDispatch;
 
       // The "false" value is gated out by value !== "true" before doorbellEventHandler is reached, so no ring is routed.
-      await doorbell.setValue("false", "false");
+      await mqtt.invokeSet(cameraConfig.mac + "/doorbell/set", "false");
       await settle();
 
       assert.equal(ring.rings.length, 0, "a non-\"true\" value is gated out and fires no ring");
@@ -243,7 +248,7 @@ describe("camera-leaf MQTT handler bodies (camera-mqtt concern net)", () => {
       // registration is feature-driven, not incidental.
       const { cameraConfig, mqtt } = built = await buildCamera();
 
-      const doorbell = mqtt.subscriptions.find((subscription) => (subscription.kind === "set") && (subscription.topic === cameraConfig.mac + "/doorbell"));
+      const doorbell = mqtt.subscriptions.find((subscription) => (subscription.kind === "set") && (subscription.topic === cameraConfig.mac + "/doorbell/set"));
 
       assert.equal(doorbell, undefined, "a plain camera without Enable.Doorbell.Trigger registers no /doorbell SET subscription");
     });

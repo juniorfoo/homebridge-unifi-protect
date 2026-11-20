@@ -50,8 +50,11 @@ describe("Video.Transcode feature options", () => {
 
     assert.equal(options.test("Video.Transcode", DEVICE_MAC, NVR_MAC), false);
     assert.equal(options.test("Video.Transcode.HighLatency", DEVICE_MAC, NVR_MAC), true);
-    assert.equal(featureOptions["Video"]?.find((entry) => entry.name === "Transcode")?.default, false);
-    assert.equal(featureOptions["Video"]?.find((entry) => entry.name === "Transcode.HighLatency")?.default, true);
+    const videoFeatureOptions = featureOptions["Video"];
+
+    assert.ok(videoFeatureOptions);
+    assert.equal(videoFeatureOptions.find((entry) => entry.name === "Transcode")?.default, false);
+    assert.equal(videoFeatureOptions.find((entry) => entry.name === "Transcode.HighLatency")?.default, true);
   });
 
   test("explicit Enable.Video.Transcode forces transcode at home", () => {

@@ -5,62 +5,58 @@
  * ProtectNvrSystemInfo is the lightest of the controller owners (alongside liveviews and the security system), and it shares NOTHING with its siblings
  * except the ProtectBase shape, so it is the right place to establish the controller-owner test pattern in isolation. This suite constructs a REAL
  * ProtectNvrSystemInfo(nvr) through the makeTestNvr double and nets its full public surface behavior-first: construction (the self-created accessory, the
- * unconditional-on-feature TemperatureSensor CPU-temp service, the initial CurrentTemperature read-through, the singular enabled-sensors log), the NVR.SystemInfo
+ * unconditional-on-feature TemperatureSensor CPU-temp service, the initial CurrentTemperature read-through, the feature's line), the NVR.SystemInfo
  * feature gate (the with-feature service plus the without-feature removal and silent no-op paths), the single nvr.systemInfo observer's refresh reaction, the
  * systeminfo MQTT GET, and the controller-scoped mqttId / signal lifetime.
  *
  * The shape DIFFERS from the device families and this suite respects every departure:
  *
- * - It extends ProtectBase, not ProtectDevice: ctor is (nvr) only, with no per-accessory abort, no device projection, no hints, and no base name-sync / device-info
- *   observer pair. Teardown is aborting the AbortController behind nvr.signal (the controller terminal-shutdown signal), not a per-accessory cleanup().
+ * - It extends ProtectBase, not ProtectDevice: ctor is (nvr) only, with no device projection, no hints, and no base name-sync / device-info observer pair. Teardown is
+ *   aborting the AbortController behind nvr.signal (the controller terminal-shutdown signal), the lifetime this owner's composed signal rides.
  * - It publishes NOTHING on the hbup:observer:wake diagnostics channel (onObserverWake is the ProtectBase no-op), so this suite does NOT reuse the viewer / sensor
  *   wake-count scaffold - a constructionWakes === 0 assertion would pass trivially and mislead. The single nvr.systemInfo observer is netted by its REACTION (the
  *   temperature characteristic refreshes after a store push). store.observerCount IS a real registration-count surface the owner's observer joins, used here only as the
  *   complementary teardown leak check.
- * - It self-creates its accessory: the test supplies none; it reads the created accessory back off nvr.platform.accessories and asserts the platform double recorded the
- *   register call. The accessory UUID is deterministic: hap.uuid.generate(nvr.ufp.mac + ".NVRSystemInfo") = "uuid:74ACB9FFFFFF.NVRSystemInfo".
+ * - It self-creates its accessory: the test supplies none; it reads the created accessory back off nvr.platform.accessories and asserts the API double recorded the
+ *   register call. The accessory UUID is deterministic: hap.uuid.generate(nvr.ufp.mac + ".NVRSystemInfo"), the seed 74ACB9FFFFFF.NVRSystemInfo.
  * - nvr.ufp reads THROUGH the store (the harness's read-through client.nvr.config getter), so seeding the store's nvr slice IS how the construction record reaches
  *   nvr.ufp, and a pushNvrPatch that moves systemInfo by reference changes both selectNvr(state) and nvr.ufp at once.
  *
- * The observer non-vacuity trap (load-bearing): the onGet is bound only on the initial pass (the configureHandler guard) and reads live nvr.ufp, so after a push
- * triggerGet returns the NEW temperature REGARDLESS of whether the observer fired - it cannot prove the reaction. The discriminator is the characteristic's CACHED
+ * The observer non-vacuity trap: the onGet is bound only on the initial pass (the guard on the pass's initialized flag) and reads live nvr.ufp, so after a push
+ * triggerGet returns the NEW temperature REGARDLESS of whether the observer fired - it cannot prove the reaction. What tells the two apart is the characteristic's CACHED
  * .value, which is written ONLY by the observer-driven updateCharacteristic: a non-firing observer leaves .value at the initial-pass write. So the observer test asserts
  * CurrentTemperature.value === NEW after pushNvrPatch moves a FRESH systemInfo by reference, never triggerGet.
  */
-import { Characteristic, Service, TestStateStore, makeNvrConfig, makeProtectState, makeTestNvr, settle } from "../testing.helpers.ts";
-import type { TestAccessory, TestLogEntry, TestMqttClient, TestProtectNvr } from "../testing.helpers.ts";
+import { Characteristic, Service, TestStateStore, accessoryUuid, makeProtectState } from "../testing.helpers.ts";
+import type { TestLogEntry, TestMqttClient } from "homebridge-plugin-utils/testing";
 import { afterEach, describe, test } from "node:test";
+import { loggedAt, settle, triggerGet } from "homebridge-plugin-utils/testing";
+import { makeNvrConfig, makeTestNvr, restoreAccessories } from "./testing.helpers.ts";
+import type { ProtectAccessory } from "../types.ts";
 import type { ProtectNvr } from "./nvr.ts";
 import { ProtectNvrSystemInfo } from "./nvr-systeminfo.ts";
+import type { TestProtectNvr } from "./testing.helpers.ts";
 import assert from "node:assert/strict";
+import { configured } from "../devices/device-base.ts";
 
-// The deterministic accessory UUID the owner composes: the platform double's uuid generator is (seed) => "uuid:" + seed, and the owner generates from
-// nvr.ufp.mac + ".NVRSystemInfo" against the makeNvrConfig mac, so the UUID is fixed. A literal rather than a derivation so a drift in the UUID composition breaks
-// loudly.
-const SYSTEMINFO_UUID = "uuid:74ACB9FFFFFF.NVRSystemInfo";
-
-// The controller logger prefixes every line with the controller name; the harness renders what the real Homebridge logger would emit into entry.formatted (for example
-// "Test Controller: Enabled system information sensor: cpu temperature."), so a log assertion matches a substring of that rendered line at the given level, mirroring the
-// sensor / device-motion suites' helper.
-function loggedAt(entries: TestLogEntry[], level: TestLogEntry["level"], substring: string): boolean {
-
-  return entries.some((entry) => (entry.level === level) && entry.formatted.includes(substring));
-}
+// The deterministic accessory UUID the owner composes: the owner seeds HAP's generator with nvr.ufp.mac + ".NVRSystemInfo" against the makeNvrConfig mac, so the
+// UUID is fixed. A literal seed rather than a derivation so a drift in the identity composition breaks loudly.
+const SYSTEMINFO_UUID = accessoryUuid("74ACB9FFFFFF.NVRSystemInfo");
 
 // The reusable construction helper: build a REAL ProtectNvrSystemInfo against the harness doubles, taking ONLY an nvr (the owner extends ProtectBase, so its ctor is
 // (nvr)). makeNvrConfig carries the systemInfo the initial pass dereferences; the store's nvr slice is seeded NON-NULL so nvr.ufp - which reads through the store -
-// returns that record. The casts are confined to the construction seam exactly as the family suites do; the instance under test is the production class running its real
-// configureAccessory / configureMqtt / observe paths. The owner SELF-CREATES its accessory, so there is no accessory pass-in; the test reads it back off
+// returns that record. The casts are confined to the construction boundary exactly as the family suites do; the instance under test is the production class running its
+// real configureAccessory / configureMqtt / observe paths. The owner SELF-CREATES its accessory, so there is no accessory pass-in; the test reads it back off
 // nvr.platform.accessories. The returned controller is the AbortController behind nvr.signal, aborted in teardown to tear down the owner's observe loop and its MQTT
-// subscriptions (a ProtectBase owner has no per-accessory cleanup()).
+// subscriptions: the fixture tears down through the controller it built, the scope that owns every registration the test created.
 function buildSystemInfo(configOptions: Parameters<typeof makeNvrConfig>[0] = {}, harnessOptions: { seedCachedAccessory?: boolean; userOptions?: string[] } = {}): {
-  accessory: TestAccessory | undefined; apiCalls: ReturnType<typeof makeTestNvr>["apiCalls"]; controller: AbortController; logEntries: TestLogEntry[];
+  accessory: ProtectAccessory | undefined; api: ReturnType<typeof makeTestNvr>["api"]; controller: AbortController; logEntries: readonly TestLogEntry[];
   mqtt: TestMqttClient; nvr: TestProtectNvr; owner: ProtectNvrSystemInfo; store: TestStateStore;
 } {
 
   const nvrConfig = makeNvrConfig(configOptions);
   const store = new TestStateStore(makeProtectState({ nvr: nvrConfig }));
-  const { apiCalls, controller, logEntries, mqtt, nvr } = makeTestNvr({ mqtt: true, store, userOptions: harnessOptions.userOptions });
+  const { api, controller, logEntries, mqtt, nvr } = makeTestNvr({ mqtt: true, store, userOptions: harnessOptions.userOptions });
 
   // makeTestNvr was called with mqtt: true, so the recording double is present; a guard narrows Nullable<TestMqttClient> to the non-null type without an assertion or a
   // same-type cast (either of which the house lint preset forbids in opposite directions), and fails loudly if the opt-in ever stops installing the double.
@@ -69,26 +65,26 @@ function buildSystemInfo(configOptions: Parameters<typeof makeNvrConfig>[0] = {}
     throw new Error("The MQTT recording double was not installed despite mqtt: true.");
   }
 
-  // The disabled-removal path pre-seeds a cached accessory at the deterministic UUID BEFORE construction, so the feature-off branch actually removes one rather than
-  // no-opping vacuously. The double's TestAccessory is reached through the platform's api.platformAccessory class so the seeded accessory is the same kind the owner
-  // would create.
+  // The disabled-removal path pre-seeds a cached accessory at the deterministic UUID BEFORE construction, restored onto the bridge as Homebridge restores a cached
+  // accessory, so the feature-off branch actually removes one rather than no-opping vacuously. The accessory is built through the platform's api.platformAccessory
+  // class, the one the owner creates its own through.
   if(harnessOptions.seedCachedAccessory) {
 
     const PlatformAccessory = nvr.platform.api.platformAccessory;
 
-    nvr.platform.accessories.push(new PlatformAccessory("Cached System Info", SYSTEMINFO_UUID));
+    restoreAccessories(nvr, [new PlatformAccessory("Cached System Info", SYSTEMINFO_UUID)]);
   }
 
-  const owner = new ProtectNvrSystemInfo(nvr as unknown as ProtectNvr);
+  const owner = configured(new ProtectNvrSystemInfo(nvr as unknown as ProtectNvr));
   const accessory = nvr.platform.accessories.find((candidate) => candidate.UUID === SYSTEMINFO_UUID);
 
-  return { accessory, apiCalls, controller, logEntries, mqtt, nvr, owner, store };
+  return { accessory, api, controller, logEntries, mqtt, nvr, owner, store };
 }
 
 describe("real ProtectNvrSystemInfo construction and controller-owner behavior", () => {
 
-  // The per-test controller, tracked so afterEach aborts whichever build the test made (the ProtectBase owner has no per-accessory cleanup; aborting the controller
-  // behind nvr.signal is the teardown). A test that builds more than one owner aborts each explicitly; this catches the single-build common case.
+  // The per-test controller, tracked so afterEach aborts whichever build the test made (aborting the controller behind nvr.signal is the fixture's teardown, the scope
+  // that owns every registration the test created). A test that builds more than one owner aborts each explicitly; this catches the single-build common case.
   let activeController: AbortController | undefined;
 
   afterEach(() => {
@@ -97,7 +93,7 @@ describe("real ProtectNvrSystemInfo construction and controller-owner behavior",
     activeController = undefined;
   });
 
-  test("the feature-enabled construction self-creates the accessory, materializes the CPU-temp service, and logs the singular enabled line", async () => {
+  test("the feature-enabled construction self-creates the accessory, materializes the CPU-temp service, and logs the enabled line", async () => {
 
     const built = buildSystemInfo({ temperature: 36 }, { userOptions: ["Enable.Nvr.SystemInfo"] });
 
@@ -110,7 +106,7 @@ describe("real ProtectNvrSystemInfo construction and controller-owner behavior",
 
     assert.ok(accessory, "the owner self-created an accessory at the deterministic UUID and pushed it onto the platform accessories array");
     assert.equal(accessory.UUID, SYSTEMINFO_UUID, "the self-created accessory carries the mac-derived NVRSystemInfo UUID");
-    assert.ok(built.apiCalls.some((call) => (call.kind === "register") && call.accessories.includes(accessory)),
+    assert.ok(built.api.calls.some((call) => (call.kind === "register") && call.accessories.includes(accessory)),
       "the platform double recorded a register call carrying the self-created accessory");
 
     // HARD-assert the TemperatureSensor service exists FIRST (non-optional), the feature-gate non-vacuity discipline.
@@ -121,16 +117,50 @@ describe("real ProtectNvrSystemInfo construction and controller-owner behavior",
 
     // The initial pass wrote CurrentTemperature off systemInfo.cpu.temperature, and bound the onGet that reads it live.
     assert.equal(temperature.getCharacteristic(Characteristic.CurrentTemperature).value, 36, "CurrentTemperature initialized from systemInfo.cpu.temperature");
-    assert.equal(await temperature.getCharacteristic(Characteristic.CurrentTemperature).triggerGet(), 36, "the onGet reads through systemInfo.cpu.temperature live");
+    assert.equal(await triggerGet(temperature.getCharacteristic(Characteristic.CurrentTemperature)), 36, "the onGet reads through systemInfo.cpu.temperature live");
 
     // setInfo wired the controller-branded identity (the device-info concern owns the per-field writes; here we assert only that setInfo ran against the accessory).
     const info = accessory.getService(Service.AccessoryInformation);
 
     assert.equal(info?.getCharacteristic(Characteristic.Model).value, "UniFi Dream Machine SE", "setInfo wired the Model from the controller marketName");
-    assert.equal(info?.getCharacteristic(Characteristic.SerialNumber).value, "74ACB9FFFFFF", "setInfo wired the SerialNumber from the controller mac");
+    assert.equal(info.getCharacteristic(Characteristic.SerialNumber).value, "74ACB9FFFFFF", "setInfo wired the SerialNumber from the controller mac");
 
-    // The singular enabled-sensors log (one sensor, so the %s plural marker is empty).
-    assert.ok(loggedAt(built.logEntries, "info", "Enabled system information sensor: cpu temperature."), "the one enabled sensor logs the singular enabled-sensor line");
+    assert.ok(loggedAt(built.logEntries, "info", "System information sensors enabled."), "the feature's line logged");
+  });
+
+  test("a controller with an empty name adds the system information accessory under its market name", async () => {
+
+    // HAP refuses an accessory whose display name is empty, and the controller's empty name sanitizes to nothing, so the accessory takes the market name.
+    const built = buildSystemInfo({ name: "" }, { userOptions: ["Enable.Nvr.SystemInfo"] });
+
+    activeController = built.controller;
+
+    await settle();
+
+    const accessory = built.accessory;
+
+    assert.ok(accessory, "the owner self-created its accessory under a controller with an empty name");
+    assert.equal(accessory.displayName, "UniFi Dream Machine SE", "the accessory was added under the controller's market name");
+    assert.ok(built.api.calls.some((call) => (call.kind === "register") && call.accessories.includes(accessory)), "the accessory was registered under that name");
+  });
+
+  test("the initial pass binds the temperature read-through, so a pull answers the live temperature over a stale cached value", async () => {
+
+    const built = buildSystemInfo({ temperature: 36 }, { userOptions: ["Enable.Nvr.SystemInfo"] });
+
+    activeController = built.controller;
+
+    await settle();
+
+    const temperature = built.accessory?.getService(Service.TemperatureSensor);
+
+    assert.ok(temperature, "the temperature service exists after construction");
+
+    // Overwrite the cached value with a sentinel the controller never reported, so only a bound read-through can answer the live temperature. A construction that ran
+    // as a later pass would bind nothing, and the pull would fall through to the sentinel.
+    temperature.getCharacteristic(Characteristic.CurrentTemperature).updateValue(-1);
+
+    assert.equal(await triggerGet(temperature.getCharacteristic(Characteristic.CurrentTemperature)), 36, "the pull answers the live temperature, not the sentinel");
   });
 
   test("construction with the feature disabled and a cached accessory present unregisters it, splices it out, and logs the removal", async () => {
@@ -143,7 +173,7 @@ describe("real ProtectNvrSystemInfo construction and controller-owner behavior",
 
     // The cached accessory was removed: gone from the platform array, AND the platform double recorded an unregister call.
     assert.equal(built.accessory, undefined, "the cached system-information accessory was spliced out of the platform accessories array");
-    assert.ok(built.apiCalls.some((call) => (call.kind === "unregister") && call.accessories.some((candidate) => candidate.UUID === SYSTEMINFO_UUID)),
+    assert.ok(built.api.calls.some((call) => (call.kind === "unregister") && call.accessories.some((candidate) => candidate.UUID === SYSTEMINFO_UUID)),
       "the platform double recorded an unregister call for the cached accessory");
     assert.ok(loggedAt(built.logEntries, "info", "Removing UniFi Protect controller system information sensors."), "the removal path logged the removal line");
   });
@@ -158,8 +188,8 @@ describe("real ProtectNvrSystemInfo construction and controller-owner behavior",
 
     assert.equal(built.accessory, undefined, "no accessory is created when the feature is off and none is cached");
     assert.equal(built.nvr.platform.accessories.length, 0, "the platform accessories array stays empty - nothing was created or restored");
-    assert.equal(built.apiCalls.some((call) => call.kind === "register"), false, "the silent no-op path records no register call");
-    assert.equal(built.apiCalls.some((call) => call.kind === "unregister"), false, "the silent no-op path records no unregister call");
+    assert.equal(built.api.calls.some((call) => call.kind === "register"), false, "the silent no-op path records no register call");
+    assert.equal(built.api.calls.some((call) => call.kind === "unregister"), false, "the silent no-op path records no unregister call");
   });
 
   test("the nvr.systemInfo observer refreshes the CACHED CurrentTemperature value after a reference-changing pushNvrPatch", async () => {
@@ -182,9 +212,36 @@ describe("real ProtectNvrSystemInfo construction and controller-owner behavior",
     await settle();
 
     // Assert the CACHED .value, NOT triggerGet: the initial-pass onGet reads live nvr.ufp and would return 47 even if the observer never fired, so it cannot prove the
-    // reaction; the cached .value is written ONLY by the observer-driven updateCharacteristic, so a non-firing observer would leave it at 20 - that is the discriminator.
+    // reaction; the cached .value is written ONLY by the observer-driven updateCharacteristic, so a non-firing observer would leave it at 20 - that is what tells the two
+    // apart.
     assert.equal(temperature.getCharacteristic(Characteristic.CurrentTemperature).value, 47,
       "the observer's updateDevice refreshed the cached CurrentTemperature to the pushed value");
+  });
+
+  test("the CPU temperature reaches HomeKit in whole degrees, on the initial pass, on a pull, and on an observer refresh", async () => {
+
+    const built = buildSystemInfo({ temperature: 56.4 }, { userOptions: ["Enable.Nvr.SystemInfo"] });
+
+    activeController = built.controller;
+
+    await settle();
+
+    const temperature = built.accessory?.getService(Service.TemperatureSensor);
+
+    assert.ok(temperature, "the temperature service exists");
+
+    const characteristic = temperature.getCharacteristic(Characteristic.CurrentTemperature);
+
+    assert.equal(characteristic.props.minStep, 1, "the characteristic declares a one-degree step");
+    assert.equal(characteristic.value, 56, "the initial pass rounds the controller's fractional reading to a whole degree");
+    assert.equal(await triggerGet(characteristic), 56, "a pull answers the rounded reading");
+
+    // A fresh systemInfo moves the reading across a half-degree boundary, so the observer's refresh lands on the next whole degree.
+    built.store.pushNvrPatch({ systemInfo: { ...built.nvr.ufp.systemInfo, cpu: { ...built.nvr.ufp.systemInfo.cpu, temperature: 56.6 } } });
+
+    await settle();
+
+    assert.equal(characteristic.value, 57, "the observer's refresh rounds the pushed reading to a whole degree");
   });
 
   test("a non-systemInfo nvr patch does NOT refresh the temperature - the narrow selector ignores it", async () => {
@@ -216,19 +273,37 @@ describe("real ProtectNvrSystemInfo construction and controller-owner behavior",
     await settle();
 
     // The mqttId is the controller MAC (the ProtectBase base default), so the GET subscription composes {controllerMAC}/systeminfo.
-    const subscription = built.mqtt.subscriptions.find((entry) => (entry.kind === "get") && (entry.topic === "74ACB9FFFFFF/systeminfo"));
+    const subscription = built.mqtt.subscriptions.find((entry) => (entry.kind === "get") && (entry.topic === "74ACB9FFFFFF/systeminfo/get"));
 
-    assert.ok(subscription?.getValue, "the systeminfo GET subscription composed the controller-MAC topic and captured a getValue handler");
+    assert.ok(subscription, "the systeminfo GET subscription composed the controller-MAC topic and captured a getValue handler");
 
     // Assert against an INDEPENDENT expected built from the KNOWN seeded temperature, not === JSON.stringify(nvr.ufp.systemInfo) (which re-reads the same handler input
     // and is a tautology). The handler stringifies the whole systemInfo, so parsing it back and reading cpu.temperature proves the read-through. The parse result is
     // typed to the one field under assertion at this confined boundary, exactly as JSON.parse's any would otherwise leak into an unsafe member access.
-    const payload = JSON.parse(subscription.getValue()) as { cpu: { temperature: number } };
+    const payload = JSON.parse(await built.mqtt.invokeGet("74ACB9FFFFFF/systeminfo/get") ?? "") as { cpu: { temperature: number } };
 
     assert.equal(payload.cpu.temperature, 33, "the GET handler stringifies the live systemInfo, carrying the seeded temperature");
 
-    // The subscription is scoped to the controller signal (nvr.signal), the controller-owner lifetime.
-    assert.equal(subscription.init?.signal, built.nvr.signal, "the GET registration carries the controller lifetime signal");
+    // The subscription is scoped to this owner's composed lifetime, which for a controller owner is the controller connection: live while the controller runs, and over
+    // the moment the controller signal aborts. Asserted behaviorally rather than by object identity, because the composed signal is a derived signal that fires when
+    // nvr.signal does rather than being nvr.signal itself.
+    assert.equal(subscription.init.signal?.aborted, false, "the GET registration's lifetime is live while the controller runs");
+
+    built.controller.abort();
+
+    assert.equal(subscription.init.signal.aborted, true, "the GET registration's lifetime ended with the controller abort");
+  });
+
+  test("with NVR.SystemInfo off the systeminfo topic has no GET, so the controller's system information is not reachable over MQTT", async () => {
+
+    const built = buildSystemInfo({ temperature: 33 });
+
+    activeController = built.controller;
+
+    await settle();
+
+    assert.equal(built.mqtt.subscriptions.some((entry) => entry.topic === "74ACB9FFFFFF/systeminfo/get"), false, "no systeminfo GET is registered with the feature off");
+    assert.equal(built.mqtt.publishedTo("/systeminfo").length, 0, "nothing publishes on the systeminfo topic with the feature off");
   });
 
   test("aborting the controller signal deregisters the observer and ends the MQTT subscription lifetime, and a later push no longer refreshes", async () => {
@@ -241,21 +316,21 @@ describe("real ProtectNvrSystemInfo construction and controller-owner behavior",
 
     assert.equal(built.store.observerCount, 1, "the single nvr.systemInfo observer is registered against the store double");
 
-    const subscription = built.mqtt.subscriptions.find((entry) => (entry.kind === "get") && (entry.topic === "74ACB9FFFFFF/systeminfo"));
+    const subscription = built.mqtt.subscriptions.find((entry) => (entry.kind === "get") && (entry.topic === "74ACB9FFFFFF/systeminfo/get"));
 
-    assert.equal(subscription?.init?.signal?.aborted, false, "the GET registration's lifetime is live before the controller abort");
+    assert.equal(subscription?.init.signal?.aborted, false, "the GET registration's lifetime is live before the controller abort");
 
     const temperature = built.accessory?.getService(Service.TemperatureSensor);
 
     assert.ok(temperature, "the temperature service exists before teardown");
 
-    // Tear down via the controller signal (the ProtectBase owner-lifetime), the only teardown a controller owner has.
+    // Tear down via the controller signal, the lifetime this owner's composed signal rides.
     built.controller.abort();
 
     await settle();
 
     assert.equal(built.store.observerCount, 0, "the observer deregistered through the controller signal");
-    assert.equal(subscription?.init?.signal?.aborted, true, "the GET registration's lifetime ended with the controller abort");
+    assert.equal(subscription.init.signal.aborted, true, "the GET registration's lifetime ended with the controller abort");
 
     // The positive half of the leak detector: a systemInfo push that WOULD refresh the cached value if the observer survived produces no change, proving the observer
     // truly deregistered rather than that the push was inert.

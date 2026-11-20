@@ -1,32 +1,37 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * reachability.test.ts: Unit tests for the projection-backed accessory base's load-bearing primitives - the composed per-accessory abort signal (teardown) and the
- * StatusActive reachability fan-out - exercised against the real production ProtectDevice.
+ * reachability.test.ts: Unit tests for the primitives the projection-backed accessory base depends on for correct teardown and reachability reporting - the composed
+ * per-accessory abort signal (teardown) and the reachability read the media paths gate on - exercised against the real production ProtectDevice.
  *
- * These import the real ProtectDevice and drive its own isReachable, refreshReachability, and cleanup. That became possible once the source loads under the project's
- * "node --strip-types" test runner: every relative import specifier now resolves to its on-disk ".ts" sibling (the rig adopted the ".ts"-specifier convention the
- * shared tsconfig's rewriteRelativeImportExtensions already rewrites back to ".js" on emit), and the lone non-erasable construct - the ProtectReservedNames string
- * enum - became an erasable "as const" object.
+ * These import the real ProtectDevice and drive its own isReachable, noteConnectionChanged, and cleanup directly: every relative import specifier resolves to its
+ * on-disk ".ts" sibling under the project's "node --strip-types" test runner (the shared tsconfig's rewriteRelativeImportExtensions rewrites it back to ".js" on
+ * emit), and the lone non-erasable construct - the ProtectReservedNames string identifiers - is an erasable "as const" object.
  *
- * The abstract base is exercised through the smallest possible concrete leaf: ProtectDevice declares no abstract members, so the subclass adds nothing but a window
- * onto the protected composed signal, and every method under test is the base's own. It is constructed against the minimal mocks isReachable / refreshReachability /
- * cleanup actually read, with the StatusActive characteristic identity wired to the same class the TestAccessory keyed its characteristics on, so the production
- * fan-out resolves the very Map entries the test materialized.
+ * The abstract base is exercised through the smallest possible concrete leaf: beside the empty configureDevice ProtectDevice requires, which never runs because the
+ * leaf is built without being configured, the subclass adds nothing but a window onto the protected composed signal, and every method under test is the base's own.
+ * It is constructed against the minimal mocks isReachable / noteConnectionChanged / cleanup actually read, and the rig hands production the runtime's HAP, whose classes
+ * the accessory's own characteristics come from.
  */
-import { Characteristic, Service, makeTestAccessory } from "../testing.helpers.ts";
+import { Characteristic, Service, hap, makeTestAccessory } from "../testing.helpers.ts";
+import { TestClock, silentLog } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
 import type { Camera } from "unifi-protect";
-import type { ProtectAccessory } from "../types.ts";
 import { ProtectDevice } from "./device.ts";
 import type { ProtectNvr } from "../nvr/nvr.ts";
-import type { TestAccessory } from "../testing.helpers.ts";
+import { TEST_CLOCK_EPOCH } from "../nvr/testing.helpers.ts";
+import type { TestProtectAccessory } from "../testing.helpers.ts";
 import assert from "node:assert/strict";
 import { composeSignals } from "homebridge-plugin-utils";
 
-// The smallest concrete leaf of the abstract base. ProtectDevice declares no abstract members, so a near-empty subclass is a faithful, fully real instance of the
-// production class - isReachable, refreshReachability, and cleanup are all the base's own, inherited unchanged. The lone addition exposes the protected composed
-// signal so the teardown assertion can observe exactly what cleanup() aborts.
+// The smallest concrete leaf of the abstract base. Its configureDevice is the empty body ProtectDevice requires and never runs, so a near-empty subclass is a
+// faithful, fully real instance of the production class - isReachable, noteConnectionChanged, and cleanup are all the base's own, inherited unchanged. The one other
+// addition exposes the protected composed signal so the teardown assertion can observe exactly what cleanup() aborts.
 class TestProtectDevice extends ProtectDevice {
+
+  protected override configureDevice(): boolean {
+
+    return true;
+  }
 
   public get composedSignal(): AbortSignal {
 
@@ -35,28 +40,26 @@ class TestProtectDevice extends ProtectDevice {
 }
 
 // Construct a real ProtectDevice against the minimal mocks its constructor and the methods under test actually read: the controller-health flag (client.connection),
-// the device record (read non-throwing via peek()), the HAP StatusActive identity (wired to the class the TestAccessory keyed its characteristics on),
-// and a real AbortSignal for composeSignals. ProtectBase binds platform.debug at construction, so that one member must be callable. The total isReachable reads the
-// device's online state through peek().state, so the lever is the record's state field, and a vanished record (present false -> peek()
-// undefined) is the unreachable-without-throwing case. Returns the mutable health / record handles so a test can flip either input and re-read the real getter. The casts
-// are confined to this seam; the instance itself is the production class.
-const makeReachableDevice = (accessory: TestAccessory):
-{ connection: { isHealthy: boolean }; device: { config: { state: string }; present: boolean }; instance: TestProtectDevice } => {
+// the device record (read non-throwing via peek()), the runtime's HAP namespace the accessory's own characteristics come from, the test clock the spine's timer
+// registry is built on, started at the harness epoch, and a real AbortSignal for composeSignals. ProtectBase composes its debug channel against the platform's scope
+// gate, so that one member must be callable - this rig exercises no debug output, so a gate that always answers false is the honest wiring. The total
+// isReachable reads the device's online state through peek().state, so the lever is the record's state field, and a vanished record (present false -> peek() undefined)
+// is the unreachable-without-throwing case. Returns the mutable health / record handles so a test can flip either input and re-read the real getter. The casts are
+// confined to this construction step; the instance itself is the production class.
+const makeReachableDevice = (accessory: TestProtectAccessory):
+  { connection: { isHealthy: boolean }; device: { config: { state: string }; present: boolean }; instance: TestProtectDevice } => {
 
-  const captured: unknown[] = [];
   const connection = { isHealthy: true };
   const device = { config: { state: "CONNECTED" }, name: "Test Accessory", peek(): { state: string } | undefined { return this.present ? this.config : undefined; },
     present: true };
-  const hap = { Characteristic: { StatusActive: Characteristic.StatusActive } };
-  const sink = (...args: unknown[]): void => { captured.push(args); };
-  const log = { debug: sink, error: sink, info: sink, warn: sink };
+  const log = silentLog();
   const nvr = {
 
     client: { connection },
-    platform: { api: { hap }, debug: sink, log, pluginLog: log },
+    platform: { api: { hap }, clock: new TestClock(TEST_CLOCK_EPOCH), log, pluginLog: log, testDebug: (): boolean => false },
     signal: new AbortController().signal
   };
-  const instance = new TestProtectDevice(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, device as unknown as Camera);
+  const instance = new TestProtectDevice(nvr as unknown as ProtectNvr, accessory, device as unknown as Camera);
 
   return { connection, device, instance };
 };
@@ -110,7 +113,7 @@ describe("per-accessory abort signal composition (composeSignals)", () => {
 
         // Yield to the event loop so the abort can interleave between iterations, exactly as a real observe loop awaits its next yield. The serial await is the whole
         // point of the model - a loop parked on its next value is what cleanup must be able to unblock - so the in-loop await is intentional here.
-        // eslint-disable-next-line no-await-in-loop
+        // eslint-disable-next-line no-await-in-loop -- The await is serial by intent, so an abort can interleave between iterations.
         await new Promise((resolve) => setTimeout(resolve, 1));
       }
     };
@@ -120,9 +123,8 @@ describe("per-accessory abort signal composition (composeSignals)", () => {
 
     const consume = (async (): Promise<void> => {
 
-      for await (const _tick of ticks()) {
+      for await(const _tick of ticks()) {
 
-        void _tick;
         iterations++;
       }
 
@@ -179,40 +181,22 @@ describe("reachability (real ProtectDevice)", () => {
     assert.equal(instance.isReachable, false, "a vanished record reports unreachable without throwing");
   });
 
-  test("refreshReachability writes the reachable state to every service carrying StatusActive and leaves services without it untouched", () => {
+  // No Response answers for reachability, so the connection loop's push sweeps nothing onto the accessory, and a service with no use for StatusActive grows none from it.
+  test("noteConnectionChanged writes no StatusActive onto any service, whatever the reachable state reads", () => {
 
     const accessory = makeTestAccessory();
-
-    // Two sensor services carry StatusActive; we materialize the characteristic on each, mirroring how the configure paths create it during setup.
     const motion = accessory.addService(Service.MotionSensor, "Motion");
     const occupancy = accessory.addService(Service.OccupancySensor, "Occupancy");
+    const { connection, instance } = makeReachableDevice(accessory);
 
-    motion.getCharacteristic(Characteristic.StatusActive);
-    occupancy.getCharacteristic(Characteristic.StatusActive);
+    for(const isHealthy of [ true, false ]) {
 
-    // A switch service deliberately does NOT carry StatusActive - the fan-out must skip it via the testCharacteristic guard.
-    const toggle = accessory.addService(Service.Switch, "Some Switch");
+      connection.isHealthy = isHealthy;
+      instance.noteConnectionChanged();
 
-    toggle.getCharacteristic(Characteristic.On);
-
-    const { connection, device, instance } = makeReachableDevice(accessory);
-
-    // Reachable: the real refreshReachability computes isReachable, walks accessory.services, and writes true to every StatusActive-bearing service.
-    connection.isHealthy = true;
-    device.config.state = "CONNECTED";
-    instance.refreshReachability();
-
-    assert.equal(motion.getCharacteristic(Characteristic.StatusActive).value, true, "the motion sensor's StatusActive reflects the reachable state");
-    assert.equal(occupancy.getCharacteristic(Characteristic.StatusActive).value, true, "the occupancy sensor's StatusActive reflects the reachable state");
-    assert.equal(toggle.testCharacteristic(Characteristic.StatusActive), false, "the switch never gained a StatusActive characteristic - the fan-out left it untouched");
-
-    // Unreachable (a controller outage): every StatusActive-bearing service goes inactive, the real improvement over leaving them stale-active.
-    connection.isHealthy = false;
-    instance.refreshReachability();
-
-    assert.equal(motion.getCharacteristic(Characteristic.StatusActive).value, false, "the motion sensor goes inactive when unreachable");
-    assert.equal(occupancy.getCharacteristic(Characteristic.StatusActive).value, false, "the occupancy sensor goes inactive when unreachable");
-    assert.equal(toggle.testCharacteristic(Characteristic.StatusActive), false, "the switch is still untouched after the second pass");
+      assert.equal(motion.testCharacteristic(Characteristic.StatusActive), false, "the motion sensor carries no StatusActive");
+      assert.equal(occupancy.testCharacteristic(Characteristic.StatusActive), false, "and neither does the occupancy sensor");
+    }
   });
 
   test("cleanup() aborts the composed per-accessory signal, tearing down every observe loop bound to it", () => {

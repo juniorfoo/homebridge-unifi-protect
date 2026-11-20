@@ -43,6 +43,7 @@ The reference below is generated directly from the plugin's own option catalog, 
  * [Fob](#fob): Fob
  * [Log](#log): Logging
  * [Motion](#motion): Motion &amp; Occupancy
+ * [Mqtt](#mqtt): MQTT
  * [Nvr](#nvr): Protect Controller
  * [Relay](#relay): Relay
  * [SecuritySystem](#securitysystem): Security System
@@ -52,7 +53,7 @@ The reference below is generated directly from the plugin's own option catalog, 
  * [Video.HKSV](#video.hksv): HomeKit Secure Video
  * [Video.Timeshift](#video.timeshift): Timeshift Buffer
 
-Options whose key ends in `.<value>` take a value - replace `.<value>` with your setting; all other options are simple on/off toggles. The default shown for each option is what applies when you leave it unset.
+Options whose key ends in `=<value>` take a value - replace `=<value>` with your setting; all other options are simple on/off toggles. The default shown for each option is what applies when you leave it unset.
 
 #### <A NAME="audio"></A>Audio
 
@@ -62,9 +63,9 @@ These option(s) apply to: Protect cameras.
 |----------------------------------------------------------------------------------|-------------------------------------------------------------
 | <A NAME="Audio"></A>`Audio`                                                      | Audio support. **(default: enabled)**. <BR>*Supported on Protect cameras that have a microphone.*
 | <A NAME="Audio.Filter.Noise"></A>`Audio.Filter.Noise`                            | Audio filter for ambient noise suppression. **(default: disabled)**. <BR>*Supported on Protect cameras that have a microphone.*
-| <A NAME="Audio.Filter.Noise.FftNr"></A>`Audio.Filter.Noise.FftNr.<value>`        | Noise reduction amount, in decibels, for the FFmpeg afftdn filter. **(default: 14)**.
-| <A NAME="Audio.Filter.Noise.HighPass"></A>`Audio.Filter.Noise.HighPass.<value>`  | Frequency, in Hertz, for the FFmpeg highpass filter. **(default: 150)**.
-| <A NAME="Audio.Filter.Noise.LowPass"></A>`Audio.Filter.Noise.LowPass.<value>`    | Frequency, in Hertz, for the FFmpeg lowpass filter. **(default: 9000)**.
+| <A NAME="Audio.Filter.Noise.FftNr"></A>`Audio.Filter.Noise.FftNr=<value>`        | Noise reduction amount, in decibels, for the FFmpeg afftdn filter. **(default: 14)**.
+| <A NAME="Audio.Filter.Noise.HighPass"></A>`Audio.Filter.Noise.HighPass=<value>`  | Frequency, in Hertz, for the FFmpeg highpass filter. **(default: 150)**.
+| <A NAME="Audio.Filter.Noise.LowPass"></A>`Audio.Filter.Noise.LowPass=<value>`    | Frequency, in Hertz, for the FFmpeg lowpass filter. **(default: 9000)**.
 | <A NAME="Audio.TwoWay"></A>`Audio.TwoWay`                                        | Two-way audio support on supported cameras. **(default: enabled)**. <BR>*Supported on Protect devices that have a speaker (e.g. Protect doorbells).*
 | <A NAME="Audio.TwoWay.Direct"></A>`Audio.TwoWay.Direct`                          | Send two-way audio directly to supported cameras, bypassing the controller. Useful for working around bugs in some Protect controller firmware versions. **(default: disabled)**. <BR>*Supported on Protect devices that have a speaker (e.g. Protect doorbells).*
 
@@ -76,13 +77,14 @@ These option(s) apply to: all Protect device types.
 |----------------------------------------------------------------------|-------------------------------------------------------------
 | <A NAME="Device"></A>`Device`                                        | Make this device available in HomeKit. **(default: enabled)**.
 | <A NAME="Device.StatusLed"></A>`Device.StatusLed`                    | Enable the status indicator light for this device in HomeKit. **(default: enabled)**. <BR>*Supported on Protect devices with a status LED.*
-| <A NAME="Device.StatusLed.Switch"></A>`Device.StatusLed.Switch`      | Add a switch accessory to control the status indicator light in HomeKit. **(default: disabled)**. <BR>*Supported on Protect devices with a status LED.*
+| <A NAME="Device.StatusLed.Switch"></A>`Device.StatusLed.Switch`      | Add a switch accessory to control the status indicator light in HomeKit. **(default: disabled)**. <BR>*Supported on Protect devices with a status LED, Protect lights, and Protect sensors that have a status indicator light.*
 | <A NAME="Device.NightVision"></A>`Device.NightVision`                | Enable the night vision indicator light for this device in HomeKit. **(default: enabled)**. <BR>*Supported on Protect cameras that have infrared LEDs.*
 | <A NAME="Device.NightVision.Dimmer"></A>`Device.NightVision.Dimmer`  | Add a dimmer accessory to control the night vision state in HomeKit. **(default: disabled)**. <BR>*Supported on Protect cameras that have infrared LEDs.*
-| <A NAME="Device.AmbientLightSensor"></A>`Device.AmbientLightSensor`  | Enable the ambient light sensor for this device in HomeKit. **(default: enabled)**. <BR>*Supported on Protect cameras that have an ambient light sensor.*
+| <A NAME="Device.AmbientLightSensor"></A>`Device.AmbientLightSensor`  | Enable the ambient light sensor for this device in HomeKit. **(default: enabled)**. <BR>*Supported on Protect cameras that have an ambient light sensor and Protect sensors that have an ambient light sensor.*
 | <A NAME="Device.Standalone"></A>`Device.Standalone`                  | Make this a standalone device in HomeKit that will need to be added to HomeKit through the Home app. **(default: disabled)**.
 | <A NAME="Device.SelfHealing"></A>`Device.SelfHealing`                | Attempt to restart misbehaving devices. This is always done very conservatively and only after periods of extended device-specific issues. **(default: enabled)**. <BR>*Supported on Protect cameras.*
-| <A NAME="Device.SyncName"></A>`Device.SyncName`                      | Synchronize the UniFi Protect name of this device with HomeKit. Synchronization is one-way only, syncing the device name from UniFi Protect to HomeKit. **(default: disabled)**.
+| <A NAME="Device.Name"></A>`Device.Name=<value>`                      | Custom HomeKit name for this device and its parts. It always applies, so a rename in the Home app yields to it wherever HomeKit allows. **(default: none)**.
+| <A NAME="Device.SyncName"></A>`Device.SyncName`                      | Synchronize the UniFi Protect name of this device and its parts with HomeKit. A rename in the Home app yields to it wherever HomeKit allows. A custom Name takes precedence. **(default: disabled)**.
 
 #### <A NAME="doorbell"></A>Doorbell &amp; Chime
 
@@ -96,22 +98,18 @@ These option(s) apply to: Protect cameras.
 | <A NAME="Doorbell.Messages.FromDoorbell"></A>`Doorbell.Messages.FromDoorbell`                            | Use messages saved to the Protect NVR as message switches. **(default: enabled)**. <BR>*Supported on Protect devices that have a doorbell.*
 | <A NAME="Doorbell.Volume.Dimmer"></A>`Doorbell.Volume.Dimmer`                                            | Add a dimmer accessory to control the Protect chime volume in HomeKit. **(default: disabled)**. <BR>*Supported on Protect devices that have a doorbell.*
 | <A NAME="Doorbell.PhysicalChime"></A>`Doorbell.PhysicalChime`                                            | Add switch accessories to control the physical chimes attached to a Protect doorbell. **(default: disabled)**. <BR>*Supported on Protect doorbells that have a physical chime.*
-| <A NAME="Doorbell.PhysicalChime.Duration.Digital"></A>`Doorbell.PhysicalChime.Duration.Digital.<value>`  | Chime duration, in milliseconds, of a digital physical chime attached to a Protect doorbell. **(default: 1000)**. <BR>*Supported on Protect doorbells that have a physical chime.*
+| <A NAME="Doorbell.PhysicalChime.Duration.Digital"></A>`Doorbell.PhysicalChime.Duration.Digital=<value>`  | Chime duration, in milliseconds, of a digital physical chime attached to a Protect doorbell. **(default: 1000)**. <BR>*Supported on Protect doorbells that have a physical chime.*
 | <A NAME="Doorbell.PackageCamera.Flashlight"></A>`Doorbell.PackageCamera.Flashlight`                      | Add a light accessory to control the flashlight on a Protect doorbell package camera. **(default: enabled)**. <BR>*Supported on Protect doorbells that have a package camera.*
 | <A NAME="Doorbell.Trigger"></A>`Doorbell.Trigger`                                                        | Add a switch accessory to trigger doorbell ring events on a Protect camera or doorbell. **(default: disabled)**.
+| <A NAME="Doorbell.Ring.Delay"></A>`Doorbell.Ring.Delay=<value>`                                          | Delay, in seconds, before a new doorbell ring event can be triggered, suppressing rapid duplicate rings. **(default: disabled, 15 when enabled)**. <BR>*Supported on Protect devices that have a doorbell.*
 
 #### <A NAME="fob"></A>Fob
 
 These option(s) apply to: Protect fobs.
 
-| Option                                               | Description
-|------------------------------------------------------|-------------------------------------------------------------
-| <A NAME="Fob.Button.Arm"></A>`Fob.Button.Arm`        | Make the Arm (1) fob button available in HomeKit. **(default: enabled)**. <BR>*Supported on Protect fobs.*
-| <A NAME="Fob.Button.Night"></A>`Fob.Button.Night`    | Make the Night (2) fob button available in HomeKit. **(default: enabled)**. <BR>*Supported on Protect fobs.*
-| <A NAME="Fob.Button.Disarm"></A>`Fob.Button.Disarm`  | Make the Disarm (3) fob button available in HomeKit. **(default: enabled)**. <BR>*Supported on Protect fobs.*
-| <A NAME="Fob.Button.Panic"></A>`Fob.Button.Panic`    | Make the Panic (4) fob button available in HomeKit. **(default: enabled)**. <BR>*Supported on Protect fobs.*
-| <A NAME="Fob.Button.Right"></A>`Fob.Button.Right`    | Make the Right fob button available in HomeKit. **(default: enabled)**. <BR>*Supported on Protect fobs.*
-| <A NAME="Fob.Button.Left"></A>`Fob.Button.Left`      | Make the Left fob button available in HomeKit. **(default: enabled)**. <BR>*Supported on Protect fobs.*
+| Option                                           | Description
+|--------------------------------------------------|-------------------------------------------------------------
+| <A NAME="Fob.Buttons"></A>`Fob.Buttons=<value>`  | Make the selected fob buttons available in HomeKit. Every button is available by default; select specific buttons to expose only those. Choices: `arm` (Arm (1)), `night` (Night (2)), `disarm` (Disarm (3)), `panic` (Panic (4)), `right` (Right), `left` (Left). **(default: all)**. <BR>*Supported on Protect fobs.*
 
 #### <A NAME="log"></A>Logging
 
@@ -120,8 +118,9 @@ These option(s) apply to: Protect cameras, Protect lights, and Protect sensors.
 | Option                                     | Description
 |--------------------------------------------|-------------------------------------------------------------
 | <A NAME="Log.Doorbell"></A>`Log.Doorbell`  | Log doorbell ring events in Homebridge. **(default: enabled)**. <BR>*Supported on Protect cameras.*
-| <A NAME="Log.HKSV"></A>`Log.HKSV`          | Log HomeKit Secure Video recording events in Homebridge. **(default: disabled)**. <BR>*Supported on Protect cameras.*
+| <A NAME="Log.HKSV"></A>`Log.HKSV`          | Log HomeKit Secure Video recording events in Homebridge. **(default: disabled)**. <BR>*Supported on Protect cameras that have a motion sensor.*
 | <A NAME="Log.Motion"></A>`Log.Motion`      | Log motion events in Homebridge. **(default: disabled)**. <BR>*Supported on Protect devices that have a motion sensor.*
+| <A NAME="Log.FFmpeg"></A>`Log.FFmpeg`      | Log verbose FFmpeg output in Homebridge. Expect a significant amount of additional logging whenever FFmpeg is active. **(default: disabled)**. <BR>*Supported on Protect cameras.*
 
 #### <A NAME="motion"></A>Motion &amp; Occupancy
 
@@ -129,30 +128,21 @@ These option(s) apply to: Protect cameras, Protect lights, and Protect sensors.
 
 | Option                                                                                                               | Description
 |----------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------
-| <A NAME="Motion.Duration"></A>`Motion.Duration.<value>`                                                              | Duration, in seconds, of a single motion event, before allowing a new one. **(default: 10)**.
-| <A NAME="Motion.OccupancySensor"></A>`Motion.OccupancySensor`                                                        | Add an occupancy sensor accessory using motion sensor activity to determine occupancy. By default, any motion will trigger occupancy. If the smart detection feature option is enabled, it will be used instead. **(default: disabled)**. <BR>*Supported on Protect devices that have a motion sensor.*
-| <A NAME="Motion.OccupancySensor.Duration"></A>`Motion.OccupancySensor.Duration.<value>`                              | Duration, in seconds, to wait without receiving a motion event to determine when occupancy is no longer detected. **(default: 300)**.
-| <A NAME="Motion.OccupancySensor.Animal"></A>`Motion.OccupancySensor.Animal`                                          | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's animal detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.Face"></A>`Motion.OccupancySensor.Face`                                              | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's face detection to trigger occupancy. **(default: enabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.LicensePlate"></A>`Motion.OccupancySensor.LicensePlate`                              | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's license plate detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.Package"></A>`Motion.OccupancySensor.Package`                                        | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's package detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.Person"></A>`Motion.OccupancySensor.Person`                                          | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's person detection to trigger occupancy. **(default: enabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.Vehicle"></A>`Motion.OccupancySensor.Vehicle`                                        | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's vehicle detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.AlrmBabyCry"></A>`Motion.OccupancySensor.AlrmBabyCry`                                | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's baby crying audio detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.AlrmBark"></A>`Motion.OccupancySensor.AlrmBark`                                      | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's bark audio detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.AlrmBurglar"></A>`Motion.OccupancySensor.AlrmBurglar`                                | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's car alarm audio detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.AlrmCarHorn"></A>`Motion.OccupancySensor.AlrmCarHorn`                                | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's car horn audio detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.AlrmCmonx"></A>`Motion.OccupancySensor.AlrmCmonx`                                    | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's CO alarm audio detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.alrmGlassBreak"></A>`Motion.OccupancySensor.alrmGlassBreak`                          | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's glass break audio detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.AlrmSiren"></A>`Motion.OccupancySensor.AlrmSiren`                                    | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's siren audio detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.AlrmSmoke"></A>`Motion.OccupancySensor.AlrmSmoke`                                    | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's smoke alarm audio detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.AlrmSpeak"></A>`Motion.OccupancySensor.AlrmSpeak`                                    | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's speaking audio detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.OccupancySensor.Smoke_cmonx"></A>`Motion.OccupancySensor.Smoke_cmonx`                                | When using both the occupancy sensor and smart detection feature options, use UniFi Protect's CO and smoke alarm audio detection to trigger occupancy. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
+| <A NAME="Motion.Duration"></A>`Motion.Duration=<value>`                                                              | Duration, in seconds, of a single motion event, before allowing a new one. **(default: 10)**.
+| <A NAME="Motion.OccupancySensor"></A>`Motion.OccupancySensor=<value>`                                                | Add an occupancy sensor accessory using motion sensor activity to determine occupancy. By default, any motion will trigger occupancy. When the smart detection feature option is enabled, the detection types selected here drive occupancy instead, defaulting to face and person detection. Selecting none of them means no smart detection triggers occupancy at all. **(default: disabled, face,person when enabled)**. <BR>*Supported on Protect devices that have a motion sensor.*
+| <A NAME="Motion.OccupancySensor.Duration"></A>`Motion.OccupancySensor.Duration=<value>`                              | Duration, in seconds, to wait without receiving a motion event to determine when occupancy is no longer detected. **(default: 300)**.
 | <A NAME="Motion.SmartDetect"></A>`Motion.SmartDetect`                                                                | Use UniFi Protect smart detection for HomeKit motion events when on a supported device. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.SmartDetect.ObjectSensors"></A>`Motion.SmartDetect.ObjectSensors`                                    | Add contact sensors for each smart detection object type that UniFi Protect supports. **(default: disabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
-| <A NAME="Motion.SmartDetect.ObjectSensors.LicensePlate"></A>`Motion.SmartDetect.ObjectSensors.LicensePlate.<value>`  | Add a contact sensor accessory that will match a specific license plate detected by UniFi Protect. You may specify multiple license plates by using hyphens to distinguish unique license plates (e.g. PLATE1-PLATE2-PLATE3). **(default: none)**. <BR>*Supported on Protect devices that support license plate smart detection.*
+| <A NAME="Motion.SmartDetect.ObjectSensors"></A>`Motion.SmartDetect.ObjectSensors=<value>`                            | Add contact sensors for the smart detection object types this camera reports. Every type it detects is included by default; select specific types to add sensors for only those. **(default: disabled, all when enabled)**. <BR>*Supported on Protect devices that support smart motion detection (e.g. G4-series cameras and better).*
+| <A NAME="Motion.SmartDetect.ObjectSensors.LicensePlate"></A>`Motion.SmartDetect.ObjectSensors.LicensePlate=<value>`  | Add a contact sensor accessory for each license plate you want UniFi Protect to match. Enter the plates one at a time; they are stored as a comma-separated list (e.g. PLATE1,PLATE2,PLATE3). **(default: none)**. <BR>*Supported on Protect devices that support license plate smart detection.*
 | <A NAME="Motion.Switch"></A>`Motion.Switch`                                                                          | Add a switch accessory to activate or deactivate motion detection in HomeKit. **(default: disabled)**. <BR>*Supported on Protect devices that have a motion sensor.*
 | <A NAME="Motion.Trigger"></A>`Motion.Trigger`                                                                        | Add a switch accessory to manually trigger a motion detection event in HomeKit. **(default: disabled)**. <BR>*Supported on Protect devices that have a motion sensor.*
+
+#### <A NAME="mqtt"></A>MQTT
+
+| Option                                         | Description
+|------------------------------------------------|-------------------------------------------------------------
+| <A NAME="Mqtt.Url"></A>`Mqtt.Url=<value>`      | URL of the MQTT broker to connect to (e.g. mqtt://1.2.3.4). **(default: none)**.
+| <A NAME="Mqtt.Topic"></A>`Mqtt.Topic=<value>`  | Topic prefix for published and subscribed MQTT messages. **(default: unifi/protect)**.
 
 #### <A NAME="nvr"></A>Protect Controller
 
@@ -160,21 +150,21 @@ These option(s) apply to: Protect cameras and Protect controllers.
 
 | Option                                                                 | Description
 |------------------------------------------------------------------------|-------------------------------------------------------------
-| <A NAME="Nvr.Service.Playlist"></A>`Nvr.Service.Playlist.<value>`      | Publish an M3U playlist of Protect cameras on the specified port of this Homebridge server that is suitable for use in apps (e.g. Channels DVR) that can make camera livestreams available through them. **(default: 10110)**. <BR>*Supported on Protect controllers.*
-| <A NAME="Nvr.DelayDeviceRemoval"></A>`Nvr.DelayDeviceRemoval.<value>`  | Delay, in seconds, before removing devices that are no longer detected on the Protect controller. Removal is held off while the controller is unreachable or restarting, and resumes once it is healthy again: immediately, if the delay is disabled. **(default: 60)**. <BR>*Supported on Protect controllers.*
+| <A NAME="Nvr.Service.Playlist"></A>`Nvr.Service.Playlist=<value>`      | Publish an M3U playlist of Protect cameras on the specified port of this Homebridge server that is suitable for use in apps (e.g. Channels DVR) that can make camera livestreams available through them. **(default: disabled, 10110 when enabled)**. <BR>*Supported on Protect controllers.*
+| <A NAME="Nvr.DelayDeviceRemoval"></A>`Nvr.DelayDeviceRemoval=<value>`  | Delay, in seconds, before removing devices that are no longer detected on the Protect controller. Removal is held off until the controller has been healthy for ten minutes, and this delay then applies. **(default: 60)**. <BR>*Supported on Protect controllers.*
 | <A NAME="Nvr.Publish.Telemetry"></A>`Nvr.Publish.Telemetry`            | Publish all the realtime telemetry received from the Protect controller to MQTT. **(default: disabled)**. <BR>*Supported on Protect controllers.*
-| <A NAME="Nvr.Reboot"></A>`Nvr.Reboot.<value>`                          | Proactively reboot the UniFi Protect controller on a scheduled interval, in hours. Active HomeKit Secure Video recording events will be allowed to complete before rebooting. Use with care. **(default: 6)**. <BR>*Supported on Protect controllers.*
+| <A NAME="Nvr.Reboot"></A>`Nvr.Reboot=<value>`                          | Proactively reboot the UniFi Protect controller on a scheduled interval, in hours. Active HomeKit Secure Video recording events will be allowed to complete before rebooting. Use with care. **(default: disabled, 6 when enabled)**. <BR>*Supported on Protect controllers.*
 | <A NAME="Nvr.Recording.Switch"></A>`Nvr.Recording.Switch`              | Add switch accessories to control the native recording capabilities of the UniFi Protect NVR. **(default: disabled)**. <BR>*Supported on Protect cameras.*
 | <A NAME="Nvr.SystemInfo"></A>`Nvr.SystemInfo`                          | Add sensor accessories to display the Protect controller system information (currently only the temperature). **(default: disabled)**. <BR>*Supported on Protect controllers.*
+| <A NAME="Nvr.OverrideAddress"></A>`Nvr.OverrideAddress=<value>`        | Override the address used when livestreaming from cameras attached to this controller. This option is intended for unusual network topologies and is unavailable for stacked controller configurations. **(default: none)**. <BR>*Supported on Protect controllers.*
 
 #### <A NAME="relay"></A>Relay
 
 These option(s) apply to: Protect relays.
 
-| Option                                         | Description
-|------------------------------------------------|-------------------------------------------------------------
-| <A NAME="Relay.Output.1"></A>`Relay.Output.1`  | Make relay output 1 available in HomeKit as a switch. **(default: enabled)**. <BR>*Supported on Protect relays.*
-| <A NAME="Relay.Output.2"></A>`Relay.Output.2`  | Make relay output 2 available in HomeKit as a switch. **(default: enabled)**. <BR>*Supported on Protect relays.*
+| Option                                               | Description
+|------------------------------------------------------|-------------------------------------------------------------
+| <A NAME="Relay.Outputs"></A>`Relay.Outputs=<value>`  | Make the selected relay outputs available in HomeKit as switches. Every output the relay reports is available by default; select specific outputs to expose only those. **(default: all)**. <BR>*Supported on Protect relays.*
 
 #### <A NAME="securitysystem"></A>Security System
 
@@ -190,7 +180,8 @@ These option(s) apply to: Protect sensors.
 
 | Option                                                       | Description
 |--------------------------------------------------------------|-------------------------------------------------------------
-| <A NAME="Sensor.MoistureSensor"></A>`Sensor.MoistureSensor`  | Expose the Protect leak sensor as a contact sensor instead of a leak sensor. This is useful for automation scenarios since HomeKit contact sensors offer more flexible automation options than leak sensors, which are primarily designed for alerts. **(default: disabled)**.
+| <A NAME="Sensor.Vape"></A>`Sensor.Vape`                      | Add a contact sensor that opens when the sensor detects vaping. **(default: disabled)**. <BR>*Supported on Protect sensors that detect vaping.*
+| <A NAME="Sensor.MoistureSensor"></A>`Sensor.MoistureSensor`  | Expose the Protect leak sensor as a contact sensor instead of a leak sensor. This is useful for automation scenarios since HomeKit contact sensors offer more flexible automation options than leak sensors, which are primarily designed for alerts. **(default: disabled)**. <BR>*Supported on Protect sensors that have a leak sensor.*
 
 #### <A NAME="unifi.access"></A>UniFi Access
 
@@ -206,19 +197,18 @@ These option(s) apply to: Protect cameras.
 
 | Option                                                                                           | Description
 |--------------------------------------------------------------------------------------------------|-------------------------------------------------------------
+| <A NAME="Video.FFmpeg.Path"></A>`Video.FFmpeg.Path=<value>`                                      | Path to the FFmpeg executable HBUP uses for streaming and recording. Default: the bundled FFmpeg build for your platform, or the first FFmpeg found in your path. **(default: none)**.
 | <A NAME="Video.Transcode.Hardware"></A>`Video.Transcode.Hardware`                                | Use hardware-accelerated transcoding when available (Apple Macs, Intel Quick Sync Video-enabled CPUs, Raspberry Pi 4). **(default: enabled)**.
 | <A NAME="Video.Transcode"></A>`Video.Transcode`                                                  | Transcode low-latency livestreams (e.g. at home) instead of using H.264 copy when the source already matches the HomeKit request. **(default: disabled)**.
-| <A NAME="Video.Transcode.Bitrate"></A>`Video.Transcode.Bitrate.<value>`                          | When transcoding at home, uses this bitrate (kbps) if greater than zero, otherwise HomeKit's requested bitrate; either way capped at the source channel bitrate (kbps). Copy sends the camera's own bitrate. **(default: 2000)**.
+| <A NAME="Video.Transcode.Bitrate"></A>`Video.Transcode.Bitrate=<value>`                          | When transcoding at home, uses this bitrate (kbps) if greater than zero, otherwise HomeKit's requested bitrate; either way capped at the source channel bitrate (kbps). Copy sends the camera's own bitrate. **(default: 2000)**.
 | <A NAME="Video.Transcode.HighLatency"></A>`Video.Transcode.HighLatency`                          | Transcode high-latency livestreams (e.g. cellular) instead of H.264 copy when the source matches the HomeKit request. **(default: enabled)**.
-| <A NAME="Video.Transcode.HighLatency.Bitrate"></A>`Video.Transcode.HighLatency.Bitrate.<value>`  | When transcoding on cellular/high-latency connections, uses this bitrate (kbps) if greater than zero, otherwise HomeKit's requested bitrate; either way capped at the source channel bitrate (kbps). Copy sends the camera's own bitrate. **(default: 1000)**.
-| <A NAME="Video.Rtsp.Only.High"></A>`Video.Rtsp.Only.High`                                        | When livestreaming directly from the camera over RTSP, force the use of the high quality video stream from the Protect controller. **(default: disabled)**.
-| <A NAME="Video.Rtsp.Only.Medium"></A>`Video.Rtsp.Only.Medium`                                    | When livestreaming directly from the camera over RTSP, force the use of the medium quality video stream from the Protect controller. **(default: disabled)**.
-| <A NAME="Video.Rtsp.Only.Low"></A>`Video.Rtsp.Only.Low`                                          | When livestreaming directly from the camera over RTSP, force the use of the low quality video stream from the Protect controller. **(default: disabled)**.
+| <A NAME="Video.Transcode.HighLatency.Bitrate"></A>`Video.Transcode.HighLatency.Bitrate=<value>`  | When transcoding on cellular/high-latency connections, uses this bitrate (kbps) if greater than zero, otherwise HomeKit's requested bitrate; either way capped at the source channel bitrate (kbps). Copy sends the camera's own bitrate. **(default: 1000)**.
+| <A NAME="Video.Rtsp.Only"></A>`Video.Rtsp.Only=<value>`                                          | When livestreaming directly from the camera over RTSP, force the use of a single video stream quality from the Protect controller. Choose exactly one of High, Medium, or Low. When this option is disabled, Protect negotiates the best available stream. Choices: `High`, `Medium`, `Low`. **(default: disabled, Medium when enabled)**.
 | <A NAME="Video.Crop"></A>`Video.Crop`                                                            | Crop the camera video stream. Enabling this option will also force transcoding of livestreams. **(default: disabled)**.
-| <A NAME="Video.Crop.X"></A>`Video.Crop.X.<value>`                                                | Left offset of the crop window, as a percentage of the original image width. **(default: 0)**.
-| <A NAME="Video.Crop.Y"></A>`Video.Crop.Y.<value>`                                                | Top offset of the crop window, as a percentage of the original image height. **(default: 0)**.
-| <A NAME="Video.Crop.Width"></A>`Video.Crop.Width.<value>`                                        | Width of the crop window, as a percentage of original image width. **(default: 100)**.
-| <A NAME="Video.Crop.Height"></A>`Video.Crop.Height.<value>`                                      | Height of the crop window, as a percentage of original image height. **(default: 100)**.
+| <A NAME="Video.Crop.X"></A>`Video.Crop.X=<value>`                                                | Left offset of the crop window, as a percentage of the original image width. **(default: 0)**.
+| <A NAME="Video.Crop.Y"></A>`Video.Crop.Y=<value>`                                                | Top offset of the crop window, as a percentage of the original image height. **(default: 0)**.
+| <A NAME="Video.Crop.Width"></A>`Video.Crop.Width=<value>`                                        | Width of the crop window, as a percentage of original image width. **(default: 100)**.
+| <A NAME="Video.Crop.Height"></A>`Video.Crop.Height=<value>`                                      | Height of the crop window, as a percentage of original image height. **(default: 100)**.
 | <A NAME="Video.HighResSnapshots"></A>`Video.HighResSnapshots`                                    | Enable higher quality snapshots. **(default: enabled)**.
 
 #### <A NAME="video.hksv"></A>HomeKit Secure Video
@@ -234,12 +224,10 @@ These option(s) apply to: Protect cameras.
 
 These option(s) apply to: Protect cameras.
 
-| Option                                                                   | Description
-|--------------------------------------------------------------------------|-------------------------------------------------------------
-| <A NAME="Video.Timeshift.Livestream"></A>`Video.Timeshift.Livestream`    | Maintain a rolling timeshift buffer of the camera's livestream to power live viewing, HomeKit Secure Video, and snapshots. Disabling this streams live views directly from the camera over RTSP instead. **(default: enabled)**.
-| <A NAME="Video.Timeshift.Only.High"></A>`Video.Timeshift.Only.High`      | Populate the timeshift buffer that feeds HomeKit Secure Video, buffer-backed live views, and snapshots from the high quality video stream from the Protect controller. **(default: disabled)**.
-| <A NAME="Video.Timeshift.Only.Medium"></A>`Video.Timeshift.Only.Medium`  | Populate the timeshift buffer that feeds HomeKit Secure Video, buffer-backed live views, and snapshots from the medium quality video stream from the Protect controller. **(default: disabled)**.
-| <A NAME="Video.Timeshift.Only.Low"></A>`Video.Timeshift.Only.Low`        | Populate the timeshift buffer that feeds HomeKit Secure Video, buffer-backed live views, and snapshots from the low quality video stream from the Protect controller. **(default: disabled)**.
+| Option                                                                 | Description
+|------------------------------------------------------------------------|-------------------------------------------------------------
+| <A NAME="Video.Timeshift.Livestream"></A>`Video.Timeshift.Livestream`  | Maintain a rolling timeshift buffer of the camera's livestream to power live viewing, HomeKit Secure Video, and snapshots. Disabling this streams live views directly from the camera over RTSP whenever an RTSP-enabled stream is available. **(default: enabled)**.
+| <A NAME="Video.Timeshift.Only"></A>`Video.Timeshift.Only=<value>`      | Populate the timeshift buffer that feeds HomeKit Secure Video, buffer-backed live views, and snapshots from a single video stream quality on the Protect controller. Choose exactly one of High, Medium, or Low. When this option is disabled, Protect negotiates the best available stream. Choices: `High`, `Medium`, `Low`. **(default: disabled, High when enabled)**.
 
 <!-- FEATURE OPTIONS:END -->
 
