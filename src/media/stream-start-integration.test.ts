@@ -103,14 +103,14 @@ function makeStartRequest(overrides?: { packetTime?: number }): StartStreamReque
   } as unknown as StartStreamRequest;
 }
 
-function makePrepareRequest(): PrepareStreamRequest {
+function makePrepareRequest(overrides?: { addressVersion?: "ipv4" | "ipv6"; targetAddress?: string }): PrepareStreamRequest {
 
   return {
 
-    addressVersion: "ipv4",
+    addressVersion: overrides?.addressVersion ?? "ipv4",
     audio: { port: 12345, srtpCryptoSuite: 0, srtp_key: Buffer.alloc(16), srtp_salt: Buffer.alloc(14) },
     sessionID: SESSION_ID,
-    targetAddress: "127.0.0.1",
+    targetAddress: overrides?.targetAddress ?? "127.0.0.1",
     video: { port: 12347, srtpCryptoSuite: 0, srtp_key: Buffer.alloc(16), srtp_salt: Buffer.alloc(14) }
   } as unknown as PrepareStreamRequest;
 }
@@ -338,11 +338,12 @@ async function wireRealTimeshiftBuffer(ctx: HarnessContext, _bufferSub: Controll
   return buffer;
 }
 
-async function prepareAndStart(ctx: HarnessContext, startRequest: StartStreamRequest = makeStartRequest()): Promise<void> {
+async function prepareAndStart(ctx: HarnessContext, startRequest: StartStreamRequest = makeStartRequest(),
+  prepareRequest: PrepareStreamRequest = makePrepareRequest()): Promise<void> {
 
   await new Promise<void>((resolve, reject) => {
 
-    ctx.delegate.prepareStream(makePrepareRequest(), (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    ctx.delegate.prepareStream(prepareRequest, (error) => ((error instanceof Error) ? reject(error) : resolve()));
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -364,6 +365,23 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
   after(() => {
 
     setLiveVideoFfmpegSpawnerForTests(undefined);
+  });
+
+  test("IPv6 HomeKit client address uses bracketed srtpDestination in tee sinks (not raw concatenation)", async () => {
+
+    const ctx = createHarness();
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+
+    await prepareAndStart(ctx, makeStartRequest(), makePrepareRequest({ addressVersion: "ipv6", targetAddress: "fd00::1:2" }));
+
+    const teeArg = (ctx.spawnedArgs[0] ?? []).find((part) => part.includes("srtp://"));
+
+    assert.ok(teeArg, "tee sink must include an srtp destination");
+    assert.ok(teeArg.includes("srtp://[fd00::1:2]:"), "IPv6 must be bracketed via srtpDestination (raw srtp://fd00:: would be wrong)");
+    assert.doesNotMatch(teeArg, /srtp:\/\/fd00::1:2:/);
   });
 
   test("buffer with matching init prefix chooses copy (ffmpeg args and decision log)", async () => {

@@ -14,9 +14,10 @@ import { TestLiveStreamingFfmpegProcess } from "./test-live-ffmpeg-process.ts";
 import type { LiveVideoEncodeDecision } from "./stream-transcode-policy.ts";
 import { resolveStreamOutputFps, resolveVideoCopyExitBridgeAction } from "./stream-transcode-policy.ts";
 import { appendLiveVideoEncodeToFfmpegArgs, buildLiveVideoEncodeInput, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge,
-  refreshBufferBackedChannelProfileForEncode, resolveCopyEscalationKeyframePrimingBuffer, resolveFmp4InitForLiveDeclaredCheck, resolveStartStreamEncodePlan,
-  resolveStartStreamForceTranscodeDueToUserOption, resolveStreamEgressBitrateBps, resolveTimeshiftBufferLiveChannel,
+  refreshBufferBackedChannelProfileForEncode, resolveCopyEscalationKeyframePrimingBuffer, resolveFmp4InitForLiveDeclaredCheck, resolveLiveStreamTranscodePipelineOptions,
+  resolveStartStreamEncodePlan, resolveStartStreamForceTranscodeDueToUserOption, resolveStreamEgressBitrateBps, resolveTimeshiftBufferLiveChannel,
   shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
+import type { LiveStreamEncoderPipelineOptions } from "./stream-live-wiring.ts";
 import type { ChannelProfile } from "./resolution.ts";
 import { parseH264AvcCFromFmp4Init } from "./h264-fmp4-avcc.ts";
 import { TEST_H264_MAIN_PPS, testH264SpsForProfileLevel } from "./h264-test-bytes.ts";
@@ -107,6 +108,44 @@ const stubFfmpegOptions: FfmpegOptions = new FfmpegOptionsImpl({
   log: { debug: () => undefined, error: () => undefined, info: () => undefined, warn: () => undefined },
   name: (): string => "stub-camera"
 });
+
+function makeAppleHardwareFfmpegOptions(): FfmpegOptions {
+
+  const base = new FfmpegOptionsImpl({
+
+    codecSupport: {
+
+      cpuGeneration: 3,
+      ffmpegAtLeast: (): boolean => true,
+      gpuMem: 0,
+      hasDecoder: (): boolean => true,
+      hasEncoder: (): boolean => true,
+      hasHwAccel: (): boolean => true,
+      hostSystem: "macOS.Apple"
+    } as never,
+    crop: undefined,
+    debug: false,
+    hardwareDecoding: true,
+    hardwareTranscoding: true,
+    log: { debug: (): void => undefined, error: (): void => undefined, info: (): void => undefined, warn: (): void => undefined },
+    name: (): string => "hardware-wiring-test"
+  });
+
+  return new Proxy(base, {
+
+    get(target, property, receiver): unknown {
+
+      if(property === "hardwareEncodes") {
+
+        return (): boolean => true;
+      }
+
+      const value: unknown = Reflect.get(target, property, receiver);
+
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+}
 
 function encodePlan(camera: TestCameraHost, init: Buffer | null, sessionSource: "buffer" | "rtsp", force = false): ReturnType<typeof resolveStartStreamEncodePlan> {
 
@@ -424,47 +463,9 @@ describe("appendLiveVideoEncodeToFfmpegArgs output fps", () => {
       }
     });
 
-    appendLiveVideoEncodeToFfmpegArgs(spyingOptions, args, transcodeDecision, channel, request, 800, useInterpolation, true);
+    appendLiveVideoEncodeToFfmpegArgs(spyingOptions, args, transcodeDecision, channel, request, 800, useInterpolation, true, testCameraHost());
 
     return { args: args, streamEncoderCalls: streamEncoderCalls };
-  }
-
-  function makeAppleHardwareFfmpegOptions(): FfmpegOptions {
-
-    const base = new FfmpegOptionsImpl({
-
-      codecSupport: {
-
-        cpuGeneration: 3,
-        ffmpegAtLeast: (): boolean => true,
-        gpuMem: 0,
-        hasDecoder: (): boolean => true,
-        hasEncoder: (): boolean => true,
-        hasHwAccel: (): boolean => true,
-        hostSystem: "macOS.Apple"
-      } as never,
-      crop: undefined,
-      debug: false,
-      hardwareDecoding: true,
-      hardwareTranscoding: true,
-      log: { debug: (): void => undefined, error: (): void => undefined, info: (): void => undefined, warn: (): void => undefined },
-      name: (): string => "hardware-wiring-test"
-    });
-
-    return new Proxy(base, {
-
-      get(target, property, receiver): unknown {
-
-        if(property === "hardwareEncodes") {
-
-          return (): boolean => true;
-        }
-
-        const value: unknown = Reflect.get(target, property, receiver);
-
-        return typeof value === "function" ? value.bind(target) : value;
-      }
-    });
   }
 
   const UPSTREAM_MINTERPOLATE_SUFFIX = ":mi_mode=mci:mc_mode=aobmc:me=fss:me_mode=bidir:vsbmc=1:scd=none";
@@ -632,5 +633,50 @@ describe("appendLiveVideoEncodeToFfmpegArgs output fps", () => {
     const { args } = appendEncodeArgs(15, 30, true);
 
     assert.equal(callerFpsFilterChain(filterArg(args)), null);
+  });
+});
+
+describe("resolveLiveStreamTranscodePipelineOptions — decoder/encoder object parity (upstream 5586429)", () => {
+
+  const transcodeDecision: LiveVideoEncodeDecision = { logReason: "wiring", mode: "transcode" };
+
+  function assertInterpolatingDecoderMatchesEncoder(inputCodec: string, sourceFps: number, requestFps: number): void {
+
+    const ffmpegOptions = makeAppleHardwareFfmpegOptions();
+    const camera = testCameraHost();
+
+    camera.ufp = { ...camera.ufp, videoCodec: inputCodec };
+
+    const channel = {
+
+      channel: { bitrate: 4000000, fps: sourceFps, height: 720, id: 1, name: "medium", width: 1280 },
+      name: "medium"
+    } as ChannelProfile;
+    const request = makeRequest();
+
+    request.video.fps = requestFps;
+
+    const pipelineOptions = resolveLiveStreamTranscodePipelineOptions(camera, transcodeDecision, channel, request, 800, true) as LiveStreamEncoderPipelineOptions;
+    const decoderArgs = ffmpegOptions.videoDecoder(pipelineOptions);
+    const encoderArgs = ffmpegOptions.streamEncoder(pipelineOptions);
+    const decoderInputCodecOnly = ffmpegOptions.videoDecoder({ inputCodec: inputCodec });
+
+    assert.equal(pipelineOptions.inputCodec, inputCodec);
+    assert.notDeepEqual(decoderArgs, decoderInputCodecOnly,
+      "interpolating transcode must not use a decoder bag with inputCodec alone (macOS Apple HW regression)");
+    assert.deepEqual(decoderArgs, ffmpegOptions.videoDecoder(pipelineOptions),
+      "videoDecoder must consume the same options object passed to streamEncoder");
+    assert.ok(encoderArgs.includes("-filter:v"), "encoder must receive interpolation filters when Apple interpolation is active");
+    assert.match(encoderArgs.join(" "), /minterpolate=/);
+  }
+
+  test("H.264 interpolating transcode shares one pipeline bag between decoder and encoder", () => {
+
+    assertInterpolatingDecoderMatchesEncoder("h264", 30, 15);
+  });
+
+  test("HEVC interpolating transcode shares one pipeline bag between decoder and encoder", () => {
+
+    assertInterpolatingDecoderMatchesEncoder("hevc", 30, 15);
   });
 });

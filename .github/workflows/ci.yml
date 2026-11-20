@@ -43,4 +43,5 @@ jobs:
           CI: true
         run: |
           npm ci
+          npm run check-docs
           npm test

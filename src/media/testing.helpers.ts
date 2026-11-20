@@ -458,65 +458,76 @@ export interface ControllableLivestreamDouble extends LivestreamSubscription {
 
 /* Build a controllable LivestreamSubscription double for a standalone timeshift behavior test.
  *
- * The iterator is the lost-wakeup-safe drain-loop the parking double established, generalized to a runtime-fed queue: it holds a queue of items
- * ({ kind: "segment" } | { kind: "end" } | { kind: "error" }), and on each turn it DRAINS THE WHOLE QUEUE - shifting and acting on every queued item (yield a segment,
- * return on end, throw on error) - and ONLY parks on a fresh one-shot resolver when the queue is empty and the double is not yet terminated; on wake it RE-CHECKS the
- * queue and continues the drain. Draining the whole queue per wake is required: a naive park/yield-one/re-park strands a second segment pushed under one wake
- * (empirically reproduced), so a two-push-then-drain self-test would observe only the first.
+ * Each active `for await` iterator owns its own queue. `push`/`end`/`throwError` broadcast to every active iterator (pooled shared-feed fanout). When no iterator is
+ * active, items are held in an orphan queue replayed into the next iterator that attaches (so a broken first consumer does not strand segments for a second consumer).
  *
- * The park keeps isStarted true: while the queue is open and the double is not ended/disposed the generator NEVER completes (it parks), so the timeshift's
- * consumeSegments for-await stays open, its finally does not run, the subscription stays committed, and timeshift.isStarted reports true. end()/throwError()/dispose are
- * the iterator-termination drivers that feed that finally: each enqueues its terminal item AFTER any queued segments (drain-then-close, so queued media is not
- * dropped) and wakes the iterator. whenEstablished resolves immediately (default true) so start() commits the subscription before the test pushes media; setting
- * deferEstablishment instead holds whenEstablished open until releaseEstablishment() resolves it true, so a start can be held in flight across a racing shutdown().
+ * The iterator drain-loop processes the whole queue, then parks on a one-shot resolver until another broadcast wake (the lost-wakeup-safe pattern). The park keeps
+ * `isStarted` true on the timeshift buffer: while the queue is open and the double is not ended, the generator suspends instead of completing, so `consumeSegments`
+ * stays attached.
  *
- * The terminal transition is one-shot and safe to repeat: once the generator has returned (end/dispose) or thrown (error), the double is terminated and
- * push/end/throwError and a second dispose are NO-OPS, and the parking resolver is resolved at most once (guarded so no double-resolve). asyncDispose records disposed =
- * true and signals a graceful end if the double is not already terminated.
+ * `end`/`throwError`/`dispose` set global terminated, enqueue terminal items to every active iterator, and make further `push`/`end`/`throwError` no-ops. When
+ * `deferEstablishment` is set, `whenEstablished()` parks until `releaseEstablishment()` resolves true (otherwise `whenEstablished` resolves immediately, default true).
+ *
+ * An iterator created after global terminate with no pending orphan items completes immediately (does not park forever).
  */
 export function makeControllableLivestreamDouble(options: { deferEstablishment?: boolean; description?: LivestreamDescription; id?: string;
   initSegment?: LivestreamInit | null; state?: LivestreamSubscriptionState; whenEstablished?: boolean; } = {}): ControllableLivestreamDouble {
 
-  // The runtime-fed item queue and the lifecycle flags. terminated latches once the generator returns or throws, after which every control method no-ops.
-  const queue: ({ kind: "segment"; segment: Segment } | { kind: "end" } | { kind: "error"; error: unknown })[] = [];
+  type QueueItem = { kind: "segment"; segment: Segment } | { kind: "end" } | { kind: "error"; error: unknown };
+
+  // One queue and park resolver per active iterator so a pooled buffer plus live session each receive the same pushed segments (shared encoder fanout).
+  interface IteratorFanout { queue: QueueItem[]; terminated: boolean; wakeResolver: (() => void) | null }
+  const iterators = new Set<IteratorFanout>();
+  // Segments pushed while no iterator is attached are replayed into the next iterator (not fan-out to concurrent iterators).
+  const orphanQueue: QueueItem[] = [];
   let terminated = false;
   let disposed = false;
   let reassessCalls = 0;
 
-  // Resolve the init segment, distinguishing "option omitted" (default to a populated init so start() commits, described by the description option or as no tracks)
-  // from "option explicitly null" (the start-validation arm the timeshift declines on). A plain ?? cannot make that distinction - it treats an explicit null as nullish
-  // and would override it with the default - so we branch on strict undefined.
   const initSegment = (options.initSegment === undefined) ? { codec: "h264", data: INIT_SEGMENT_DATA, description: options.description ?? NO_TRACKS } :
     options.initSegment;
 
-  // The one-shot park resolver: the generator stores its resolver here before awaiting, and wake() resolves and clears it. Holding at most one resolver and clearing it
-  // on resolve guarantees no double-resolve and no stale wake.
-  let wakeResolver: (() => void) | null = null;
+  const wakeAll = (): void => {
 
-  // The deferred-establishment gate for the shutdown-versus-in-flight-start race. When deferEstablishment is set, whenEstablished() parks on this resolver until the
-  // test calls releaseEstablishment(), so a start can be held in flight while shutdown() runs and then committed afterward. The release resolves to true specifically,
-  // since a release-to-decline would never commit the subscription. Without the gate, whenEstablished resolves immediately.
-  let establishmentResolver: ((established: boolean) => void) | null = null;
+    for(const iterator of iterators) {
 
-  // Wake a parked generator, if one is parked. Resolving and clearing in one step keeps the resolver one-shot.
-  const wake = (): void => {
+      const resolve = iterator.wakeResolver;
 
-    const resolve = wakeResolver;
-
-    wakeResolver = null;
-    resolve?.();
+      iterator.wakeResolver = null;
+      resolve?.();
+    }
   };
 
-  // Enqueue an item and wake the iterator, unless the double has already terminated (in which case every control method is a no-op).
-  const enqueue = (item: { kind: "segment"; segment: Segment } | { kind: "end" } | { kind: "error"; error: unknown }): void => {
+  let establishmentResolver: ((established: boolean) => void) | null = null;
+
+  const enqueue = (item: QueueItem): void => {
 
     if(terminated) {
 
       return;
     }
 
-    queue.push(item);
-    wake();
+    if((item.kind === "end") || (item.kind === "error")) {
+
+      terminated = true;
+    }
+
+    if(iterators.size === 0) {
+
+      orphanQueue.push(item);
+
+      return;
+    }
+
+    for(const iterator of iterators) {
+
+      if(!iterator.terminated) {
+
+        iterator.queue.push(item);
+      }
+    }
+
+    wakeAll();
   };
 
   return {
@@ -554,59 +565,86 @@ export function makeControllableLivestreamDouble(options: { deferEstablishment?:
     },
     [Symbol.asyncIterator]: async function *(): AsyncGenerator<Segment> {
 
-      // The drain-loop: process the whole queue, then park only when it is empty and we have not yet terminated. On wake, the outer while re-checks the queue.
-      while(!terminated) {
+      const fanout: IteratorFanout = { queue: [], terminated: false, wakeResolver: null };
 
-        // Drain every queued item before considering a park, so no item pushed under a single wake is stranded.
-        while(queue.length > 0) {
+      iterators.add(fanout);
 
-          const item = queue.shift();
+      if(orphanQueue.length > 0) {
 
-          if(!item) {
+        fanout.queue.push(...orphanQueue);
+        orphanQueue.length = 0;
+      }
 
-            break;
-          }
+      if((terminated) && (fanout.queue.length === 0)) {
 
-          switch(item.kind) {
+        iterators.delete(fanout);
 
-            case "end": {
+        return;
+      }
 
-              terminated = true;
+      try {
 
-              return;
-            }
+        while(!fanout.terminated) {
 
-            case "error": {
+          while(fanout.queue.length > 0) {
 
-              terminated = true;
+            const item = fanout.queue.shift();
 
-              throw item.error;
-            }
-
-            case "segment": {
-
-              yield item.segment;
+            if(!item) {
 
               break;
             }
 
-            default: {
+            switch(item.kind) {
 
-              throw new Error("The controllable livestream double received an unknown queue item kind.");
+              case "end": {
+
+                fanout.terminated = true;
+
+                return;
+              }
+
+              case "error": {
+
+                fanout.terminated = true;
+
+                throw item.error;
+              }
+
+              case "segment": {
+
+                yield item.segment;
+
+                break;
+              }
+
+              default: {
+
+                throw new Error("The controllable livestream double received an unknown queue item kind.");
+              }
             }
           }
-        }
 
-        // The queue is empty, so park on a fresh one-shot resolver until a control method wakes us, then re-check the queue. For the one consumer the double
-        // serves, the loop's condition is the only terminated check the park needs: the drain sets the flag only where it leaves the generator at once.
-        // eslint-disable-next-line no-await-in-loop -- The park is intentionally serial: the generator suspends here until a push/end/throwError/dispose wakes it.
-        await new Promise<void>((resolve) => { wakeResolver = resolve; });
+          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- fanout.terminated is cleared by drain paths in the same loop turn.
+          if(!fanout.terminated) {
+
+            // eslint-disable-next-line no-await-in-loop -- The park is intentionally serial: the generator suspends here until a push/end/throwError/dispose wakes it.
+            await new Promise<void>((resolve) => { fanout.wakeResolver = resolve; });
+          }
+        }
+      } finally {
+
+        fanout.terminated = true;
+
+        const resolvePark = fanout.wakeResolver;
+
+        fanout.wakeResolver = null;
+        resolvePark?.();
+        iterators.delete(fanout);
       }
     },
     [Symbol.asyncDispose]: async (): Promise<void> => {
 
-      // Record the dispose and, if the double has not already terminated, signal a graceful end so the parked iterator completes its finally. Safe to repeat: a second
-      // dispose after termination no-ops via the enqueue terminated-guard.
       disposed = true;
       enqueue({ kind: "end" });
     }

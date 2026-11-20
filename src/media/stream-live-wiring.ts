@@ -180,8 +180,54 @@ export function createCopyEscalationTsbResume(input: { feedState: LiveTsbFeedSta
   };
 }
 
+export type LiveStreamEncoderPipelineOptions = Parameters<FfmpegOptions["streamEncoder"]>[0];
+
+export type LiveStreamVideoPipelineOptions = LiveStreamEncoderPipelineOptions | Pick<LiveStreamEncoderPipelineOptions, "inputCodec">;
+
+function buildLiveStreamEncoderPipelineOptions(protectCamera: ProtectCameraHost, channelProfile: ChannelProfile, request: StartStreamRequest, targetBitrate: number,
+  useInterpolationFilter: boolean): LiveStreamEncoderPipelineOptions {
+
+  const requestedFps = request.video.fps;
+  const rawSourceFps = channelProfile.channel.fps;
+  const policySourceFps = normalizeLiveSourceFps(rawSourceFps);
+  const useInterpolation = resolveLiveStreamInterpolationActive(useInterpolationFilter, rawSourceFps, requestedFps);
+  const outputFps = resolveStreamOutputFps({ requestedFps: requestedFps, sourceFps: rawSourceFps });
+  const encoderFps = useInterpolation ? policySourceFps : outputFps;
+  const encoderInputFps = policySourceFps;
+
+  return {
+
+    bitrate: targetBitrate,
+    fps: encoderFps,
+    height: request.video.height,
+    idrInterval: HOMEKIT_IDR_INTERVAL,
+    inputCodec: protectCamera.ufp.videoCodec,
+    inputFps: encoderInputFps,
+    level: request.video.level,
+    profile: request.video.profile,
+    // When interpolating, hand the encoder the fps and interpolation filters to smooth the presentation timestamps; it composes them into its own chain and bridges
+    // any GPU-to-CPU download transfer itself.
+    ...(useInterpolation ? { videoFilters: [ "fps=" + requestedFps.toString(),
+      "minterpolate=fps=" + requestedFps.toString() + ":mi_mode=mci:mc_mode=aobmc:me=fss:me_mode=bidir:vsbmc=1:scd=none" ] } : {}),
+    width: request.video.width
+  };
+}
+
+/** Shared decoder/encoder pipeline bag for a live transcode, or copy-only { inputCodec } when not transcoding. */
+export function resolveLiveStreamTranscodePipelineOptions(protectCamera: ProtectCameraHost, encodeDecision: LiveVideoEncodeDecision,
+  channelProfile: ChannelProfile, request: StartStreamRequest, targetBitrate: number, useInterpolationFilter: boolean): LiveStreamVideoPipelineOptions {
+
+  if(encodeDecision.mode === "copy") {
+
+    return { inputCodec: protectCamera.ufp.videoCodec };
+  }
+
+  return buildLiveStreamEncoderPipelineOptions(protectCamera, channelProfile, request, targetBitrate, useInterpolationFilter);
+}
+
 export function appendLiveVideoEncodeToFfmpegArgs(ffmpegOptions: FfmpegOptions, ffmpegArgs: string[], encodeDecision: LiveVideoEncodeDecision,
-  channelProfile: ChannelProfile, request: StartStreamRequest, targetBitrate: number, useInterpolationFilter: boolean, useTsb: boolean): void {
+  channelProfile: ChannelProfile, request: StartStreamRequest, targetBitrate: number, useInterpolationFilter: boolean, useTsb: boolean, protectCamera: ProtectCameraHost,
+  pipelineOptions?: LiveStreamVideoPipelineOptions): void {
 
   // Check to see if we're transcoding. If we are, set the right FFmpeg encoder options. If not, copy the video stream.
   if(encodeDecision.mode === "copy") {
@@ -206,29 +252,11 @@ export function appendLiveVideoEncodeToFfmpegArgs(ffmpegOptions: FfmpegOptions, 
   }
 
   // Configure our video parameters for transcoding.
-  const requestedFps = request.video.fps;
-  const rawSourceFps = channelProfile.channel.fps;
-  const policySourceFps = normalizeLiveSourceFps(rawSourceFps);
-  const useInterpolation = resolveLiveStreamInterpolationActive(useInterpolationFilter, rawSourceFps, requestedFps);
-  const outputFps = resolveStreamOutputFps({ requestedFps: requestedFps, sourceFps: rawSourceFps });
-  const encoderFps = useInterpolation ? policySourceFps : outputFps;
-  const encoderInputFps = policySourceFps;
+  const encoderOptions = pipelineOptions ?
+    (pipelineOptions as LiveStreamEncoderPipelineOptions) :
+    buildLiveStreamEncoderPipelineOptions(protectCamera, channelProfile, request, targetBitrate, useInterpolationFilter);
 
-  ffmpegArgs.push(...ffmpegOptions.streamEncoder({
-
-    bitrate: targetBitrate,
-    fps: encoderFps,
-    height: request.video.height,
-    idrInterval: HOMEKIT_IDR_INTERVAL,
-    inputFps: encoderInputFps,
-    level: request.video.level,
-    profile: request.video.profile,
-    // When interpolating, hand the encoder the fps and interpolation filters to smooth the presentation timestamps; it composes them into its own chain and bridges
-    // any GPU-to-CPU download transfer itself.
-    ...(useInterpolation ? { videoFilters: [ "fps=" + requestedFps.toString(),
-      "minterpolate=fps=" + requestedFps.toString() + ":mi_mode=mci:mc_mode=aobmc:me=fss:me_mode=bidir:vsbmc=1:scd=none" ] } : {}),
-    width: request.video.width
-  }));
+  ffmpegArgs.push(...ffmpegOptions.streamEncoder(encoderOptions));
 }
 
 /** Mirrors startStream channel reselect + copy-first encode (before spawn). */

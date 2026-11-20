@@ -90,7 +90,7 @@ describe("startStream spawn hook", () => {
 
     const args = [ "-map", "0:v:0" ];
 
-    appendLiveVideoEncodeToFfmpegArgs(stubFfmpegOptions(), args, plan.encodeDecision, stubChannel, makeRequest(), plan.encoderBitrate, false, true);
+    appendLiveVideoEncodeToFfmpegArgs(stubFfmpegOptions(), args, plan.encodeDecision, stubChannel, makeRequest(), plan.encoderBitrate, false, true, camera);
 
     assert.ok(!args.includes("copy"), "transcode path must not use -codec:v copy");
     assert.ok((args.some((part) => part.includes("libx264"))) || (args.includes("-c:v")), "transcode encoder args must be present");

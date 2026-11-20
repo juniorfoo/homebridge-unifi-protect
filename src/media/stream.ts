@@ -40,7 +40,9 @@ import type { LiveTsbFeedState } from "./stream-live-feed.ts";
 import { consumeLiveStreamSegments, createTsbSegmentWriterRail } from "./stream-live-feed.ts";
 import { appendLiveVideoEncodeToFfmpegArgs, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge, formatLiveEncodeDecisionLog,
   resolveCopyEscalationKeyframePrimingBuffer, resolveFmp4InitForLiveDeclaredCheck, resolveStartStreamEncodePlan, resolveStartStreamForceTranscodeDueToUserOption,
-  resolveStreamEgressBitrateBps, resolveTimeshiftBufferLiveChannel, shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
+  resolveLiveStreamTranscodePipelineOptions, resolveStreamEgressBitrateBps, resolveTimeshiftBufferLiveChannel,
+  shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
+import type { LiveStreamVideoPipelineOptions } from "./stream-live-wiring.ts";
 import { replaceFailedCopyWithTranscode } from "./stream-copy-escalation.ts";
 import type { CopyEscalationTsbResume, StreamLiveEncodeRebuild } from "./stream-copy-escalation.ts";
 import { spawnLiveVideoFfmpegProcess } from "./stream-live-ffmpeg-spawn.ts";
@@ -264,12 +266,9 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     if(streamTestOptions) {
 
       derived = { audioFormat: null, probe: null };
-    } else if(!isProtectStreamingDelegateTestOptions(derivedOrTest)) {
-
-      derived = derivedOrTest;
     } else {
 
-      derived = { audioFormat: null, probe: null };
+      derived = derivedOrTest as Pick<AdvertisedStreams, "audioFormat" | "probe">;
     }
 
     this.streamTestOptions = streamTestOptions;
@@ -688,13 +687,15 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
   }
 
   // FFmpeg argv through -map (before video encode / copy, metadata, and tee sinks).
-  private buildLiveFfmpegArgsThroughVideoMap(channelProfile: ChannelProfile, request: StartStreamRequest, sessionInfo: SessionInfo, useTsb: boolean): string[] {
+  private buildLiveFfmpegArgsThroughVideoMap(channelProfile: ChannelProfile, request: StartStreamRequest, sessionInfo: SessionInfo, useTsb: boolean,
+    encodeDecision: LiveVideoEncodeDecision, pipelineOptions: LiveStreamVideoPipelineOptions): string[] {
 
     // -hide_banner                     Suppress printing the startup banner in FFmpeg.
     // -nostats                         Suppress printing progress reports while encoding in FFmpeg.
     // -fflags +discardcorrupt          Discard any corrupt packets and continue rather than exit.
     // -err_detect ignore_err           Ignore decoding errors and continue rather than exit.
-    // [video decoder]                  The camera codec's input video decoder flags - hardware-accelerated where available, from the FFmpeg options helper.
+    // [video decoder]                  The input video decoder flags, built from the pipeline description the encoder reads so the two agree on where decoded frames
+    //                                  live, or from the camera's codec alone on a copy - hardware-accelerated where available, from the FFmpeg options helper.
     // -max_delay 500000                Set an upper limit on how much time FFmpeg can take in demuxing packets, in microseconds.
     // -flags low_delay                 Tell FFmpeg to optimize for low delay / realtime decoding.
     // -probesize number                How many bytes should be analyzed for stream information.
@@ -704,7 +705,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       "-nostats",
       "-fflags", "+discardcorrupt",
       "-err_detect", "ignore_err",
-      ...this.ffmpegOptions.videoDecoder({ inputCodec: this.protectCamera.ufp.videoCodec }),
+      ...this.ffmpegOptions.videoDecoder((encodeDecision.mode === "transcode") ?
+        (pipelineOptions) : pipelineOptions),
       "-max_delay", "500000",
       "-flags", "low_delay",
       "-probesize", this.probesize.toString()
@@ -789,11 +791,13 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
   // Complete the live FFmpeg argv with sinks, spawn the process, and register the per-instance abort bridge.
   private spawnLiveVideoFfmpeg(ffmpegArgsThroughVideoMap: string[], encodeDecision: LiveVideoEncodeDecision, channelProfile: ChannelProfile, request: StartStreamRequest,
-    sessionInfo: SessionInfo, targetBitrate: number, useInterpolationFilter: boolean, useTsb: boolean, ffmpegAbort: AbortController): ProtectStreamingFfmpegProcess {
+    sessionInfo: SessionInfo, targetBitrate: number, useInterpolationFilter: boolean, useTsb: boolean, ffmpegAbort: AbortController,
+    pipelineOptions: LiveStreamVideoPipelineOptions): ProtectStreamingFfmpegProcess {
 
     const ffmpegArgs = [...ffmpegArgsThroughVideoMap];
 
-    appendLiveVideoEncodeToFfmpegArgs(this.ffmpegOptions, ffmpegArgs, encodeDecision, channelProfile, request, targetBitrate, useInterpolationFilter, useTsb);
+    appendLiveVideoEncodeToFfmpegArgs(this.ffmpegOptions, ffmpegArgs, encodeDecision, channelProfile, request, targetBitrate, useInterpolationFilter, useTsb,
+      this.protectCamera, pipelineOptions);
 
     // -metadata                        Set the metadata to the name of the camera to distinguish between FFmpeg sessions.
     ffmpegArgs.push(
@@ -801,43 +805,13 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       "-metadata", "comment=" + this.protectCamera.accessoryName + " Livestream"
     );
 
-    // Send the stream to HomeKit through a single tee-muxed output rather than two top-level outputs. The distinction is load-bearing: a top-level output that ends up
-    // with no streams is a fatal error for the entire command, while a tee sink is isolable...this is the shape that lets a session survive its optional audio map
-    // matching nothing. Video and audio are routed to their negotiated SRTP destinations with per-sink select filters, and only the audio sink carries onfail=ignore:
-    // an input without an audio track costs us that sink alone, degrading the session to video-only - the truth of the input - while a failure on the video sink
-    // keeps tee's default behavior and ends the session loudly. Because no input to this command is synthetic or unbounded, every output stream ends when the camera
-    // input does, and FFmpeg's organic exit on input EOF is a design invariant here...the teardown in consumeStreamSegments depends on it.
-    //
-    // The options inside each sink's brackets combine tee's own per-sink directives - format, stream routing, and failure policy - with options that pass through to
-    // that sink's RTP muxer and SRTP protocol:
-    //
-    // f=rtp                            Use the RTP muxer for this sink.
-    // select=v / select=a              Route only the selected stream type to this sink.
-    // onfail=ignore                    We set this only on the audio sink: a sink that fails to open or write is dropped while the remaining sinks continue.
-    // payload_type=num                 Payload type for the RTP stream. This is negotiated by HomeKit and is usually 99 for H.264 video and 110 for AAC-ELD audio.
-    // ssrc=num                         Synchronization source stream identifier. Random number negotiated by HomeKit to identify this stream.
-    // flush_packets=1                  Ensure we flush our write buffer after each muxed packet.
-    // packetsize=num                   Use a packetsize of 1200 for video, which should be no more than the HomeKit livestreaming MTU (1378 for IPv4 and 1228 for IPv6).
-    //                                  For audio, HomeKit livestreaming wants a block size of 480 samples when using AAC-ELD - we loosely interpret that to mean less
-    //                                  than 480 bytes per packet and use 384 since it's divisible by 16 kHz and 24 kHz.
-    // srtp_out_suite=enc               Specify the output encryption encoding suites.
-    // srtp_out_params=params           Specify the output encoding parameters. This is negotiated by HomeKit. The value is safe within tee's sink syntax: the suite's
-    //                                  fixed 30-byte key and salt encode to exactly 40 base64 characters with no "=" padding, and the remainder of the base64 alphabet
-    //                                  carries no meaning to tee's option parser.
-    const videoSink = "[f=rtp:select=v:payload_type=" + request.video.pt.toString() + ":ssrc=" + sessionInfo.videoSSRC.toString() +
-      ":flush_packets=1:packetsize=1200:srtp_out_suite=AES_CM_128_HMAC_SHA1_80:srtp_out_params=" + sessionInfo.videoSRTP.toString("base64") +
-      "]srtp://" + sessionInfo.address + ":" + sessionInfo.videoPort.toString() + "?rtcpport=" + sessionInfo.videoPort.toString();
+    try {
 
-    const audioSink = !sessionInfo.hasAudioSupport ? "" :
-      "|[f=rtp:select=a:onfail=ignore:payload_type=" + request.audio.pt.toString() + ":ssrc=" + sessionInfo.audioSSRC.toString() +
-      ":flush_packets=1:packetsize=384:srtp_out_suite=AES_CM_128_HMAC_SHA1_80:srtp_out_params=" + sessionInfo.audioSRTP.toString("base64") +
-      "]srtp://" + sessionInfo.address + ":" + sessionInfo.audioPort.toString() + "?rtcpport=" + sessionInfo.audioPort.toString();
+      this.appendLiveSrtpTeeSinks(ffmpegArgs, request, sessionInfo);
+    } catch {
 
-    ffmpegArgs.push(
-
-      "-f", "tee",
-      videoSink + audioSink
-    );
+      throw new LiveViewSrtpDestinationRefusal(sessionInfo.address);
+    }
 
     if(isFfmpegVerbose(this.protectCamera) || this.protectCamera.hasFeature("Debug.Video.FFmpeg")) {
 
@@ -862,6 +836,52 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       signal: ffmpegAbort.signal,
       suppressLivestreamApiErrors: useTsb
     });
+  }
+
+  private appendLiveSrtpTeeSinks(ffmpegArgs: string[], request: StartStreamRequest, sessionInfo: SessionInfo): void {
+
+    // Send the stream to HomeKit through a single tee-muxed output rather than two top-level outputs. The distinction is load-bearing: a top-level output that ends up
+    // with no streams is a fatal error for the entire command, while a tee sink is isolable...this is the shape that lets a session survive its optional audio map
+    // matching nothing. Video and audio are routed to their negotiated SRTP destinations with per-sink select filters, and only the audio sink carries onfail=ignore:
+    // an input without an audio track costs us that sink alone, degrading the session to video-only - the truth of the input - while a failure on the video sink
+    // keeps tee's default behavior and ends the session loudly. Because no input to this command is synthetic or unbounded, every output stream ends when the camera
+    // input does, and FFmpeg's organic exit on input EOF is a design invariant here...the teardown in consumeStreamSegments depends on it.
+    //
+    // The options inside each sink's brackets combine tee's own per-sink directives - format, stream routing, and failure policy - with options that pass through to
+    // that sink's RTP muxer and SRTP protocol:
+    //
+    // f=rtp                            Use the RTP muxer for this sink.
+    // select=v / select=a              Route only the selected stream type to this sink.
+    // onfail=ignore                    We set this only on the audio sink: a sink that fails to open or write is dropped while the remaining sinks continue.
+    // payload_type=num                 Payload type for the RTP stream. This is negotiated by HomeKit and is usually 99 for H.264 video and 110 for AAC-ELD audio.
+    // ssrc=num                         Synchronization source stream identifier. Random number negotiated by HomeKit to identify this stream.
+    // flush_packets=1                  Ensure we flush our write buffer after each muxed packet.
+    // packetsize=num                   Use a packetsize of 1200 for video, which should be no more than the HomeKit livestreaming MTU (1378 for IPv4 and 1228 for IPv6).
+    //                                  For audio, HomeKit livestreaming wants a block size of 480 samples when using AAC-ELD - we loosely interpret that to mean less
+    //                                  than 480 bytes per packet and use 384 since it's divisible by 16 kHz and 24 kHz.
+    // srtp_out_suite=enc               Specify the output encryption encoding suites.
+    // srtp_out_params=params           Specify the output encoding parameters. This is negotiated by HomeKit. The value is safe within tee's sink syntax: the suite's
+    //                                  fixed 30-byte key and salt encode to exactly 40 base64 characters with no "=" padding, and the remainder of the base64 alphabet
+    //                                  carries no meaning to tee's option parser.
+    //
+    // Each sink sends to the destination srtpDestination composes from the HomeKit client's address. It refuses an IPv6 address carrying a zone, which no destination
+    // can hold, and that refusal ends the start the way every other start failure here does: the error is logged, HomeKit is answered, and the prepared session is
+    // disposed, which releases its ports and turns off a package-camera flashlight this session lit. Letting the refusal escape instead would answer HomeKit without
+    // ever disposing the session, because HomeKit sends no stop for a start that failed.
+    const videoSink = "[f=rtp:select=v:payload_type=" + request.video.pt.toString() + ":ssrc=" + sessionInfo.videoSSRC.toString() +
+      ":flush_packets=1:packetsize=1200:srtp_out_suite=AES_CM_128_HMAC_SHA1_80:srtp_out_params=" + sessionInfo.videoSRTP.toString("base64") +
+      "]" + srtpDestination(sessionInfo.address, sessionInfo.videoPort);
+
+    const audioSink = !sessionInfo.hasAudioSupport ? "" :
+      "|[f=rtp:select=a:onfail=ignore:payload_type=" + request.audio.pt.toString() + ":ssrc=" + sessionInfo.audioSSRC.toString() +
+      ":flush_packets=1:packetsize=384:srtp_out_suite=AES_CM_128_HMAC_SHA1_80:srtp_out_params=" + sessionInfo.audioSRTP.toString("base64") +
+      "]" + srtpDestination(sessionInfo.address, sessionInfo.audioPort);
+
+    ffmpegArgs.push(
+
+      "-f", "tee",
+      videoSink + audioSink
+    );
   }
 
   // Replace a failed H.264 copy FFmpeg with a transcode instance without tearing down the HomeKit session.
@@ -890,8 +910,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         const encodeDecision: LiveVideoEncodeDecision = { logReason: ctx.transcodeReason, mode: "transcode" };
 
+        const pipelineOptions = resolveLiveStreamTranscodePipelineOptions(this.protectCamera, encodeDecision, ctx.channelProfile, rebuild.request, ctx.targetBitrate,
+          ctx.useInterpolationFilter);
+
         return this.spawnLiveVideoFfmpeg(ctx.ffmpegArgsThroughVideoMap, encodeDecision, ctx.channelProfile, rebuild.request,
-          rebuild.sessionInfo as SessionInfo, ctx.targetBitrate, ctx.useInterpolationFilter, ctx.useTsb, ffmpegAbort);
+          rebuild.sessionInfo as SessionInfo, ctx.targetBitrate, ctx.useInterpolationFilter, ctx.useTsb, ffmpegAbort, pipelineOptions);
       },
       transcodeReason: transcodeReason,
       transcodeTargetBitrate: owner.liveEncodeRebuild?.transcodeTargetBitrate ?? 0,
@@ -927,7 +950,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
           transcodeBitrateHint: this.protectCamera.hints.transcodeBitrate,
           transcodeHighLatencyBitrateHint: this.protectCamera.hints.transcodeHighLatencyBitrate
         });
-        const ffmpegArgsThroughVideoMap = this.buildLiveFfmpegArgsThroughVideoMap(channelProfile, fullRebuild.request, fullRebuild.sessionInfo as SessionInfo, false);
+        const transcodeEncodeDecision: LiveVideoEncodeDecision = { logReason: transcodeReason, mode: "transcode" };
+        const transcodePipelineOptions = resolveLiveStreamTranscodePipelineOptions(this.protectCamera, transcodeEncodeDecision, channelProfile, fullRebuild.request,
+          transcodeTargetBitrate, fullRebuild.useInterpolationFilter);
+        const ffmpegArgsThroughVideoMap = this.buildLiveFfmpegArgsThroughVideoMap(channelProfile, fullRebuild.request, fullRebuild.sessionInfo as SessionInfo, false,
+          transcodeEncodeDecision, transcodePipelineOptions);
 
         return { channelProfile: channelProfile, ffmpegArgsThroughVideoMap: ffmpegArgsThroughVideoMap, transcodeTargetBitrate: transcodeTargetBitrate };
       }
@@ -1067,23 +1094,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         break;
       }
-
-      default: {
-
-        // "unavailable": an AV1 camera with no buffer path. FFmpeg cannot stream AV1 over RTSP, so there is no viable source. The remedy differs by capability - a camera
-        // that could use the buffer is told to re-enable buffer-backed livestreaming, while a camera that cannot use it at all has no remedy to offer.
-        const capable = !this.protectCamera.ufp.isThirdPartyCamera || this.protectCamera.ufp.isPairedWithAiPort;
-        const errorMessage = capable ?
-          "Unable to start video stream: FFmpeg does not currently support AV1-encoded RTSP streams. Enable the Video.Timeshift.Livestream feature option (enabled by " +
-            "default) to view this camera." :
-          "Unable to start video stream: FFmpeg does not currently support AV1-encoded RTSP streams, and this camera cannot use the timeshift buffer.";
-
-        this.log.error(errorMessage);
-        callback(new Error(this.protectCamera.accessoryName + ": " + errorMessage));
-        this.disposePreparedSession(request.sessionID, sessionInfo);
-
-        return;
-      }
     }
 
     const timeshiftPrefixBuffer = useTsb ? (this.timeshift?.buffer.getLast(PROTECT_LIVESTREAM_API_IDR_INTERVAL * 1000) ?? null) : null;
@@ -1162,7 +1172,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     channelProfile = encodePlan.channelProfile;
 
-    const { encodeDecision, declaredForLog, isTranscoding, transcodeTargetBitrate } = encodePlan;
+    const { encodeDecision, declaredForLog, encoderBitrate, isTranscoding, transcodeTargetBitrate } = encodePlan;
 
     this.log.info("%s", formatLiveEncodeDecisionLog(encodeDecision, declaredForLog));
 
@@ -1198,7 +1208,12 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     //
     // - Since we are using an already existing connection to the Protect controller, we don't need to create another connection which incurs an additional delay, as well
     //   as a resource hit on the Protect controller.
-    const ffmpegArgs = this.buildLiveFfmpegArgsThroughVideoMap(channelProfile, request, sessionInfo, useTsb);
+    const useInterpolationFilter = useTsb && !isPackageCameraContext(this.protectCamera.accessory.context) &&
+      ((this.platform.codecSupport.hostSystem === "macOS.Apple") && (this.platform.codecSupport.cpuGeneration >= 3));
+
+    const livePipelineOptions = resolveLiveStreamTranscodePipelineOptions(this.protectCamera, encodeDecision, channelProfile, request, encoderBitrate,
+      useInterpolationFilter);
+    const ffmpegArgs = this.buildLiveFfmpegArgsThroughVideoMap(channelProfile, request, sessionInfo, useTsb, encodeDecision, livePipelineOptions);
 
     // Inform the user.
     const hinting = [];
@@ -1272,12 +1287,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     this.sessionDiagnosticsById.set(request.sessionID, sessionDiagnostics);
 
-    // When on high-performance hardware like Apple Silicon, using the TSB, and we don't have low-FPS cameras like the package camera, enable the use of the
-    // CPU-intensive FFmpeg minterpolate filter to enable very smooth video, especially when there's motion involved. M3+ Apple Silicon environments are able to reliably
-    // use this filter in realtime and with great results. I'm hoping to be able to enable this in the future for other platforms.
-    const useInterpolationFilter = useTsb && !isPackageCameraContext(this.protectCamera.accessory.context) &&
-      ((this.platform.codecSupport.hostSystem === "macOS.Apple") && (this.platform.codecSupport.cpuGeneration >= 3));
-
     const ffmpegArgsBeforeVideoEncode = [...ffmpegArgs];
     const ffmpegAbort = new AbortController();
 
@@ -1295,10 +1304,28 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       useTsb: useTsb
     };
 
-    const encoderBitrate = encodePlan.encoderBitrate;
+    let activeFfmpeg: ProtectStreamingFfmpegProcess;
 
-    let activeFfmpeg = this.spawnLiveVideoFfmpeg(ffmpegArgsBeforeVideoEncode, encodeDecision, channelProfile, request, sessionInfo, encoderBitrate,
-      useInterpolationFilter, useTsb, ffmpegAbort);
+    try {
+
+      activeFfmpeg = this.spawnLiveVideoFfmpeg(ffmpegArgsBeforeVideoEncode, encodeDecision, channelProfile, request, sessionInfo, encoderBitrate,
+        useInterpolationFilter, useTsb, ffmpegAbort, livePipelineOptions);
+    } catch(error) {
+
+      if(error instanceof LiveViewSrtpDestinationRefusal) {
+
+        this.sessionDiagnosticsById.delete(request.sessionID);
+        outputWatchdog.clear();
+
+        this.log.error(error.message, { address: error.clientAddress });
+        callback(new Error(this.protectCamera.accessoryName + ": " + error.message));
+        this.disposePreparedSession(request.sessionID, sessionInfo);
+
+        return;
+      }
+
+      throw error;
+    }
 
     // Bridge FFmpeg's ready signal to HomeKit's StreamRequestCallback, exactly once, for all input sources. ready resolves on FFmpeg's first stderr byte regardless
     // of source and rejects on a spawn failure (-> callback(error)). We prefer the underlying cause on the reject path so an ENOENT surfaces usefully rather than the
@@ -1563,7 +1590,20 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     if(this.protectCamera.hints.twoWayAudioDirect) {
 
-      ffmpegReturnAudioCmd.push("udp://" + this.protectCamera.ufp.host + ":" + this.protectCamera.ufp.talkbackSettings.bindPort.toString());
+      // The return audio goes straight to the camera, at the destination talkbackDestination composes from the address the controller reports for it. A refusal there
+      // costs this session its return audio alone: the video session is already running and HomeKit has its answer, so we say why and return before a return-audio
+      // process is spawned, and the session goes on without return audio. The demuxer's readiness promise then goes unread, which is safe: HBPU marks it handled, so its
+      // rejection when the session ends raises nothing.
+      try {
+
+        ffmpegReturnAudioCmd.push(talkbackDestination(this.protectCamera.ufp.host, this.protectCamera.ufp.talkbackSettings.bindPort));
+      } catch {
+
+        this.log.error("Unable to start two-way audio: the camera's IPv6 address carries a zone, which a return audio destination cannot include.",
+          { address: this.protectCamera.ufp.host });
+
+        return;
+      }
     } else {
 
       ffmpegReturnAudioCmd.push("pipe:1");
@@ -1690,9 +1730,10 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
       case StreamRequestTypes.RECONFIGURE:
 
-        // Once FFmpeg is updated to support this, we'll enable this one.
+        // HomeKit's reconfigure request has no effect on the running FFmpeg process: there is no way to adjust an already-spawned FFmpeg's encoding parameters
+        // mid-stream, so we log the request and acknowledge it without acting on it.
         this.log.debug("Streaming parameters adjustment requested by HomeKit: %sx%s, %s fps, %s.",
-          request.video.width, request.video.height, request.video.fps, formatBps(request.video.max_bit_rate));
+          request.video.width, request.video.height, request.video.fps, formatBps(request.video.max_bit_rate * 1000));
 
         callback();
 
@@ -1891,6 +1932,18 @@ export function liveAudioFilterArgs(host: Pick<ProtectCameraHost, "getAudioFilte
   const afOptions = host.getAudioFilters(requestedKhz * 1000);
 
   return afOptions.length ? [ "-filter:a", afOptions.join(", ") ] : [];
+}
+
+/** HomeKit client address carried a zone identifier; tee SRTP sinks refuse such destinations. */
+export class LiveViewSrtpDestinationRefusal extends Error {
+
+  readonly clientAddress: string;
+
+  constructor(clientAddress: string) {
+
+    super("Unable to start video stream: the HomeKit client's IPv6 address carries a zone, which a streaming destination cannot include.");
+    this.clientAddress = clientAddress;
+  }
 }
 
 /**

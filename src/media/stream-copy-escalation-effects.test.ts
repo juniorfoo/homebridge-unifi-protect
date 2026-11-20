@@ -561,7 +561,12 @@ describe("copy-to-transcode replacement effects", () => {
 
     sessionInfo.abortController.abort(new HbpuAbortError("shutdown"));
 
-    await assert.rejects(blockedWrite, { message: /shutdown/ });
+    await assert.rejects(blockedWrite, (e: unknown) => {
+
+      assert.ok(isHbpuAbortReason(e, "shutdown"), "blocked write must reject with shutdown abort reason");
+
+      return true;
+    });
     await drainBackpressureWrites();
 
     copy.abort(sessionInfo.abortController.signal.reason);

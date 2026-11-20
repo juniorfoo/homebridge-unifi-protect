@@ -273,6 +273,15 @@ describe("shouldEscalateCopyToTranscode", () => {
       videoCopy: true }), false);
   });
 
+  test("pins VIDEO_COPY_ESCALATION_WINDOW_MS at 8000 ms for copy escalation eligibility", () => {
+
+    assert.equal(VIDEO_COPY_ESCALATION_WINDOW_MS, 8000);
+    assert.equal(shouldEscalateCopyToTranscode({ copyFailure: true, elapsedMs: 7999, escalatedFromCopy: false, segmentsFed: 2, useTimeshiftBuffer: true,
+      videoCopy: true }), true);
+    assert.equal(shouldEscalateCopyToTranscode({ copyFailure: true, elapsedMs: 8001, escalatedFromCopy: false, segmentsFed: 2, useTimeshiftBuffer: true,
+      videoCopy: true }), false);
+  });
+
   test("rejects escalation after the window, when already escalated, or when not on copy", () => {
 
     assert.equal(shouldEscalateCopyToTranscode({ copyFailure: true, elapsedMs: VIDEO_COPY_ESCALATION_WINDOW_MS + 1, escalatedFromCopy: false, segmentsFed: 2,
