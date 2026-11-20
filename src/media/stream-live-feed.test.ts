@@ -2,14 +2,14 @@
  *
  * stream-live-feed.test.ts: Production TSB writer rotation used by copy-to-transcode escalation (mutation-sensitive).
  */
-/* eslint-disable sort-imports, sort-keys, @stylistic/array-bracket-spacing */
+/* eslint-disable sort-imports, sort-keys */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { Writable } from "node:stream";
 import type { HomebridgePluginLogging } from "homebridge-plugin-utils";
 import { BackpressureWriter } from "homebridge-plugin-utils";
-import { makeBox, makeContainer } from "homebridge-plugin-utils";
-import { makeNonKeyframeFragment, makeUntimedNonKeyframeFragment } from "../testing.helpers.ts";
+import { makeBox, makeContainer } from "homebridge-plugin-utils/testing";
+import { makeNonKeyframeFragment, makeUntimedNonKeyframeFragment } from "./testing.helpers.ts";
 import { COPY_ESCALATION_PRIME_FLOOR_MAX_WRITTEN_LIVE_MOOF_CHECKS, livePrimeMediaFloorFromIdentity,
   parsePrimeMediaFloorFromPrimingBuffer } from "./fmp4-fragment-identity.ts";
 import type { LivestreamSubscription } from "./livestream.ts";

@@ -1193,14 +1193,15 @@ describe("the timeshift buffer's stream formats and its adopted subscription", (
     test("returns init plus fragments from the last keyframe through the tail in order", async () => {
 
       const initBytes = Buffer.from("fmp4-init-for-prime");
-      const double = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: initBytes } });
+      const initSegment = { codec: "h264", data: initBytes, description: { tracks: [] } };
+      const double = makeControllableLivestreamDouble({ initSegment });
       const { timeshift } = await buildStartedTimeshift({ double });
       const firstKeyframe = makeKeyframeFragment();
       const middle = makeNonKeyframeFragment();
       const lastKeyframe = makeKeyframeFragment();
       const tail = makeNonKeyframeFragment();
 
-      double.push({ codec: "h264", data: initBytes, type: "init" });
+      double.push({ ...initSegment, type: "init" });
       await settle();
       double.push(makeMediaSegment(firstKeyframe));
       await settle();
@@ -1222,10 +1223,11 @@ describe("the timeshift buffer's stream formats and its adopted subscription", (
     test("returns null when no keyframe is buffered (init-only fallback)", async () => {
 
       const initBytes = Buffer.from("fmp4-init-only");
-      const double = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: initBytes } });
+      const initSegment = { codec: "h264", data: initBytes, description: { tracks: [] } };
+      const double = makeControllableLivestreamDouble({ initSegment });
       const { timeshift } = await buildStartedTimeshift({ double });
 
-      double.push({ codec: "h264", data: initBytes, type: "init" });
+      double.push({ ...initSegment, type: "init" });
       await settle();
       double.push(makeMediaSegment(makeNonKeyframeFragment()));
       await settle();

@@ -1,10 +1,10 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved. */
-/* eslint-disable sort-imports, sort-keys, @stylistic/array-bracket-spacing */
+/* eslint-disable sort-imports, sort-keys */
 
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { makeBox, makeContainer } from "homebridge-plugin-utils";
-import { makeKeyframeFragment, makeNonKeyframeFragment, makeUntimedNonKeyframeFragment } from "../testing.helpers.ts";
+import { makeBox, makeContainer } from "homebridge-plugin-utils/testing";
+import { makeKeyframeFragment, makeNonKeyframeFragment, makeUntimedNonKeyframeFragment } from "./testing.helpers.ts";
 import { applyPrimeMediaFloorClearAfterComparableAheadLiveWrite, isPrimeMediaFloorEmpty, isTrackMfhdOnlyInFloor, livePrimeMediaFloorFromIdentity,
   parseFmp4MediaFragmentIdentity, parseFmp4MoofTiming, parseLastMediaFragmentIdentityInPrimingBuffer, parsePrimeMediaFloorFromPrimingBuffer,
   shouldSkipLiveSegmentAfterCopyPrime } from "./fmp4-fragment-identity.ts";

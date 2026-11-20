@@ -136,6 +136,13 @@ export interface ProtectStreamingDelegateTestOptions {
   recordCreateTsbResumeInvocation?: () => void;
 }
 
+function isProtectStreamingDelegateTestOptions(value: Pick<AdvertisedStreams, "audioFormat" | "probe"> | ProtectStreamingDelegateTestOptions):
+  value is ProtectStreamingDelegateTestOptions {
+
+  return (value !== null) && (typeof value === "object") &&
+    (("onRotateSegmentWriter" in value) || ("recordCreateTsbResumeInvocation" in value));
+}
+
 /* One camera's probesize self-tuning: how many bytes FFmpeg is told to analyze before it may act on a stream, raised whenever FFmpeg gives up trying to make sense of
  * the input. The camera's configured probesize is the baseline, injected as a supplier rather than a value so this owns the whole effective-probesize story - a caller
  * cannot hand it a stale current value - and so a hint the user changes mid-life is picked up on the next read.
@@ -252,12 +259,19 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
   constructor(protectCamera: ProtectCameraHost, resolutions: Resolution[],
     derivedOrTest: Pick<AdvertisedStreams, "audioFormat" | "probe"> | ProtectStreamingDelegateTestOptions = { audioFormat: null, probe: null }) {
 
-    const streamTestOptions = (derivedOrTest !== null && typeof derivedOrTest === "object" &&
-      ("onRotateSegmentWriter" in derivedOrTest || "recordCreateTsbResumeInvocation" in derivedOrTest))
-      ? derivedOrTest as ProtectStreamingDelegateTestOptions : undefined;
-    const derived: Pick<AdvertisedStreams, "audioFormat" | "probe"> = streamTestOptions
-      ? { audioFormat: null, probe: null }
-      : derivedOrTest as Pick<AdvertisedStreams, "audioFormat" | "probe">;
+    const streamTestOptions = isProtectStreamingDelegateTestOptions(derivedOrTest) ? derivedOrTest : undefined;
+    let derived: Pick<AdvertisedStreams, "audioFormat" | "probe">;
+
+    if(streamTestOptions) {
+
+      derived = { audioFormat: null, probe: null };
+    } else if(!isProtectStreamingDelegateTestOptions(derivedOrTest)) {
+
+      derived = derivedOrTest;
+    } else {
+
+      derived = { audioFormat: null, probe: null };
+    }
 
     this.streamTestOptions = streamTestOptions;
     const advertised = recordingAdvertisementOf(derived.audioFormat);
@@ -386,7 +400,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
             {
 
               audioChannels: 1,
-              bitrate: 0,
 
               // Protect doorbells and the Opus audio track over RTSP both use a 48 kHz audio sampling rate, which HomeKit doesn't support; the samplerate helper hands
               // HomeKit both 16 and 24 kHz to choose from there (each divides 48 cleanly) and just 16 kHz when the buffer-backed livestream API delivers it. This surface

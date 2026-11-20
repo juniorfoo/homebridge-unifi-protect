@@ -268,6 +268,36 @@ export function makeChannelProfile(host: TestCameraHost, index = 0): ChannelProf
   return { channel, name: channel.name, resolution: [ 1920, 1080, 30 ], url: "rtsps://test" };
 }
 
+function makeTfdtVersion0Box(baseMediaDecodeTime: number): Buffer {
+
+  const payload = Buffer.alloc(8);
+
+  payload.writeUInt32BE(0, 0);
+  payload.writeUInt32BE(baseMediaDecodeTime, 4);
+
+  return makeBox("tfdt", payload);
+}
+
+function makeMfhdBox(sequenceNumber: number): Buffer {
+
+  const payload = Buffer.alloc(8);
+
+  payload.writeUInt32BE(0, 0);
+  payload.writeUInt32BE(sequenceNumber, 4);
+
+  return makeBox("mfhd", payload);
+}
+
+function makeTfhdBox(trackId: number): Buffer {
+
+  const payload = Buffer.alloc(8);
+
+  payload.writeUInt32BE(0, 0);
+  payload.writeUInt32BE(trackId, 4);
+
+  return makeBox("tfhd", payload);
+}
+
 // Synthesize a genuine fMP4 media fragment on the published fMP4 builders so the production isKeyframe TRUN-flag parse runs against REAL bytes on the REAL path - no
 // isKeyframe injection point, so the test exercises the actual fMP4 keyframe coupling rather than a test-only divergence. The fragment is moof>traf>trun with a
 // first_sample_flags-bearing trun (the builder sets the data_offset and first_sample_flags TRUN flags, sample_count 1, data_offset 0). The ONLY difference between a
@@ -275,13 +305,19 @@ export function makeChannelProfile(host: TestCameraHost, index = 0): ChannelProf
 // SAMPLE_FLAG_NON_SYNC sets it, marking a non-sync sample (a non-keyframe) the production parse rejects. The mdat carries an empty body - the timeshift never decodes
 // the payload, it only parses the moof for keyframe-ness and concatenates the bytes. The returned data buffer is the moof+mdat pair a media Segment delivers. This is
 // the single source of truth for both fragment kinds; makeKeyframeFragment and makeNonKeyframeFragment are the two thin selectors over it.
-function makeMediaFragment(options: { keyframe?: boolean } = {}): { data: Buffer; mdat: Buffer; moof: Buffer } {
+function makeMediaFragment(options: { baseMediaDecodeTime?: number; keyframe?: boolean; sequenceNumber?: number; tag?: number; trackId?: number } = {}):
+{ data: Buffer; mdat: Buffer; moof: Buffer; tag?: number } {
 
   const keyframe = options.keyframe ?? true;
-  const moof = makeContainer("moof", [makeContainer("traf", [makeTrunBox({ sampleFlagsValue: keyframe ? 0 : SAMPLE_FLAG_NON_SYNC, useFirstSampleFlags: true })])]);
-  const mdat = makeBox("mdat");
+  const trackId = options.trackId ?? 1;
+  const baseMediaDecodeTime = options.baseMediaDecodeTime ?? (keyframe ? 0 : 3000);
+  const sequenceNumber = options.sequenceNumber ?? 1;
+  const moof = makeContainer("moof", [ makeMfhdBox(sequenceNumber), makeContainer("traf", [ makeTfhdBox(trackId), makeTfdtVersion0Box(baseMediaDecodeTime),
+    makeTrunBox({ sampleFlagsValue: keyframe ? 0 : SAMPLE_FLAG_NON_SYNC, useFirstSampleFlags: true }) ]) ]);
+  const tagPayload = options.tag === undefined ? Buffer.alloc(0) : Buffer.from([ options.tag & 0xFF, (options.tag >> 8) & 0xFF ]);
+  const mdat = makeBox("mdat", tagPayload);
 
-  return { data: Buffer.concat([ moof, mdat ]), mdat, moof };
+  return { data: Buffer.concat([ moof, mdat ]), mdat, moof, tag: options.tag };
 }
 
 // The keyframe-bearing fragment: makeMediaFragment with its default keyframe-true selection, so the production isKeyframe parse returns true. This is a thin
@@ -296,9 +332,20 @@ export function makeKeyframeFragment(): { data: Buffer; mdat: Buffer; moof: Buff
 // parse returns false on the REAL path. The timeshift suite pushes this through the controllable double to exercise the discontinuity keyframe-gate (a
 // discontinuity-marked non-keyframe must defer the discontinuity emit until a clean keyframe arrives) and to drive any non-keyframe classification. Built at the use
 // site rather than cached in a module const so there is no unused-when-the-suite-changes SSOT cruft to drift.
-export function makeNonKeyframeFragment(): { data: Buffer; mdat: Buffer; moof: Buffer } {
+export function makeNonKeyframeFragment(tag?: number, timing?: { baseMediaDecodeTime?: number; sequenceNumber?: number; trackId?: number }):
+{ data: Buffer; mdat: Buffer; moof: Buffer; tag?: number } {
 
-  return makeMediaFragment({ keyframe: false });
+  return makeMediaFragment({ keyframe: false, tag, ...timing });
+}
+
+/** Media fragment without tfdt/mfhd (copy-escalation dedup cannot read an identity). */
+export function makeUntimedNonKeyframeFragment(tag?: number): { data: Buffer; mdat: Buffer; moof: Buffer; tag?: number } {
+
+  const moof = makeContainer("moof", [makeContainer("traf", [makeTrunBox({ sampleFlagsValue: SAMPLE_FLAG_NON_SYNC, useFirstSampleFlags: true })])]);
+  const tagPayload = tag === undefined ? Buffer.alloc(0) : Buffer.from([ tag & 0xFF, (tag >> 8) & 0xFF ]);
+  const mdat = makeBox("mdat", tagPayload);
+
+  return { data: Buffer.concat([ moof, mdat ]), mdat, moof, tag };
 }
 
 // The one keyframe fragment and init buffer the segment-yielding double reuses across every yield. The timeshift never mutates segment bytes (it parses and concatenates

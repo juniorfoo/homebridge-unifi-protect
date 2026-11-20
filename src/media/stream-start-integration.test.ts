@@ -7,10 +7,11 @@ import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import type { PrepareStreamRequest, StartStreamRequest } from "homebridge";
 import { H264Level, H264Profile, HOMEKIT_IDR_INTERVAL, RtpPortAllocator, StreamRequestTypes, formatBps } from "homebridge-plugin-utils";
+import { formatLogEntry, settle, type TestLogEntry } from "homebridge-plugin-utils/testing";
+import { makeTimeshiftSupervisorDouble, type TestTimeshiftSupervisor } from "../testing.helpers.ts";
 import { makeControllableLivestreamDouble, makeKeyframeFragment, makeLivestreamSubscriptionDouble, makeNonKeyframeFragment, makeTestCameraHost,
-  makeTimeshiftSupervisorDouble, makeUntimedNonKeyframeFragment, settle } from "../testing.helpers.ts";
+  makeUntimedNonKeyframeFragment, type ControllableLivestreamDouble, type TestCameraHost } from "./testing.helpers.ts";
 import { makeChannel } from "../camera.fixtures.ts";
-import type { ControllableLivestreamDouble, TestCameraHost, TestLogEntry, TestTimeshiftSupervisor } from "../testing.helpers.ts";
 import { ProtectTimeshiftBuffer } from "./timeshift.ts";
 import { parseH264AvcCFromFmp4Init } from "./h264-fmp4-avcc.ts";
 import { TEST_H264_MAIN_PPS, testH264SpsForProfileLevel } from "./h264-test-bytes.ts";
@@ -87,6 +88,7 @@ function buildFmp4Init(profileIdc: number, levelIdc: number): Buffer {
 }
 
 const MATCHING_INIT = buildFmp4Init(77, 31);
+const MATCHING_INIT_LIVESTREAM = { codec: "h264", data: MATCHING_INIT, description: { tracks: [] } };
 
 function makeStartRequest(overrides?: { packetTime?: number }): StartStreamRequest {
 
@@ -112,8 +114,6 @@ function makePrepareRequest(): PrepareStreamRequest {
 
 function installProtectStreamingHarness(host: TestCameraHost): void {
 
-  const api = host.api as { hap: Record<string, unknown> };
-
   class MockCameraController {
 
     public static generateSynchronisationSource(): number {
@@ -127,7 +127,31 @@ function installProtectStreamingHarness(host: TestCameraHost): void {
     }
   }
 
-  api.hap["CameraController"] = MockCameraController;
+  const api = host.api;
+
+  host.api = new Proxy(api, {
+
+    get(target, property, receiver): unknown {
+
+      if(property === "hap") {
+
+        return new Proxy(target.hap, {
+
+          get(hapTarget, hapProperty, hapReceiver): unknown {
+
+            if(hapProperty === "CameraController") {
+
+              return MockCameraController;
+            }
+
+            return Reflect.get(hapTarget, hapProperty, hapReceiver);
+          }
+        });
+      }
+
+      return Reflect.get(target, property, receiver);
+    }
+  });
 
   (host.platform as { rtpPorts: RtpPortAllocator }).rtpPorts = new RtpPortAllocator();
 }
@@ -170,8 +194,8 @@ interface PooledSharedFeedCouple {
 // Two distinct subscription objects (production never shares ids) fed from one shared push surface.
 function makePooledSharedFeedCouple(): PooledSharedFeedCouple {
 
-  const bufferSub = makeControllableLivestreamDouble({ id: "pooled-buffer-encoder", initSegment: { codec: "h264", data: MATCHING_INIT } });
-  const streamSub = makeControllableLivestreamDouble({ id: "pooled-session-encoder", initSegment: { codec: "h264", data: MATCHING_INIT } });
+  const bufferSub = makeControllableLivestreamDouble({ id: "pooled-buffer-encoder", initSegment: MATCHING_INIT_LIVESTREAM });
+  const streamSub = makeControllableLivestreamDouble({ id: "pooled-session-encoder", initSegment: MATCHING_INIT_LIVESTREAM });
 
   assert.notEqual(bufferSub.id, streamSub.id, "pooled buffer and session subscriptions must be distinct objects");
 
@@ -188,7 +212,7 @@ function makePooledSharedFeedCouple(): PooledSharedFeedCouple {
     bufferSub,
     pushInitToBuffer: (): void => {
 
-      bufferSub.push({ codec: "h264", data: MATCHING_INIT, type: "init" });
+      bufferSub.push({ ...MATCHING_INIT_LIVESTREAM, type: "init" });
     },
     pushMediaToBoth: (fragment): void => {
 
@@ -207,17 +231,16 @@ function makePooledSharedFeedCouple(): PooledSharedFeedCouple {
   };
 }
 
-function logLineIncludes(entries: TestLogEntry[], fragment: string): boolean {
+function logLineIncludes(entries: readonly TestLogEntry[], fragment: string): boolean {
 
-  return entries.some((entry) => entry.formatted.includes(fragment) || entry.parameters.some((parameter) => (typeof parameter === "string") &&
-    parameter.includes(fragment)));
+  return entries.some((entry) => formatLogEntry(entry).includes(fragment));
 }
 
 interface HarnessContext {
 
   delegate: ProtectStreamingDelegate;
   host: TestCameraHost;
-  logEntries: TestLogEntry[];
+  logEntries: readonly TestLogEntry[];
   spawnedArgs: string[][];
   spawnedProcesses: TestLiveStreamingFfmpegProcess[];
   timeshift: TestTimeshiftSupervisor;
@@ -545,7 +568,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
   test("bufferDegraded without buffer profile falls back to transcode-biased selectChannel", async () => {
 
     const ctx = createHarness();
-    let selectCall: { biasHigher?: boolean; maxPixels?: number; height: number; width: number } | undefined;
+    let selectCall: { bias?: string; maxPixels?: number; height: number; width: number } | undefined;
 
     ctx.host.ufp = { ...ctx.host.ufp, videoCodec: "av1" };
     ctx.timeshift.buffer.isStarted = false;
@@ -554,7 +577,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.selectSubstrateChannel = () => null;
     ctx.host.selectChannel = (width, height, options) => {
 
-      selectCall = { biasHigher: options?.biasHigher, height: height, maxPixels: options?.maxPixels, width: width };
+      selectCall = { bias: options?.bias, height: height, maxPixels: options?.maxPixels, width: width };
 
       return stubChannel;
     };
@@ -563,7 +586,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     assert.equal(ctx.spawnedProcesses.length, 1);
     assert.ok(selectCall);
-    assert.equal(selectCall?.biasHigher, true);
+    assert.equal(selectCall?.bias, "higher");
     assert.ok((selectCall?.maxPixels ?? 0) > 0);
   });
 
@@ -616,8 +639,8 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
         }
       }
     });
-    const bufferSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
-    const streamSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
+    const bufferSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
+    const streamSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
     const liveSub = streamSub;
     const bufferedKeyframe = makeKeyframeFragment();
     const bufferedTail = makeNonKeyframeFragment();
@@ -626,7 +649,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     const buffer = await wireRealTimeshiftBuffer(ctx, bufferSub);
 
-    bufferSub.push({ codec: "h264", data: MATCHING_INIT, type: "init" });
+    bufferSub.push({ ...MATCHING_INIT_LIVESTREAM, type: "init" });
     await settle();
     bufferSub.push({ data: bufferedKeyframe.data, mdat: bufferedKeyframe.mdat, moof: bufferedKeyframe.moof, type: "media" });
     await settle();
@@ -1302,13 +1325,13 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
   test("copy escalation init-only prime when buffer channel id differs from live subscription (PM3)", async () => {
 
     const ctx = createHarness();
-    const bufferSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
-    const streamSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
+    const bufferSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
+    const streamSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
 
     ctx.host.livestreamSubscriptions = [bufferSub];
     const buffer = await wireRealTimeshiftBuffer(ctx, bufferSub);
 
-    bufferSub.push({ codec: "h264", data: MATCHING_INIT, type: "init" });
+    bufferSub.push({ ...MATCHING_INIT_LIVESTREAM, type: "init" });
     await settle();
     const bufferedKeyframe = makeKeyframeFragment();
 
@@ -1375,14 +1398,14 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
   test("copy escalation init-only prime when buffer lens differs from live subscription (PM3 lens)", async () => {
 
     const ctx = createHarness();
-    const bufferSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
-    const streamSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
+    const bufferSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
+    const streamSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
     const bufferProfile: ChannelProfile = { ...stubChannel, lens: 0 };
 
     ctx.host.livestreamSubscriptions = [bufferSub];
     const buffer = await wireRealTimeshiftBuffer(ctx, bufferSub, bufferProfile);
 
-    bufferSub.push({ codec: "h264", data: MATCHING_INIT, type: "init" });
+    bufferSub.push({ ...MATCHING_INIT_LIVESTREAM, type: "init" });
     await settle();
     const bufferedKeyframe = makeKeyframeFragment();
 
@@ -1450,13 +1473,13 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     const ctx = createHarness();
     const defaultHasFeature = ctx.host.hasFeature.bind(ctx.host);
 
-    const bufferSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
-    const streamSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
+    const bufferSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
+    const streamSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
 
     ctx.host.livestreamSubscriptions = [bufferSub];
     const buffer = await wireRealTimeshiftBuffer(ctx, bufferSub);
 
-    bufferSub.push({ codec: "h264", data: MATCHING_INIT, type: "init" });
+    bufferSub.push({ ...MATCHING_INIT_LIVESTREAM, type: "init" });
     await settle();
     const bufferedKeyframe = makeKeyframeFragment();
 
@@ -1545,11 +1568,11 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.usesTimeshiftLivestream = false;
     ctx.timeshift.buffer.isStarted = false;
 
-    let selectCall: { biasHigher?: boolean; height: number; maxPixels?: number; width: number } | undefined;
+    let selectCall: { bias?: string; height: number; maxPixels?: number; width: number } | undefined;
 
     ctx.host.selectChannel = (width, height, options) => {
 
-      selectCall = { biasHigher: options?.biasHigher, height: height, maxPixels: options?.maxPixels, width: width };
+      selectCall = { bias: options?.bias, height: height, maxPixels: options?.maxPixels, width: width };
 
       return stubChannel;
     };
@@ -1559,7 +1582,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     assert.ok(selectCall, "copy-first RTSP transcode must reselect a source channel");
     assert.equal(selectCall?.width, 3840);
     assert.equal(selectCall?.height, 2160);
-    assert.equal(selectCall?.biasHigher, true);
+    assert.equal(selectCall?.bias, "higher");
     assert.ok((selectCall?.maxPixels ?? 0) > 0);
     assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), false);
   });
@@ -1584,7 +1607,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     });
 
     Object.defineProperty(ctx.delegate, "ffmpegOptions", { value: hardwareFfmpegOptions });
-    let selectCall: { biasHigher?: boolean; height: number; maxPixels?: number; width: number } | undefined;
+    let selectCall: { bias?: string; height: number; maxPixels?: number; width: number } | undefined;
 
     ctx.timeshift.buffer.isStarted = false;
     ctx.timeshift.buffer.channelProfile = null;
@@ -1592,7 +1615,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.selectSubstrateChannel = () => null;
     ctx.host.selectChannel = (width, height, options) => {
 
-      selectCall = { biasHigher: options?.biasHigher, height: height, maxPixels: options?.maxPixels, width: width };
+      selectCall = { bias: options?.bias, height: height, maxPixels: options?.maxPixels, width: width };
 
       return stubChannel;
     };
@@ -1602,7 +1625,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     assert.ok(selectCall);
     assert.equal(selectCall?.width, 3840);
     assert.equal(selectCall?.height, 2160);
-    assert.equal(selectCall?.biasHigher, true);
+    assert.equal(selectCall?.bias, "higher");
     assert.ok((selectCall?.maxPixels ?? 0) > 0);
     assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), false);
   });

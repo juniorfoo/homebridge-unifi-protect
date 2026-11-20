@@ -9,8 +9,8 @@ import type { StartStreamRequest } from "homebridge";
 import type { FfmpegOptions } from "homebridge-plugin-utils";
 import { FfmpegOptions as FfmpegOptionsImpl, H264Level, H264Profile } from "homebridge-plugin-utils";
 /* eslint-disable camelcase -- HomeKit StartStreamRequest wire field names */
-import { makeTestCameraHost } from "../testing.helpers.ts";
-import type { TestCameraHost } from "../testing.helpers.ts";
+import { makeTestCameraHost } from "./testing.helpers.ts";
+import type { TestCameraHost } from "./testing.helpers.ts";
 import { appendLiveVideoEncodeToFfmpegArgs, resolveStartStreamEncodePlan, resolveStartStreamForceTranscodeDueToUserOption } from "./stream-live-wiring.ts";
 import type { ChannelProfile } from "./resolution.ts";
 import { setLiveVideoFfmpegSpawnerForTests, spawnLiveVideoFfmpegProcess } from "./stream-live-ffmpeg-spawn.ts";
