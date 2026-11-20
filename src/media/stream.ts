@@ -59,11 +59,14 @@ interface StreamReconfigureHandles {
 
 interface StreamSessionDiagnostics {
 
+  activeVideoFfmpeg?: { current: ProtectStreamingFfmpegProcess };
+  appliedHomeKitVideo?: HomeKitStreamVideoSnapshot;
   escalatedFromCopy: boolean;
   firstFrameMs?: number | null;
   hardwareTranscode: boolean;
   homeKitVideo?: HomeKitStreamVideoSnapshot;
   liveEncodeRebuild?: StreamLiveEncodeRebuild;
+  pendingReconfigure?: StartStreamRequest;
   outputWatchdog: StreamOutputWatchdog;
   path: string;
   profile: string;
@@ -1300,6 +1303,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     const homeKitVideo = homeKitStreamVideoSnapshotFromRequest(request.video);
 
+    sessionDiagnostics.appliedHomeKitVideo = homeKitVideo;
     sessionDiagnostics.homeKitVideo = homeKitVideo;
     sessionDiagnostics.liveEncodeRebuild = {
 
@@ -1325,6 +1329,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
       activeFfmpeg = this.spawnLiveVideoFfmpeg(ffmpegArgsBeforeVideoEncode, encodeDecision, channelProfile, request, sessionInfo, encoderBitrate,
         useInterpolationFilter, useTsb, ffmpegAbort, livePipelineOptions);
+      sessionDiagnostics.activeVideoFfmpeg = { current: activeFfmpeg };
     } catch(error) {
 
       if(error instanceof LiveViewSrtpDestinationRefusal) {
@@ -1419,6 +1424,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       onRespawned: (respawned) => {
 
         activeFfmpeg = respawned;
+        sessionDiagnostics.activeVideoFfmpeg = { current: respawned };
       },
       sessionDiagnostics: sessionDiagnostics,
       sessionStartedAt: sessionStartedAt,
@@ -1471,7 +1477,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     if(useTsb) {
 
       // Feed segments to FFmpeg with backpressure handling...if FFmpeg can't keep up, segments are queued and written when it's ready.
-      tsbWriterRail = createTsbSegmentWriterRail({ feedState: tsbFeedState, getStdin: () => activeFfmpeg.stdin,
+      tsbWriterRail = createTsbSegmentWriterRail({ feedState: tsbFeedState, getStdin: () => sessionDiagnostics.activeVideoFfmpeg?.current.stdin ?? activeFfmpeg.stdin,
         onRotateSegmentWriter: this.streamTestOptions?.onRotateSegmentWriter, signal: sessionInfo.abortController.signal });
 
       // Subscribe to the pooled livestream via the camera interface. This call is synchronous and returns the subscription handle immediately; the underlying connection
@@ -1490,18 +1496,19 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         urgency: () => PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_MS });
 
       // Drive the segment iterator in the background.
-      void this.consumeStreamSegments(() => activeFfmpeg, tsbFeedState, subscription, (): BackpressureWriter => {
+      void this.consumeStreamSegments(() => sessionDiagnostics.activeVideoFfmpeg?.current ?? activeFfmpeg, tsbFeedState, subscription,
+        (): BackpressureWriter => {
 
-        if(!tsbWriterRail) {
+          if(!tsbWriterRail) {
 
-          throw new Error("TSB segment writer is missing.");
-        }
+            throw new Error("TSB segment writer is missing.");
+          }
 
-        return tsbWriterRail.getSegmentWriter();
-      }, tsBuffer, (): void => {
+          return tsbWriterRail.getSegmentWriter();
+        }, tsBuffer, (): void => {
 
-        this.recordTsbMediaSegmentForOwner(request.sessionID, sessionDiagnostics);
-      });
+          this.recordTsbMediaSegmentForOwner(request.sessionID, sessionDiagnostics);
+        });
 
       /* Wait for the session to establish, within the live view's start deadline. HomeKit's answer comes from the FFmpeg ready bridge above, and FFmpeg says nothing
        * until video reaches it, so a livestream that never delivers would otherwise hold HomeKit's request until HAP times it out. The deadline is measured from
@@ -1779,20 +1786,9 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     rebuild: StreamLiveEncodeRebuild): ReturnType<typeof resolveStartStreamEncodePlan> | null {
 
     let channelProfile = rebuild.channelProfile;
-    let bufferForcedTranscodeReason = rebuild.bufferForcedTranscodeReason;
+    const bufferForcedTranscodeReason = rebuild.bufferForcedTranscodeReason;
 
-    if(rebuild.useTsb) {
-
-      const bufferProfile = this.timeshift?.buffer.channelProfile;
-
-      if(bufferProfile) {
-
-        const resolved = resolveTimeshiftBufferLiveChannel(bufferProfile, this.protectCamera);
-
-        channelProfile = resolved.encodeProfile;
-        bufferForcedTranscodeReason = resolved.forcedTranscodeReason;
-      }
-    } else {
+    if(!rebuild.useTsb) {
 
       const reselected = this.reselectRtspChannelForLiveReconfigure(updatedRequest, rebuild.preferCopyChannel);
 
@@ -1910,17 +1906,54 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         primeLiveFfmpegStdinAfterRespawn(tsbResume.feedState, tsbResume.subscription, respawned, tsbResume.keyframePrimingBuffer, this.log);
       }
 
+      if(owner.activeVideoFfmpeg) {
+
+        owner.activeVideoFfmpeg.current = respawned;
+      } else {
+
+        owner.activeVideoFfmpeg = { current: respawned };
+      }
+
       handles.wireFfmpegExitBridge(respawned);
 
+      void respawned.exited.finally(() => unlinkSessionAbort());
+
       await respawned.ready;
+      owner.appliedHomeKitVideo = nextSnapshot;
     } catch(error) {
 
+      unlinkSessionAbort();
       this.log.error("Unable to replan the live view stream after HomeKit RECONFIGURE: %s.", formatErrorMessage(error));
     } finally {
 
-      unlinkSessionAbort();
       handles.copyEscalationInFlightRef.current = false;
       owner.reconfigureInFlight = false;
+
+      const pending = owner.pendingReconfigure;
+      const pendingRebuild = owner.liveEncodeRebuild;
+
+      if(pending && pendingRebuild) {
+
+        owner.pendingReconfigure = undefined;
+        const encodePlan = this.resolveEncodePlanAfterHomeKitReconfigure(pending, pendingRebuild);
+
+        if(encodePlan) {
+
+          const nextSnapshot = homeKitStreamVideoSnapshotFromRequest(pending.video);
+          const decision = isMaterialLiveStreamReconfigure({
+
+            next: nextSnapshot,
+            nextEncode: encodePlan.encodeDecision.mode,
+            previous: owner.appliedHomeKitVideo,
+            previousEncode: owner.videoCopy ? "copy" : "transcode"
+          });
+
+          if(decision.material) {
+
+            void this.replanLiveStreamForHomeKitReconfigure(sessionId, pending, encodePlan, decision.reason);
+          }
+        }
+      }
     }
   }
 
@@ -1967,18 +2000,22 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
                 next: nextSnapshot,
                 nextEncode: encodePlan.encodeDecision.mode,
-                previous: owner.homeKitVideo,
+                previous: owner.appliedHomeKitVideo,
                 previousEncode: owner.videoCopy ? "copy" : "transcode"
               });
 
               if(decision.material) {
 
-                void this.replanLiveStreamForHomeKitReconfigure(request.sessionID, updatedRequest, encodePlan, decision.reason);
+                if(owner.reconfigureInFlight) {
+
+                  owner.pendingReconfigure = updatedRequest;
+                } else {
+
+                  void this.replanLiveStreamForHomeKitReconfigure(request.sessionID, updatedRequest, encodePlan, decision.reason);
+                }
               } else {
 
-                owner.homeKitVideo = nextSnapshot;
                 rebuild.request = updatedRequest;
-                rebuild.homeKitVideo = nextSnapshot;
               }
             }
           }
