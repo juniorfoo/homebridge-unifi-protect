@@ -2022,6 +2022,71 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     await stopActiveSession(ctx, startRequest.sessionID);
   });
 
+  test("RECONFIGURE restore fps while replan is pending queues a follow-up replan", async () => {
+
+    const ctx = createHarness();
+    let replanSlow: TestLiveStreamingFfmpegProcess | null = null;
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      const deferReady = ctx.spawnedProcesses.length === 1;
+      const proc = new TestLiveStreamingFfmpegProcess("live-" + String(ctx.spawnedProcesses.length), { deferReady: deferReady, signal: init.signal });
+
+      if(deferReady) {
+
+        replanSlow = proc;
+      }
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(proc);
+
+      return proc as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+
+    startRequest.video.fps = 30;
+
+    await prepareAndStart(ctx, startRequest);
+    assert.equal(ctx.spawnedArgs.length, 1);
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({
+
+        ...startRequest,
+        type: StreamRequestTypes.RECONFIGURE,
+        video: { ...startRequest.video, fps: 15 }
+      }, (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    await waitFor(() => ctx.spawnedArgs.length === 2, "first replan spawn");
+    assert.ok(replanSlow, "replan ffmpeg must be spawned");
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({
+
+        ...startRequest,
+        type: StreamRequestTypes.RECONFIGURE,
+        video: { ...startRequest.video, fps: 30 }
+      }, (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    assert.ok(replanSlow);
+
+    (replanSlow as TestLiveStreamingFfmpegProcess).releaseReady();
+
+    await waitFor(() => ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID)?.appliedHomeKitVideo?.fps === 30,
+      "applied HomeKit video must restore to 30fps after in-flight 15fps replan");
+
+    await stopActiveSession(ctx, startRequest.sessionID);
+  });
+
   test("IPv6 zone refusal on start disposes prepared session without spawning video ffmpeg", async () => {
 
     let disposeCalls = 0;

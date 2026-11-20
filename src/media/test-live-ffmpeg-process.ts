@@ -11,6 +11,8 @@ export interface TestLiveStreamingFfmpegProcessInit {
   blockStdin?: boolean;
   /** When true (default for blockStdin), abort/terminateStdin breaks the pipe like a dead child (EPIPE) without synthetic drain. */
   pipeBreakOnTeardown?: boolean;
+  deferReady?: boolean;
+  rejectExited?: boolean;
   returnPort?: FfmpegStreamingReturnPort;
   signal?: AbortSignal;
   stderrLog?: readonly string[];
@@ -34,6 +36,8 @@ export class TestLiveStreamingFfmpegProcess {
   readonly ready: Promise<void>;
   readonly exited: Promise<FfmpegProcessExitInfo>;
   #exitedSettled = false;
+  #rejectExitedRejector?: (reason: unknown) => void;
+  #resolveReady?: () => void;
 
   constructor(id: string, init?: TestLiveStreamingFfmpegProcessInit) {
 
@@ -63,23 +67,32 @@ export class TestLiveStreamingFfmpegProcess {
 
     let resolveExited!: (value: FfmpegProcessExitInfo) => void;
 
-    this.exited = new Promise((resolve) => {
+    if(init?.rejectExited) {
 
-      resolveExited = resolve;
-    });
+      this.exited = new Promise((_resolve, reject) => {
 
-    const settleExited = (): void => {
+        this.#rejectExitedRejector = reject;
+      });
+    } else {
 
-      if(this.#exitedSettled) {
+      this.exited = new Promise((resolve) => {
 
-        return;
-      }
+        resolveExited = resolve;
+      });
 
-      this.#exitedSettled = true;
-      resolveExited({ exitCode: null, exitSignal: "SIGTERM" });
-    };
+      const settleExited = (): void => {
 
-    this.#controller.signal.addEventListener("abort", settleExited, { once: true });
+        if(this.#exitedSettled) {
+
+          return;
+        }
+
+        this.#exitedSettled = true;
+        resolveExited({ exitCode: null, exitSignal: "SIGTERM" });
+      };
+
+      this.#controller.signal.addEventListener("abort", settleExited, { once: true });
+    }
 
     if(init?.signal) {
 
@@ -101,7 +114,33 @@ export class TestLiveStreamingFfmpegProcess {
       }
     }
 
-    this.ready = Promise.resolve();
+    if(init?.deferReady) {
+
+      this.ready = new Promise<void>((resolve) => {
+
+        this.#resolveReady = resolve;
+      });
+    } else {
+
+      this.ready = Promise.resolve();
+    }
+  }
+
+  releaseReady(): void {
+
+    this.#resolveReady?.();
+    this.#resolveReady = undefined;
+  }
+
+  rejectExitedNow(reason: unknown = new Error("ffmpeg exited rejected")): void {
+
+    if(this.#exitedSettled) {
+
+      return;
+    }
+
+    this.#exitedSettled = true;
+    this.#rejectExitedRejector?.(reason);
   }
 
   get signal(): AbortSignal {

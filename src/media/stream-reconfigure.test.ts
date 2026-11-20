@@ -4,8 +4,8 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { H264Level, H264Profile } from "homebridge-plugin-utils";
-import { LIVE_STREAM_RECONFIGURE_TRANSCODE_BITRATE_THRESHOLD_KBPS, homeKitStreamVideoSnapshotFromRequest, isMaterialLiveStreamReconfigure } from
-  "./stream-reconfigure.ts";
+import { LIVE_STREAM_RECONFIGURE_TRANSCODE_BITRATE_THRESHOLD_KBPS, homeKitStreamVideoSnapshotFromRequest, isMaterialLiveStreamReconfigure,
+  resolveReconfigureMaterialityBaseline, unlinkOnFfmpegExitedSettled } from "./stream-reconfigure.ts";
 
 const baseVideo = {
 
@@ -100,5 +100,80 @@ describe("stream-reconfigure", () => {
       previous: appliedTranscode,
       previousEncode: "transcode"
     }).material, true);
+  });
+
+  test("resolveReconfigureMaterialityBaseline uses negotiated rebuild target before applied catches up", () => {
+
+    const applied = homeKitStreamVideoSnapshotFromRequest(baseVideo);
+    const inFlightVideo = { ...baseVideo, fps: 15 };
+    const restoreVideo = { ...baseVideo, fps: 30 };
+
+    const baseline = resolveReconfigureMaterialityBaseline({
+
+      applied: applied,
+      pendingRequestVideo: undefined,
+      rebuildRequestVideo: inFlightVideo,
+      reconfigureInFlight: false
+    });
+    const decision = isMaterialLiveStreamReconfigure({
+
+      next: homeKitStreamVideoSnapshotFromRequest(restoreVideo),
+      nextEncode: "copy",
+      previous: baseline,
+      previousEncode: "copy"
+    });
+
+    assert.equal(decision.material, true, "restore to 30 fps must be material vs negotiated 15 fps before ready, even if applied is still 30");
+  });
+
+  test("resolveReconfigureMaterialityBaseline uses in-flight target while replan is pending", () => {
+
+    const applied = homeKitStreamVideoSnapshotFromRequest(baseVideo);
+    const inFlightVideo = { ...baseVideo, fps: 15 };
+    const restoreVideo = { ...baseVideo, fps: 30 };
+
+    const baseline = resolveReconfigureMaterialityBaseline({
+
+      applied: applied,
+      pendingRequestVideo: undefined,
+      rebuildRequestVideo: inFlightVideo,
+      reconfigureInFlight: true
+    });
+    const decision = isMaterialLiveStreamReconfigure({
+
+      next: homeKitStreamVideoSnapshotFromRequest(restoreVideo),
+      nextEncode: "copy",
+      previous: baseline,
+      previousEncode: "copy"
+    });
+
+    assert.equal(decision.material, true, "restore to 30 fps must be material vs in-flight 15 fps, not applied 30 fps");
+  });
+
+  test("unlinkOnFfmpegExitedSettled does not leave rejected exited promises unhandled", async () => {
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+
+      unhandled.push(reason);
+    };
+
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+
+      let unlinked = false;
+
+      unlinkOnFfmpegExitedSettled(Promise.reject(new Error("exited failed")), () => {
+
+        unlinked = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(unhandled.length, 0);
+      assert.equal(unlinked, true);
+    } finally {
+
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 });
