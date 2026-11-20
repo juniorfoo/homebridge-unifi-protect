@@ -66,8 +66,8 @@ For HomeKit Secure Video event recording:
 Everything above can be tailored to your environment and taste in the HBUP feature options webUI. Specifically, you can:
 
 * Stream live views directly from the camera over RTSP instead of from the buffer. **Default: buffer-backed live viewing (`Video.Timeshift.Livestream`, on).**
-* Transmux instead of transcode for local clients. **Default: transcode local clients.**
-* Transmux instead of transcode for high-latency / remote clients. **Default: transcode high-latency / remote clients.**
+* Transcode instead of H.264 copy for local clients (`Video.Transcode`). **Default: copy for local clients only when the source exactly matches the HomeKit request (transcode off).**
+* Allow H.264 copy for high-latency clients when the source matches (`Video.Transcode.HighLatency` off). **Default: transcode high-latency clients (`Video.Transcode.HighLatency` on).**
 * Force a specific Protect stream quality for direct-RTSP live views, using `Video.Rtsp.Only.High` / `Medium` / `Low`. **Default: HBUP decides, using the rules above.**
 * Force the stream quality the timeshift buffer feeds from - the source HKSV, buffer-backed live views, and snapshots all draw on - using `Video.Timeshift.Only.High` / `Medium` / `Low`. **Default: the highest available quality.**
 

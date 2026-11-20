@@ -5,12 +5,12 @@
  * This module is heavily inspired by the homebridge and homebridge-camera-ffmpeg source code. Thank you for your contributions to the HomeKit world.
  */
 import type { AudioOptionsIdentity, StreamingDelegate, StreamingDelegateFactory } from "./stream-delegate.ts";
-import { AudioRecordingCodecType, AudioRecordingSamplerate, AudioStreamingCodecType, AudioStreamingSamplerate, BackpressureWriter, FfmpegOptions,
-  FfmpegStreamingProcess, H264Level, H264Profile, HKSV_FRAGMENT_LENGTH, HOMEKIT_IDR_INTERVAL, HbpuAbortError, MediaContainerType, RtpDemuxer, SRTPCryptoSuites,
+import { AudioRecordingCodecType, AudioRecordingSamplerate, AudioStreamingCodecType, AudioStreamingSamplerate, FfmpegOptions,
+  FfmpegStreamingProcess, H264Level, H264Profile, HKSV_FRAGMENT_LENGTH, HbpuAbortError, MediaContainerType, RtpDemuxer, SRTPCryptoSuites,
   StreamRequestTypes, VideoCodecType, formatBps, formatErrorMessage, guardedDispatch, isHbpuAbortReason } from "homebridge-plugin-utils";
+import type { BackpressureWriter, HomebridgePluginLogging, IpFamily, Nullable, PortReservation } from "homebridge-plugin-utils";
 import type { CameraController, CameraControllerOptions, CameraStreamingDelegate, HAP, PrepareStreamCallback, PrepareStreamRequest, PrepareStreamResponse, Resolution,
   Service, SnapshotRequest, SnapshotRequestCallback, StartStreamRequest, StreamRequestCallback, StreamingRequest } from "homebridge";
-import type { HomebridgePluginLogging, IpFamily, Nullable, PortReservation } from "homebridge-plugin-utils";
 import { PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_MS, PROTECT_LIVESTREAM_API_IDR_INTERVAL, PROTECT_TIMESHIFT_BUFFER_MAXDURATION } from "../settings.ts";
 import { ProtectAbortedError, livestreamAudioSampleRate } from "unifi-protect";
 import { ProtectReservedNames, isPackageCameraContext } from "../types.ts";
@@ -22,21 +22,34 @@ import type { ProtectNvr } from "../nvr/nvr.ts";
 import type { ProtectPlatform } from "../platform.ts";
 import { ProtectRecordingDelegate } from "./record.ts";
 import { ProtectSnapshot } from "./snapshot.ts";
-import { ProtectStreamingFfmpegProcess } from "./stream-ffmpeg-process.ts";
+import type { ProtectStreamingFfmpegProcess } from "./stream-ffmpeg-process.ts";
 import { ProtectTimeshiftSupervisor } from "./timeshift-supervisor.ts";
 import type { TalkbackSession } from "unifi-protect";
-import { logLivestreamIterationError } from "./livestream.ts";
 import { resolveSessionSource } from "./stream-source-policy.ts";
 import { streamingSamplerates } from "./stream-delegate.ts";
 /* eslint-disable sort-imports -- multi-member telemetry import must follow single-member neighbor imports without reordering paths. */
+import type { LiveVideoEncodeDecision } from "./stream-transcode-policy.ts";
+import type { LiveStreamSessionSource } from "./stream-transcode-policy.ts";
+import { resolveLiveTranscodeBitrate, shouldRegisterOngoingSessionEntry, shouldRemoveOngoingSessionEntry,
+  shouldRemovePendingSessionEntry } from "./stream-transcode-policy.ts";
 import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, establishmentFailureStopReason, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart,
   formatStreamSessionStop, recordStreamMediaActivityIfOwner } from "./stream-telemetry.ts";
+import type { LiveTsbFeedState } from "./stream-live-feed.ts";
+import { consumeLiveStreamSegments, createTsbSegmentWriterRail } from "./stream-live-feed.ts";
+import { appendLiveVideoEncodeToFfmpegArgs, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge, formatLiveEncodeDecisionLog,
+  resolveCopyEscalationKeyframePrimingBuffer, resolveFmp4InitForLiveDeclaredCheck, resolveStartStreamEncodePlan, resolveStartStreamForceTranscodeDueToUserOption,
+  resolveStreamEgressBitrateBps, resolveTimeshiftBufferLiveChannel, shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
+import { replaceFailedCopyWithTranscode } from "./stream-copy-escalation.ts";
+import type { CopyEscalationTsbResume, StreamLiveEncodeRebuild } from "./stream-copy-escalation.ts";
+import { spawnLiveVideoFfmpegProcess } from "./stream-live-ffmpeg-spawn.ts";
 /* eslint-enable sort-imports */
 
 interface StreamSessionDiagnostics {
 
+  escalatedFromCopy: boolean;
   firstFrameMs?: number | null;
   hardwareTranscode: boolean;
+  liveEncodeRebuild?: StreamLiveEncodeRebuild;
   outputWatchdog: StreamOutputWatchdog;
   path: string;
   profile: string;
@@ -44,6 +57,7 @@ interface StreamSessionDiagnostics {
   sessionStartedAt: number;
   stopLogged: boolean;
   transcode: boolean;
+  videoCopy: boolean;
 }
 
 interface OngoingSessionEntry {
@@ -111,6 +125,13 @@ function isCleanTalkbackStop(error: unknown, signal: AbortSignal): boolean {
   return signal.aborted || (error instanceof ProtectAbortedError);
 }
 
+/** Optional hooks for node:test harnesses (not used in production). */
+export interface ProtectStreamingDelegateTestOptions {
+
+  onRotateSegmentWriter?: (event: { poisoned: BackpressureWriter; replacement: BackpressureWriter }) => void;
+  recordCreateTsbResumeInvocation?: () => void;
+}
+
 // Camera streaming delegate implementation for Protect.
 export class ProtectStreamingDelegate implements CameraStreamingDelegate, StreamingDelegate {
 
@@ -139,10 +160,12 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
   // Internal development only: alternates the resolved transport source between the timeshift buffer and RTSP when Debug.Video.Stream.ABTest is enabled, so a live
   // A/B comparison can run without restarting the plugin.
   private abTest = false;
+  private readonly streamTestOptions: ProtectStreamingDelegateTestOptions | undefined;
 
   // Create an instance of a HomeKit streaming delegate.
-  constructor(protectCamera: ProtectCameraHost, resolutions: [number, number, number][]) {
+  constructor(protectCamera: ProtectCameraHost, resolutions: [number, number, number][], streamTestOptions?: ProtectStreamingDelegateTestOptions) {
 
+    this.streamTestOptions = streamTestOptions;
     this.builtFor = { isDoorbell: protectCamera.ufp.featureFlags.isDoorbell, twoWayAudio: protectCamera.hints.twoWayAudio };
     this.hap = protectCamera.api.hap;
     this.hksv = null;
@@ -553,268 +576,15 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     owner.outputWatchdog.activity();
   }
 
-  // Consume Segments from a livestream subscription and write them through to FFmpeg via the supplied BackpressureWriter. FFmpeg needs a valid fMP4 header before any
-  // MOOF/MDAT data, so we prepend the header exactly once on the first media: either the pre-existing timeshift buffer slice (which already contains the init segment
-  // followed by recent frames) or the subscription's cached init segment data on its own. The unifi-protect library's pool yields the init as its own Segment, so we
-  // SKIP the init-typed segment here (writing both the prepended init data and the init segment would double-write the fMP4 header and corrupt FFmpeg's -f mp4 input)
-  // and consume the cached initSegment.data instead. Error classification is centralised in logLivestreamIterationError so every livestream consumer uses identical
-  // phrasing.
-  private async consumeStreamSegments(ffmpegStream: ProtectStreamingFfmpegProcess, subscription: LivestreamSubscription, segmentWriter: BackpressureWriter,
-    tsBuffer: Nullable<Buffer>, onMediaSegment?: () => void): Promise<void> {
+  // Segment consumption and fMP4 header priming live in stream-live-feed.ts (upstream comments restored there).
+  private async consumeStreamSegments(getFfmpeg: () => ProtectStreamingFfmpegProcess, feedState: LiveTsbFeedState, subscription: LivestreamSubscription,
+    getSegmentWriter: () => BackpressureWriter, tsBuffer: Nullable<Buffer>, onMediaSegment?: () => void): Promise<void> {
 
-    let headerWritten = false;
-
-    try {
-
-      for await (const segment of subscription) {
-
-        // The init segment is consumed through the cached subscription.initSegment getter and prepended once below as the header, not written here. Skip it.
-        if(segment.type === "init") {
-
-          continue;
-        }
-
-        // The first media segment after a genuine reconnect carries discontinuity:true: its tfdt baseMediaDecodeTime has been rebased near zero (a backward timeline
-        // jump). Our live -f mp4 input carries +discardcorrupt / ignore_err but NOT +genpts, so feeding the rebased fragment would corrupt FFmpeg's demux. We end
-        // FFmpeg's stdin instead - the .exited force-stop bridge then re-establishes the HomeKit session cleanly, ending the stream on every visible disconnect (the
-        // discontinuity marker sources that decision inline). A unifi-protect-side timeline-continuity alternative (stitching the timeline across reconnects rather
-        // than ending) is backlogged. This check is BEFORE the write so the rebased fragment is never forwarded; it mirrors timeshift.ts's check-before-forward
-        // ordering.
-        if(segment.discontinuity) {
-
-          ffmpegStream.stdin.end();
-
-          return;
-        }
-
-        // Prepend the fMP4 header once, on the first media segment. The whenEstablished contract guarantees subscription.initSegment is non-null by the time media
-        // flows...the unifi-protect library delivers the init segment before the first media segment. If the library ever violates this and we see a null header
-        // here, fail the stream cleanly rather than feeding FFmpeg MOOF/MDAT chunks without a header (which would silently corrupt the output).
-        if(!headerWritten) {
-
-          headerWritten = true;
-
-          const header = tsBuffer ?? subscription.initSegment?.data;
-
-          if(!header) {
-
-            this.log.error("Live streaming aborted: the livestream API delivered its first segment before the initialization segment.");
-            ffmpegStream.stdin.end();
-
-            return;
-          }
-
-          void segmentWriter.write(header).catch((error: unknown) => this.log.debug("Live stream backpressure write dropped.", { error }));
-        }
-
-        onMediaSegment?.();
-
-        // Write the media fragment. The homebridge-plugin-utils write() returns a typed-rejecting Promise; the .catch (debug) swallows BackpressureClosedStreamError /
-        // signal.reason on teardown (the common case when FFmpeg exits mid-write). No highWaterMark (unbounded) and no segment-count accounting, unlike HKSV.
-        void segmentWriter.write(segment.data).catch((error: unknown) => this.log.debug("Live stream backpressure write dropped.", { error }));
-      }
-    } catch(error) {
-
-      logLivestreamIterationError({ consumer: "Live streaming", error, log: this.log });
-
-      // The iterator terminated out-of-band (the subscription is disposed, no more segments will arrive). Ending FFmpeg's stdin lets the process wrap up cleanly
-      // on its own schedule rather than waiting for its internal stall timeout to fire. There is no consumer-side reboot here - the live and HKSV-timeshift
-      // consumers share one pooled session and the timeshift owns the single reboot anchor; logLivestreamIterationError already warns on the recovery give-up.
-      ffmpegStream.stdin.end();
-    }
+    await consumeLiveStreamSegments(getFfmpeg, feedState, subscription, getSegmentWriter, tsBuffer, this.log, onMediaSegment);
   }
 
-  // Launch the Protect video (and audio) stream.
-  private async startStream(request: StartStreamRequest, callback: StreamRequestCallback): Promise<void> {
-
-    const sessionInfo = this.pendingSessions.get(request.sessionID);
-
-    if(!sessionInfo) {
-
-      callback(new Error("Unable to find the pending session."));
-
-      return;
-    }
-
-    const sdpIpVersion = sessionInfo.addressVersion === "ipv6" ? "IP6" : "IP4";
-
-    // If we aren't connected, we're done.
-    if(!this.protectCamera.isReachable) {
-
-      const errorMessage = "Unable to start video stream: the camera is offline or unavailable.";
-
-      this.log.error(errorMessage);
-      callback(new Error(this.protectCamera.accessoryName + ": " + errorMessage));
-      this.disposePreparedSession(request.sessionID, sessionInfo);
-
-      return;
-    }
-
-    // We transcode based in the following circumstances:
-    //
-    //   1. The user has explicitly configured transcoding.
-    //   2. The user has configured cropping for the video stream.
-    //   3. We are on a high latency streaming session (e.g. cellular). If we're high latency, we'll transcode by default unless the user has asked us not to. Why? It
-    //      generally results in a speedier experience, at the expense of some stream quality (HomeKit tends to request far lower bitrates than Protect is capable of
-    //      producing).
-    //   4. The codec in use on the Protect camera isn't H.264.
-    //
-    // How do we determine if we're a high latency connection? We look at the RTP packet time of the audio packet time for a hint. HomeKit uses values of 20, 30, 40,
-    // and 60ms. We make an assumption, validated by lots of real-world testing, that when we see 60ms used by HomeKit, it's a high latency connection and act
-    // accordingly.
-    const isHighLatency = request.audio.packet_time >= 60;
-    const isTranscoding = this.protectCamera.hints.transcode || this.protectCamera.hints.crop || (isHighLatency && this.protectCamera.hints.transcodeHighLatency) ||
-      (this.protectCamera.ufp.videoCodec !== "h264");
-
-    // Set the initial bitrate we should use for this request based on what HomeKit is requesting.
-    let targetBitrate = request.video.max_bit_rate;
-
-    // Resolve which transport this live view draws from: the standing timeshift buffer's pooled socket, or a direct RTSP session. The decision is a pure policy over the
-    // camera's current facts (the buffer-backed-livestreaming toggle, the recording demand, the buffer's liveness, the package preference, the AV1 constraint, and the
-    // internal A/B test). The A/B test flip is captured and the toggle advanced here so the policy itself stays pure.
-    const abTestFlip = this.abTest && this.protectCamera.hasFeature("Debug.Video.Stream.ABTest");
-
-    this.abTest = !this.abTest;
-
-    const decision = resolveSessionSource({
-
-      abTestFlip: abTestFlip,
-      bufferStarted: this.timeshift?.buffer.isStarted ?? false,
-      hasRecordingDemand: this.hksv?.isRecording ?? false,
-      isPackageCamera: isPackageCameraContext(this.protectCamera.accessory.context),
-      usesTimeshiftLivestream: this.protectCamera.usesTimeshiftLivestream,
-      videoCodec: this.protectCamera.ufp.videoCodec
-    });
-
-    // A momentarily-down buffer that should be running gets a fire-and-forget wake, so it re-establishes behind whatever transport serves this request.
-    if(decision.kick) {
-
-      void this.timeshift?.reconcile();
-    }
-
-    // useTsb is captured as the streaming subclass's per-session suppressLivestreamApiErrors flag and drives the pooled-input pipeline below; both buffer-backed sources
-    // set it. The channel profile is seeded per source in one place: the running buffer's channel for "buffer", the substrate policy's channel for the transient
-    // "bufferDegraded" API session (so no direct-RTSP option leaks into it and the socket lands on the key the buffer revives onto), and left null for the direct-RTSP
-    // selection below otherwise.
-    let useTsb: boolean;
-    let channelProfile: Nullable<ChannelProfile>;
-
-    switch(decision.source) {
-
-      case "buffer": {
-
-        useTsb = true;
-        channelProfile = this.timeshift?.buffer.channelProfile ?? null;
-
-        break;
-      }
-
-      case "bufferDegraded": {
-
-        useTsb = true;
-        channelProfile = this.timeshift?.buffer.channelProfile ?? this.protectCamera.selectSubstrateChannel();
-
-        break;
-      }
-
-      case "rtsp": {
-
-        useTsb = false;
-        channelProfile = null;
-
-        break;
-      }
-
-      default: {
-
-        // "unavailable": an AV1 camera with no buffer path. FFmpeg cannot stream AV1 over RTSP, so there is no viable source. The remedy differs by capability - a camera
-        // that could use the buffer is told to re-enable buffer-backed livestreaming, while a camera that cannot use it at all has no remedy to offer.
-        const capable = !this.protectCamera.ufp.isThirdPartyCamera || this.protectCamera.ufp.isPairedWithAiPort;
-        const errorMessage = capable ?
-          "Unable to start video stream: FFmpeg does not currently support AV1-encoded RTSP streams. Enable the Video.Timeshift.Livestream feature option (enabled by " +
-            "default) to view this camera." :
-          "Unable to start video stream: FFmpeg does not currently support AV1-encoded RTSP streams, and this camera cannot use the timeshift buffer.";
-
-        this.log.error(errorMessage);
-        callback(new Error(this.protectCamera.accessoryName + ": " + errorMessage));
-        this.disposePreparedSession(request.sessionID, sessionInfo);
-
-        return;
-      }
-    }
-
-    // Find the best RTSP stream based on what we're looking for.
-    if(isTranscoding) {
-
-      // When the live encode runs on the host's hardware encoder we bias toward the highest-quality source the pipeline can ingest, because fixed-function encoders
-      // perform better with higher-bitrate sources; a software encode is fed a source matched to the requested resolution instead, so the CPU cost tracks what HomeKit
-      // actually asked for.
-      const usesHardwareEncoder = this.ffmpegOptions.hardwareEncodes("stream");
-
-      channelProfile ??= this.protectCamera.selectChannel(
-        usesHardwareEncoder ? 3840 : request.video.width,
-        usesHardwareEncoder ? 2160 : request.video.height,
-        { biasHigher: true, maxPixels: this.ffmpegOptions.maxSourcePixels("stream") }
-      );
-
-      // If we have specified the bitrates we want to use when transcoding, let's honor those here.
-      if(isHighLatency && (this.protectCamera.hints.transcodeHighLatencyBitrate > 0)) {
-
-        targetBitrate = this.protectCamera.hints.transcodeHighLatencyBitrate;
-      } else if(!isHighLatency && (this.protectCamera.hints.transcodeBitrate > 0)) {
-
-        targetBitrate = this.protectCamera.hints.transcodeBitrate;
-      }
-
-      // If we're targeting a bitrate that's beyond the capabilities of our input channel, match the bitrate of the input channel.
-      if(channelProfile && (targetBitrate > (channelProfile.channel.bitrate / 1000))) {
-
-        targetBitrate = channelProfile.channel.bitrate / 1000;
-      }
-    } else {
-
-      channelProfile ??= this.protectCamera.selectChannel(request.video.width, request.video.height);
-    }
-
-    if(!channelProfile) {
-
-      const errorMessage = "Unable to start video stream: no valid RTSP stream profile was found.";
-
-      this.log.error("%s %sx%s, %s fps, %s kbps.", errorMessage,
-        request.video.width, request.video.height, request.video.fps, request.video.max_bit_rate.toLocaleString("en-US"));
-
-      callback(new Error(this.protectCamera.accessoryName + ": " + errorMessage));
-      this.disposePreparedSession(request.sessionID, sessionInfo);
-
-      return;
-    }
-
-    // If we are streaming the package camera, and it's dark outside, activate the flashlight on the camera. We record the lit service on the session itself so the single
-    // prepared-session disposal path can turn it back off on any failed start, and stopStream can turn it off on a normal stop - the session field is the one record of
-    // the toggle.
-    if(isPackageCameraContext(this.protectCamera.accessory.context)) {
-
-      const flashlightService = this.protectCamera.accessory.getServiceById(this.hap.Service.Lightbulb, ProtectReservedNames.LIGHTBULB_PACKAGE_FLASHLIGHT);
-
-      // If we're already on, we assume the user's activated it and we'll leave it untouched. Otherwise, we'll toggle it on and off when we begin and end streaming.
-      if(this.protectCamera.ufp.isDark && flashlightService && !flashlightService.getCharacteristic(this.hap.Characteristic.On).value) {
-
-        // We explicitly want to call the set handler for the flashlight.
-        flashlightService.setCharacteristic(this.hap.Characteristic.On, true);
-        sessionInfo.toggleLight = flashlightService;
-      }
-    }
-
-    // If we have the timeshift buffer enabled, and we've selected the same quality for the livestream as our timeshift buffer, we use the timeshift buffer to
-    // significantly accelerate our livestream startup. Using the timeshift buffer provides advantages:
-    //
-    // - Since we typically have several seconds of video already queued up in the timeshift buffer, FFmpeg will get a significant speed up in startup performance.
-    //   FFmpeg takes time at the beginning of each session to analyze the input before allowing you to perform any action. By using the timeshift buffer, we're able to
-    //   give FFmpeg all that data right at the beginning, effectively reducing that startup time to the point of being imperceptible.
-    //
-    // - Since we are using an already existing connection to the Protect controller, we don't need to create another connection which incurs an additional delay, as well
-    //   as a resource hit on the Protect controller.
-    const tsBuffer: Nullable<Buffer> = useTsb ? (this.timeshift?.buffer.getLast(PROTECT_LIVESTREAM_API_IDR_INTERVAL * 1000) ?? null) : null;
+  // FFmpeg argv through -map (before video encode / copy, metadata, and tee sinks).
+  private buildLiveFfmpegArgsThroughVideoMap(channelProfile: ChannelProfile, request: StartStreamRequest, sessionInfo: SessionInfo, useTsb: boolean): string[] {
 
     // -hide_banner                     Suppress printing the startup banner in FFmpeg.
     // -nostats                         Suppress printing progress reports while encoding in FFmpeg.
@@ -880,123 +650,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       );
     }
 
-    // Inform the user.
-    const hinting = [];
-
-    // Lightning bolt, using the default emoji presentation. We use this to indicate hardware acceleration.
-    hinting.push(...(isTranscoding && this.ffmpegOptions.hardwareEncodes("stream") ? ["\u{26A1}\u{FE0F}"] : []));
-
-    // Gear, using the text presentation modifier. We use this to indicate that we're transcoding.
-    hinting.push(...(isTranscoding ? ["\u{26ED}\u{FE0E}"] : []));
-
-    // Hourglass, using the text presentation modifier. We use this to indicate high latency connections.
-    hinting.push(...((request.audio.packet_time === 60) ? ["\u{29D6}\u{FE0E}"] : []));
-
-    // Speaker, using the text presentation modifier. We use this to indicate that we're applying audio filters for noise reduction.
-    hinting.push(...(sessionInfo.hasAudioSupport && (this.protectCamera.hasFeature("Audio.Filter.Noise")) ? ["\u{1F50A}\u{FE0E}"] : []));
-
-    hinting.push(...(hinting.length ? [""] : []));
-
-    const streamPathLabel = formatLiveViewPathLabel(useTsb, this.protectCamera.hasFeature("Debug.Video.Timeshift.UseRtsp"));
-    const verboseTelemetry = this.protectCamera.hasFeature("Debug.Video.HKSV.Telemetry");
-
-    this.log.info("%sStreaming request: %sx%s@%sfps, %s. Using %s [%s], %s [%s].", hinting.join(" "), request.video.width, request.video.height, request.video.fps,
-      formatBps(targetBitrate * 1000), channelProfile.name, this.protectCamera.videoCodecName,
-      formatBps(channelProfile.channel.bitrate), streamPathLabel);
-
-    const sessionStartedAt = Date.now();
-    const outputWatchdog = new StreamOutputWatchdog((): void => {
-
-      this.log.warn(formatNoOutputWarning(this.protectCamera.accessoryName, request.sessionID, streamPathLabel));
-    }, STREAM_NO_OUTPUT_WARNING_MS);
-
-    // Arm only on the pooled livestream (stdin) path. Direct RTSP already has the returnPort inbound-silence watchdog (~5s force-stop) from homebridge-plugin-utils;
-    // a second timer tied to FFmpeg stderr would clear too early and duplicate operator signals.
-    if(useTsb) {
-
-      outputWatchdog.arm();
-    }
-
-    const sessionDiagnostics: StreamSessionDiagnostics = {
-
-      firstFrameMs: undefined,
-      hardwareTranscode: isTranscoding && this.ffmpegOptions.hardwareEncodes("stream"),
-      outputWatchdog: outputWatchdog,
-      path: streamPathLabel,
-      profile: channelProfile.name,
-      segmentsFed: 0,
-      sessionStartedAt: sessionStartedAt,
-      stopLogged: false,
-      transcode: isTranscoding
-    };
-
-    if(verboseTelemetry) {
-
-      this.log.info(formatStreamSessionStart({
-
-        camera: this.protectCamera.accessoryName,
-        clientAddress: sessionInfo.address,
-        dst: sessionInfo.address + ":" + sessionInfo.videoPort.toString(),
-        hardwareTranscode: sessionDiagnostics.hardwareTranscode,
-        path: streamPathLabel,
-        profile: channelProfile.name,
-        sessionId: request.sessionID,
-        transcode: isTranscoding,
-        verboseTelemetry: verboseTelemetry
-      }));
-    }
-
-    this.sessionDiagnosticsById.set(request.sessionID, sessionDiagnostics);
-
-    // When on high-performance hardware like Apple Silicon, using the TSB, and we don't have low-FPS cameras like the package camera, enable the use of the
-    // CPU-intensive FFmpeg minterpolate filter to enable very smooth video, especially when there's motion involved. M3+ Apple Silicon environments are able to reliably
-    // use this filter in realtime and with great results. I'm hoping to be able to enable this in the future for other platforms.
-    const useInterpolationFilter = useTsb && !isPackageCameraContext(this.protectCamera.accessory.context) &&
-      ((this.platform.codecSupport.hostSystem === "macOS.Apple") && (this.platform.codecSupport.cpuGeneration >= 3));
-
-    // Check to see if we're transcoding. If we are, set the right FFmpeg encoder options. If not, copy the video stream.
-    if(isTranscoding) {
-
-      // Configure our video parameters for transcoding.
-      ffmpegArgs.push(...this.ffmpegOptions.streamEncoder({
-
-        bitrate: targetBitrate,
-        fps: useInterpolationFilter ? channelProfile.channel.fps : request.video.fps,
-        height: request.video.height,
-        idrInterval: HOMEKIT_IDR_INTERVAL,
-        inputFps: channelProfile.channel.fps,
-        level: request.video.level,
-        profile: request.video.profile,
-        // When interpolating, hand the encoder the fps and interpolation filters to smooth the presentation timestamps; it composes them into its own chain and bridges
-        // any GPU-to-CPU download transfer itself.
-        ...(useInterpolationFilter ? { videoFilters: [ "fps=" + request.video.fps.toString(),
-          "minterpolate=fps=" + request.video.fps.toString() + ":mi_mode=mci:mc_mode=aobmc:me=fss:me_mode=bidir:vsbmc=1:scd=none" ] } : {}),
-        width: request.video.width
-      }));
-    } else {
-
-      // Configure our video parameters for just copying the input stream from Protect - it tends to be quite solid in most cases:
-      //
-      // -codec:v copy                  Copy the stream without reencoding it.
-      ffmpegArgs.push(
-
-        "-codec:v", "copy"
-      );
-
-      // The livestream API needs to be transmuxed before we use it directly.
-      if(useTsb) {
-
-        // -bsf:v h264_mp4toannexb    Convert the livestream container format from MP4 to MPEG-TS.
-        ffmpegArgs.push("-bsf:v", "h264_mp4toannexb");
-      }
-    }
-
-    // -metadata                        Set the metadata to the name of the camera to distinguish between FFmpeg sessions.
-    ffmpegArgs.push(
-
-      "-metadata", "comment=" + this.protectCamera.accessoryName + " Livestream"
-    );
-
     // Configure the audio portion of the command line, if we have a version of FFmpeg that supports the audio codecs we need. Options we use are:
     //
     // -codec:a                         Encode using the codecs available to us on given platforms.
@@ -1031,6 +684,23 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         ffmpegArgs.push("-filter:a", afOptions.join(", "));
       }
     }
+
+    return ffmpegArgs;
+  }
+
+  // Complete the live FFmpeg argv with sinks, spawn the process, and register the per-instance abort bridge.
+  private spawnLiveVideoFfmpeg(ffmpegArgsThroughVideoMap: string[], encodeDecision: LiveVideoEncodeDecision, channelProfile: ChannelProfile, request: StartStreamRequest,
+    sessionInfo: SessionInfo, targetBitrate: number, useInterpolationFilter: boolean, useTsb: boolean, ffmpegAbort: AbortController): ProtectStreamingFfmpegProcess {
+
+    const ffmpegArgs = [...ffmpegArgsThroughVideoMap];
+
+    appendLiveVideoEncodeToFfmpegArgs(this.ffmpegOptions, ffmpegArgs, encodeDecision, channelProfile, request, targetBitrate, useInterpolationFilter, useTsb);
+
+    // -metadata                        Set the metadata to the name of the camera to distinguish between FFmpeg sessions.
+    ffmpegArgs.push(
+
+      "-metadata", "comment=" + this.protectCamera.accessoryName + " Livestream"
+    );
 
     // Send the stream to HomeKit through a single tee-muxed output rather than two top-level outputs. The distinction is load-bearing: a top-level output that ends up
     // with no streams is a fatal error for the entire command, while a tee sink is isolable...this is the shape that lets a session survive its optional audio map
@@ -1070,7 +740,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       videoSink + audioSink
     );
 
-    // Additional logging, but only if we're debugging.
     if(this.platform.verboseFfmpeg || this.verboseFfmpeg || this.protectCamera.hasFeature("Debug.Video.FFmpeg")) {
 
       ffmpegArgs.push("-loglevel", "level+verbose");
@@ -1085,37 +754,482 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     // session demuxes its packet flow externally, so arming the internal 5-second inbound-silence watchdog there would risk a false force-stop on every two-way live
     // view. The homebridge-plugin-utils process spawns the child synchronously on construction. The subclass implements failed-teardown logging (benign-API
     // suppression gated on useTsb, plus probesize self-tuning) through the logFailedTeardown hook.
-    const ffmpegStream = new ProtectStreamingFfmpegProcess(this.ffmpegOptions, {
+    return spawnLiveVideoFfmpegProcess(this.ffmpegOptions, {
 
       args: ffmpegArgs,
       onProbesizeError: (): void => this.adjustProbeSize(),
       returnPort: (sessionInfo.hasAudioSupport && this.protectCamera.hints.twoWayAudio) ? undefined :
         { ipFamily: sessionInfo.addressVersion, port: sessionInfo.videoReturnPort },
-      signal: sessionInfo.abortController.signal,
+      signal: ffmpegAbort.signal,
       suppressLivestreamApiErrors: useTsb
     });
+  }
+
+  // Replace a failed H.264 copy FFmpeg with a transcode instance without tearing down the HomeKit session.
+  private async escalateCopyFailureToTranscode(sessionId: string, owner: StreamSessionDiagnostics, prior: ProtectStreamingFfmpegProcess, transcodeReason: string,
+    onRespawned: (process: ProtectStreamingFfmpegProcess) => void, tsbResume?: CopyEscalationTsbResume): Promise<ProtectStreamingFfmpegProcess | null> {
+
+    const respawned = await replaceFailedCopyWithTranscode({
+
+      hardwareTranscodes: this.ffmpegOptions.hardwareEncodes("stream"),
+      log: this.log,
+      onRespawned: (process) => onRespawned(process as ProtectStreamingFfmpegProcess),
+      ongoingSessions: this.ongoingSessions,
+      owner: owner,
+      pendingSessions: this.pendingSessions,
+      prior: prior,
+      sessionDiagnosticsById: this.sessionDiagnosticsById,
+      sessionId: sessionId,
+      spawnLiveVideo: (ctx, ffmpegAbort) => {
+
+        const rebuild = owner.liveEncodeRebuild;
+
+        if(!rebuild) {
+
+          throw new Error("Missing live encode rebuild state.");
+        }
+
+        const encodeDecision: LiveVideoEncodeDecision = { logReason: ctx.transcodeReason, mode: "transcode" };
+
+        return this.spawnLiveVideoFfmpeg(ctx.ffmpegArgsThroughVideoMap, encodeDecision, ctx.channelProfile, rebuild.request,
+          rebuild.sessionInfo as SessionInfo, ctx.targetBitrate, ctx.useInterpolationFilter, ctx.useTsb, ffmpegAbort);
+      },
+      transcodeReason: transcodeReason,
+      transcodeTargetBitrate: owner.liveEncodeRebuild?.transcodeTargetBitrate ?? 0,
+      tsbResume: tsbResume,
+      updateRtspRebuild: (rebuild) => {
+
+        const fullRebuild = owner.liveEncodeRebuild;
+
+        if(!fullRebuild) {
+
+          return null;
+        }
+
+        const usesHardwareEncoder = this.ffmpegOptions.hardwareEncodes("stream");
+
+        const cappedSource = this.protectCamera.selectChannel(
+          usesHardwareEncoder ? 3840 : rebuild.request.video.width,
+          usesHardwareEncoder ? 2160 : rebuild.request.video.height,
+          { biasHigher: true, maxPixels: this.ffmpegOptions.maxSourcePixels("stream") }
+        );
+
+        if(!cappedSource) {
+
+          return null;
+        }
+
+        const channelProfile = cappedSource;
+        const transcodeTargetBitrate = resolveLiveTranscodeBitrate({
+
+          homeKitBitrateKbps: rebuild.request.video.max_bit_rate,
+          isHighLatency: rebuild.isHighLatency,
+          sourceBitrateKbps: channelProfile.channel.bitrate / 1000,
+          transcodeBitrateHint: this.protectCamera.hints.transcodeBitrate,
+          transcodeHighLatencyBitrateHint: this.protectCamera.hints.transcodeHighLatencyBitrate
+        });
+        const ffmpegArgsThroughVideoMap = this.buildLiveFfmpegArgsThroughVideoMap(channelProfile, fullRebuild.request, fullRebuild.sessionInfo as SessionInfo, false);
+
+        return { channelProfile: channelProfile, ffmpegArgsThroughVideoMap: ffmpegArgsThroughVideoMap, transcodeTargetBitrate: transcodeTargetBitrate };
+      }
+    });
+
+    return respawned as ProtectStreamingFfmpegProcess | null;
+  }
+
+  // Launch the Protect video (and audio) stream.
+  private async startStream(request: StartStreamRequest, callback: StreamRequestCallback): Promise<void> {
+
+    const sessionInfo = this.pendingSessions.get(request.sessionID);
+
+    if(!sessionInfo) {
+
+      callback(new Error("Unable to find the pending session."));
+
+      return;
+    }
+
+    const sdpIpVersion = sessionInfo.addressVersion === "ipv6" ? "IP6" : "IP4";
+
+    // If we aren't connected, we're done.
+    if(!this.protectCamera.isReachable) {
+
+      const errorMessage = "Unable to start video stream: the camera is offline or unavailable.";
+
+      this.log.error(errorMessage);
+      callback(new Error(this.protectCamera.accessoryName + ": " + errorMessage));
+      this.disposePreparedSession(request.sessionID, sessionInfo);
+
+      return;
+    }
+
+    // We transcode based in the following circumstances:
+    //
+    //   1. The user has explicitly configured transcoding.
+    //   2. The user has configured cropping for the video stream.
+    //   3. We are on a high latency streaming session (e.g. cellular). If we're high latency, we'll transcode by default unless the user has asked us not to. Why? It
+    //      generally results in a speedier experience, at the expense of some stream quality (HomeKit tends to request far lower bitrates than Protect is capable of
+    //      producing).
+    //   4. The codec in use on the Protect camera isn't H.264.
+    //
+    // How do we determine if we're a high latency connection? We look at the RTP packet time of the audio packet time for a hint. HomeKit uses values of 20, 30, 40,
+    // and 60ms. We make an assumption, validated by lots of real-world testing, that when we see 60ms used by HomeKit, it's a high latency connection and act
+    // accordingly.
+    const isHighLatency = request.audio.packet_time >= 60;
+
+    // Copy vs transcode is decided in resolveStartStreamEncodePlan / decideLiveVideoEncode (user options, crop, codec, RTSP, avcC prefix, geometry).
+    const forceTranscodeDueToUserOption = resolveStartStreamForceTranscodeDueToUserOption(this.protectCamera, isHighLatency);
+    const forceTranscodePipeline = this.protectCamera.hints.crop || (this.protectCamera.ufp.videoCodec !== "h264") || forceTranscodeDueToUserOption;
+    const preferCopyChannel = !forceTranscodePipeline;
+
+    // Set the initial bitrate we should use for this request based on what HomeKit is requesting.
+    let targetBitrate = request.video.max_bit_rate;
+
+    // Resolve which transport this live view draws from: the standing timeshift buffer's pooled socket, or a direct RTSP session. The decision is a pure policy over the
+    // camera's current facts (the buffer-backed-livestreaming toggle, the recording demand, the buffer's liveness, the package preference, the AV1 constraint, and the
+    // internal A/B test). The A/B test flip is captured and the toggle advanced here so the policy itself stays pure.
+    const abTestFlip = this.abTest && this.protectCamera.hasFeature("Debug.Video.Stream.ABTest");
+
+    this.abTest = !this.abTest;
+
+    const decision = resolveSessionSource({
+
+      abTestFlip: abTestFlip,
+      bufferStarted: this.timeshift?.buffer.isStarted ?? false,
+      hasRecordingDemand: this.hksv?.isRecording ?? false,
+      isPackageCamera: isPackageCameraContext(this.protectCamera.accessory.context),
+      usesTimeshiftLivestream: this.protectCamera.usesTimeshiftLivestream,
+      videoCodec: this.protectCamera.ufp.videoCodec
+    });
+
+    // A momentarily-down buffer that should be running gets a fire-and-forget wake, so it re-establishes behind whatever transport serves this request.
+    if(decision.kick) {
+
+      void this.timeshift?.reconcile();
+    }
+
+    // useTsb is captured as the streaming subclass's per-session suppressLivestreamApiErrors flag and drives the pooled-input pipeline below; both buffer-backed sources
+    // set it. The channel profile is seeded per source in one place: the running buffer's channel for "buffer", the substrate policy's channel for the transient
+    // "bufferDegraded" API session (so no direct-RTSP option leaks into it and the socket lands on the key the buffer revives onto), and left null for the direct-RTSP
+    // selection below otherwise.
+    let useTsb: boolean;
+    let channelProfile: Nullable<ChannelProfile>;
+    let subscriptionChannelProfile: Nullable<ChannelProfile> = null;
+    let bufferForcedTranscodeReason: string | null = null;
+
+    switch(decision.source) {
+
+      case "buffer": {
+
+        useTsb = true;
+        const bufferProfile = this.timeshift?.buffer.channelProfile ?? null;
+
+        if(bufferProfile) {
+
+          const resolved = resolveTimeshiftBufferLiveChannel(bufferProfile, this.protectCamera);
+
+          subscriptionChannelProfile = resolved.subscriptionProfile;
+          channelProfile = resolved.encodeProfile;
+          bufferForcedTranscodeReason = resolved.forcedTranscodeReason;
+        } else {
+
+          channelProfile = null;
+        }
+
+        break;
+      }
+
+      case "bufferDegraded": {
+
+        useTsb = true;
+        const bufferProfile = this.timeshift?.buffer.channelProfile ?? this.protectCamera.selectSubstrateChannel();
+
+        if(bufferProfile) {
+
+          const resolved = resolveTimeshiftBufferLiveChannel(bufferProfile, this.protectCamera);
+
+          subscriptionChannelProfile = resolved.subscriptionProfile;
+          channelProfile = resolved.encodeProfile;
+          bufferForcedTranscodeReason = resolved.forcedTranscodeReason;
+        } else {
+
+          channelProfile = null;
+        }
+
+        break;
+      }
+
+      case "rtsp": {
+
+        useTsb = false;
+        channelProfile = null;
+
+        break;
+      }
+
+      default: {
+
+        // "unavailable": an AV1 camera with no buffer path. FFmpeg cannot stream AV1 over RTSP, so there is no viable source. The remedy differs by capability - a camera
+        // that could use the buffer is told to re-enable buffer-backed livestreaming, while a camera that cannot use it at all has no remedy to offer.
+        const capable = !this.protectCamera.ufp.isThirdPartyCamera || this.protectCamera.ufp.isPairedWithAiPort;
+        const errorMessage = capable ?
+          "Unable to start video stream: FFmpeg does not currently support AV1-encoded RTSP streams. Enable the Video.Timeshift.Livestream feature option (enabled by " +
+            "default) to view this camera." :
+          "Unable to start video stream: FFmpeg does not currently support AV1-encoded RTSP streams, and this camera cannot use the timeshift buffer.";
+
+        this.log.error(errorMessage);
+        callback(new Error(this.protectCamera.accessoryName + ": " + errorMessage));
+        this.disposePreparedSession(request.sessionID, sessionInfo);
+
+        return;
+      }
+    }
+
+    const timeshiftPrefixBuffer = useTsb ? (this.timeshift?.buffer.getLast(PROTECT_LIVESTREAM_API_IDR_INTERVAL * 1000) ?? null) : null;
+    const standingTimeshiftPrefix = useTsb && Boolean(timeshiftPrefixBuffer);
+
+    // Find the best RTSP stream based on what we're looking for. TSB-backed sessions keep the buffer's channel for the livestream subscription and prefix; never
+    // substitute selectChannel while useTsb is true, except bufferDegraded with no standing encode profile and no active timeshift prefix (nothing to mismatch).
+    if(shouldSubstituteSelectChannelForSession(useTsb, decision.source, channelProfile, standingTimeshiftPrefix)) {
+
+      // Copy-first sessions bias toward the HomeKit request; bufferDegraded always transcodes and keeps upstream's transcode-biased, pixel-capped channel selection.
+      if(preferCopyChannel) {
+
+        channelProfile ??= this.protectCamera.selectChannel(request.video.width, request.video.height);
+      } else {
+
+        // When the live encode runs on the host's hardware encoder we bias toward the highest-quality source the pipeline can ingest, because fixed-function encoders
+        // perform better with higher-bitrate sources; a software encode is fed a source matched to the requested resolution instead, so the CPU cost tracks what HomeKit
+        // actually asked for.
+        const usesHardwareEncoder = this.ffmpegOptions.hardwareEncodes("stream");
+
+        const transcodeChannel = channelProfile ??= this.protectCamera.selectChannel(
+          usesHardwareEncoder ? 3840 : request.video.width,
+          usesHardwareEncoder ? 2160 : request.video.height,
+          { biasHigher: true, maxPixels: this.ffmpegOptions.maxSourcePixels("stream") }
+        );
+
+        if(transcodeChannel) {
+
+          // If we have specified the bitrates we want to use when transcoding, let's honor those here.
+          // If we're targeting a bitrate that's beyond the capabilities of our input channel, match the bitrate of the input channel.
+          targetBitrate = resolveLiveTranscodeBitrate({
+
+            homeKitBitrateKbps: request.video.max_bit_rate,
+            isHighLatency: isHighLatency,
+            sourceBitrateKbps: transcodeChannel.channel.bitrate / 1000,
+            transcodeBitrateHint: this.protectCamera.hints.transcodeBitrate,
+            transcodeHighLatencyBitrateHint: this.protectCamera.hints.transcodeHighLatencyBitrate
+          });
+        }
+      }
+    }
+
+    if(!channelProfile) {
+
+      const errorMessage = "Unable to start video stream: no valid RTSP stream profile was found.";
+
+      this.log.error("%s %sx%s, %s fps, %s kbps.", errorMessage,
+        request.video.width, request.video.height, request.video.fps, request.video.max_bit_rate.toLocaleString("en-US"));
+
+      callback(new Error(this.protectCamera.accessoryName + ": " + errorMessage));
+      this.disposePreparedSession(request.sessionID, sessionInfo);
+
+      return;
+    }
+
+    const sessionSource = decision.source as LiveStreamSessionSource;
+
+    const tsBuffer = timeshiftPrefixBuffer;
+    const fmp4InitForDeclared = resolveFmp4InitForLiveDeclaredCheck({ sessionSource: sessionSource, timeshiftPrefixBuffer: tsBuffer });
+
+    const encodePlan = resolveStartStreamEncodePlan({ bufferForcedTranscodeReason: bufferForcedTranscodeReason, channelProfile: channelProfile,
+      ffmpegOptions: this.ffmpegOptions, fmp4InitSegmentData: fmp4InitForDeclared, forceTranscodeDueToUserOption: forceTranscodeDueToUserOption,
+      homeKitBitrateKbps: targetBitrate, isHighLatency: isHighLatency, preferCopyChannel: preferCopyChannel, protectCamera: this.protectCamera, request: request,
+      sessionSource: sessionSource, useTsb: useTsb });
+
+    if(encodePlan.transcodeReselectMissing) {
+
+      const errorMessage = "Unable to start video stream: no valid RTSP stream profile was found for transcoding.";
+
+      this.log.error(errorMessage);
+      callback(new Error(this.protectCamera.accessoryName + ": " + errorMessage));
+      this.disposePreparedSession(request.sessionID, sessionInfo);
+
+      return;
+    }
+
+    channelProfile = encodePlan.channelProfile;
+
+    const { encodeDecision, declaredForLog, isTranscoding, transcodeTargetBitrate } = encodePlan;
+
+    this.log.info("%s", formatLiveEncodeDecisionLog(encodeDecision, declaredForLog));
+
+    if(isTranscoding && encodeDecision.logReason) {
+
+      this.log.info("Transcoding live video: %s.", encodeDecision.logReason);
+    } else if(!isTranscoding) {
+
+      this.log.info("Streaming live video with H.264 copy (no transcode).");
+    }
+
+    // If we are streaming the package camera, and it's dark outside, activate the flashlight on the camera. We record the lit service on the session itself so the single
+    // prepared-session disposal path can turn it back off on any failed start, and stopStream can turn it off on a normal stop - the session field is the one record of
+    // the toggle.
+    if(isPackageCameraContext(this.protectCamera.accessory.context)) {
+
+      const flashlightService = this.protectCamera.accessory.getServiceById(this.hap.Service.Lightbulb, ProtectReservedNames.LIGHTBULB_PACKAGE_FLASHLIGHT);
+
+      // If we're already on, we assume the user's activated it and we'll leave it untouched. Otherwise, we'll toggle it on and off when we begin and end streaming.
+      if(this.protectCamera.ufp.isDark && flashlightService && !flashlightService.getCharacteristic(this.hap.Characteristic.On).value) {
+
+        // We explicitly want to call the set handler for the flashlight.
+        flashlightService.setCharacteristic(this.hap.Characteristic.On, true);
+        sessionInfo.toggleLight = flashlightService;
+      }
+    }
+
+    // If we have the timeshift buffer enabled, and we've selected the same quality for the livestream as our timeshift buffer, we use the timeshift buffer to
+    // significantly accelerate our livestream startup. Using the timeshift buffer provides advantages:
+    //
+    // - Since we typically have several seconds of video already queued up in the timeshift buffer, FFmpeg will get a significant speed up in startup performance.
+    //   FFmpeg takes time at the beginning of each session to analyze the input before allowing you to perform any action. By using the timeshift buffer, we're able to
+    //   give FFmpeg all that data right at the beginning, effectively reducing that startup time to the point of being imperceptible.
+    //
+    // - Since we are using an already existing connection to the Protect controller, we don't need to create another connection which incurs an additional delay, as well
+    //   as a resource hit on the Protect controller.
+    const ffmpegArgs = this.buildLiveFfmpegArgsThroughVideoMap(channelProfile, request, sessionInfo, useTsb);
+
+    // Inform the user.
+    const hinting = [];
+
+    // Lightning bolt, using the default emoji presentation. We use this to indicate hardware acceleration.
+    hinting.push(...(isTranscoding && this.ffmpegOptions.hardwareEncodes("stream") ? ["\u{26A1}\u{FE0F}"] : []));
+
+    // Gear, using the text presentation modifier. We use this to indicate that we're transcoding.
+    hinting.push(...(isTranscoding ? ["\u{26ED}\u{FE0E}"] : []));
+
+    // Hourglass, using the text presentation modifier. We use this to indicate high latency connections.
+    hinting.push(...((request.audio.packet_time === 60) ? ["\u{29D6}\u{FE0E}"] : []));
+
+    // Speaker, using the text presentation modifier. We use this to indicate that we're applying audio filters for noise reduction.
+    hinting.push(...(sessionInfo.hasAudioSupport && (this.protectCamera.hasFeature("Audio.Filter.Noise")) ? ["\u{1F50A}\u{FE0E}"] : []));
+
+    hinting.push(...(hinting.length ? [""] : []));
+
+    const streamPathLabel = formatLiveViewPathLabel(useTsb, this.protectCamera.hasFeature("Debug.Video.Timeshift.UseRtsp"));
+    const verboseTelemetry = this.protectCamera.hasFeature("Debug.Video.HKSV.Telemetry");
+
+    const egressBitrateBps = resolveStreamEgressBitrateBps(isTranscoding, transcodeTargetBitrate, channelProfile.channel.bitrate);
+
+    this.log.info("%sStreaming request: %sx%s@%sfps, %s. Using %s [%s], %s [%s].", hinting.join(" "), request.video.width, request.video.height, request.video.fps,
+      formatBps(egressBitrateBps), channelProfile.name, this.protectCamera.videoCodecName,
+      formatBps(channelProfile.channel.bitrate), streamPathLabel);
+
+    const sessionStartedAt = Date.now();
+    const outputWatchdog = new StreamOutputWatchdog((): void => {
+
+      this.log.warn(formatNoOutputWarning(this.protectCamera.accessoryName, request.sessionID, streamPathLabel));
+    }, STREAM_NO_OUTPUT_WARNING_MS);
+
+    // Arm only on the pooled livestream (stdin) path. Direct RTSP already has the returnPort inbound-silence watchdog (~5s force-stop) from homebridge-plugin-utils;
+    // a second timer tied to FFmpeg stderr would clear too early and duplicate operator signals.
+    if(useTsb) {
+
+      outputWatchdog.arm();
+    }
+
+    const sessionDiagnostics: StreamSessionDiagnostics = {
+
+      escalatedFromCopy: false,
+      firstFrameMs: undefined,
+      hardwareTranscode: isTranscoding && this.ffmpegOptions.hardwareEncodes("stream"),
+      outputWatchdog: outputWatchdog,
+      path: streamPathLabel,
+      profile: channelProfile.name,
+      segmentsFed: 0,
+      sessionStartedAt: sessionStartedAt,
+      stopLogged: false,
+      transcode: isTranscoding,
+      videoCopy: !isTranscoding
+    };
+
+    if(verboseTelemetry) {
+
+      this.log.info(formatStreamSessionStart({
+
+        camera: this.protectCamera.accessoryName,
+        clientAddress: sessionInfo.address,
+        dst: sessionInfo.address + ":" + sessionInfo.videoPort.toString(),
+        hardwareTranscode: sessionDiagnostics.hardwareTranscode,
+        path: streamPathLabel,
+        profile: channelProfile.name,
+        sessionId: request.sessionID,
+        transcode: isTranscoding,
+        verboseTelemetry: verboseTelemetry
+      }));
+    }
+
+    this.sessionDiagnosticsById.set(request.sessionID, sessionDiagnostics);
+
+    // When on high-performance hardware like Apple Silicon, using the TSB, and we don't have low-FPS cameras like the package camera, enable the use of the
+    // CPU-intensive FFmpeg minterpolate filter to enable very smooth video, especially when there's motion involved. M3+ Apple Silicon environments are able to reliably
+    // use this filter in realtime and with great results. I'm hoping to be able to enable this in the future for other platforms.
+    const useInterpolationFilter = useTsb && !isPackageCameraContext(this.protectCamera.accessory.context) &&
+      ((this.platform.codecSupport.hostSystem === "macOS.Apple") && (this.platform.codecSupport.cpuGeneration >= 3));
+
+    const ffmpegArgsBeforeVideoEncode = [...ffmpegArgs];
+    const ffmpegAbort = new AbortController();
+
+    sessionInfo.abortController.signal.addEventListener("abort", () => ffmpegAbort.abort(sessionInfo.abortController.signal.reason), { once: true });
+
+    sessionDiagnostics.liveEncodeRebuild = {
+
+      channelProfile: channelProfile,
+      ffmpegArgsThroughVideoMap: ffmpegArgsBeforeVideoEncode,
+      isHighLatency: isHighLatency,
+      request: request,
+      sessionInfo: sessionInfo,
+      transcodeTargetBitrate: transcodeTargetBitrate,
+      useInterpolationFilter: useInterpolationFilter,
+      useTsb: useTsb
+    };
+
+    const encoderBitrate = encodePlan.encoderBitrate;
+
+    let activeFfmpeg = this.spawnLiveVideoFfmpeg(ffmpegArgsBeforeVideoEncode, encodeDecision, channelProfile, request, sessionInfo, encoderBitrate,
+      useInterpolationFilter, useTsb, ffmpegAbort);
 
     // Bridge FFmpeg's ready signal to HomeKit's StreamRequestCallback, exactly once, for all input sources. ready resolves on FFmpeg's first stderr byte regardless
     // of source and rejects on a spawn failure (-> callback(error)). We prefer the underlying cause on the reject path so an ENOENT surfaces usefully rather than the
     // bare abort-reason name. ready settles once, so this calls back exactly once; the whenEstablished await below gates only whether to keep or bail the session,
     // never the callback.
-    void ffmpegStream.ready.then(() => callback(undefined), (reason: unknown) => callback(new Error(this.protectCamera.accessoryName + ": " +
+    void activeFfmpeg.ready.then(() => callback(undefined), (reason: unknown) => callback(new Error(this.protectCamera.accessoryName + ": " +
       (((reason instanceof HbpuAbortError) && (reason.cause instanceof Error)) ? reason.cause.message : String(reason)))));
 
-    let segmentWriter: Nullable<BackpressureWriter> = null;
     let subscription: Nullable<LivestreamSubscription> = null;
+    let tsbWriterRail: ReturnType<typeof createTsbSegmentWriterRail> | null = null;
 
     // Force-stop bridge: when FFmpeg exits, reclaim the subscription and writer, and (when the session is still live and the exit was organic, not a self-initiated
     // shutdown) force HomeKit to reclaim the streaming slot. We observe BOTH settlements of exited - it rejects on the never-spawned/ENOENT path, and a never-spawned
     // FFmpeg still needs its subscription/writer reclaimed - so the same cleanup runs on either branch. The organic discriminator reads signal.reason: stopStream
     // aborts with an explicit HbpuAbortError("shutdown"), so isHbpuAbortReason(reason, "shutdown") suppresses the self-stop double-fire; the entry-existence guard is
     // defense-in-depth. This is the started-then-died force-stop, and the returnPort watchdog timeout flows through the same path.
-    const bridge = (ffmpegExitCode?: number | null): void => {
+    const copyEscalationInFlightRef = { current: false };
+
+    const sessionStillOwned = (): boolean => this.sessionDiagnosticsById.get(request.sessionID) === sessionDiagnostics;
+
+    const endFfmpegBridge = (exitedProcess: ProtectStreamingFfmpegProcess, ffmpegExitCode?: number | null): void => {
+
+      if(!sessionStillOwned()) {
+
+        return;
+      }
 
       void subscription?.[Symbol.asyncDispose]();
-      segmentWriter?.abort();
+      tsbWriterRail?.getSegmentWriter().abort();
 
-      if(!isHbpuAbortReason(ffmpegStream.signal.reason, "shutdown")) {
+      if(!isHbpuAbortReason(exitedProcess.signal.reason, "shutdown")) {
 
         this.logStreamSessionStopForOwner(request.sessionID, sessionDiagnostics, "ffmpeg-exit", ffmpegExitCode);
 
@@ -1127,12 +1241,69 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       }
     };
 
-    void ffmpegStream.exited.then((exitInfo) => bridge(exitInfo.exitCode), () => bridge());
+    const tsbFeedState: LiveTsbFeedState = { allowTimeshiftPrefix: true, headerWritten: false, primeMediaFloor: null };
+
+    const { wireFfmpegExitBridge } = createLiveFfmpegCopyExitBridge({
+
+      copyEscalationInFlightRef: copyEscalationInFlightRef,
+      createTsbResume: () => {
+
+        if(!(useTsb && tsbWriterRail && subscription)) {
+
+          return undefined;
+        }
+
+        this.streamTestOptions?.recordCreateTsbResumeInvocation?.();
+
+        const bufferProfile = this.timeshift?.buffer.channelProfile;
+        // True when live and timeshift share one pooled encoder (false under Debug.Video.Timeshift.UseRtsp split sockets).
+        // Keyframe prime is valid only under the POOL-SHARING invariant below (~1313).
+        const pooledLiveAndBuffer = !this.protectCamera.hasFeature("Debug.Video.Timeshift.UseRtsp");
+        const liveProfile = subscriptionChannelProfile ?? channelProfile;
+        const keyframePrimingBuffer = resolveCopyEscalationKeyframePrimingBuffer(bufferProfile, liveProfile,
+          this.timeshift?.buffer.getInitPlusTrailingFromLastKeyframe() ?? null, pooledLiveAndBuffer);
+
+        return createCopyEscalationTsbResume({
+
+          feedState: tsbFeedState,
+          keyframePrimingBuffer: keyframePrimingBuffer,
+          rail: tsbWriterRail,
+          subscription: subscription
+        });
+      },
+      endFfmpegBridge: endFfmpegBridge,
+      escalateCopyFailure: (exitedProcess, onRespawned, tsbResume) => this.escalateCopyFailureToTranscode(request.sessionID, sessionDiagnostics, exitedProcess,
+        "H.264 copy path failed at runtime", onRespawned, tsbResume),
+      onRespawned: (respawned) => {
+
+        activeFfmpeg = respawned;
+      },
+      sessionDiagnostics: sessionDiagnostics,
+      sessionStartedAt: sessionStartedAt,
+      sessionStillOwned: sessionStillOwned,
+      useTsb: useTsb
+    });
+
+    wireFfmpegExitBridge(activeFfmpeg);
+
+    // Register the video FFmpeg before pooled livestream establishment completes so an eligible copy failure can escalate instead of disposing the subscription.
+    if(shouldRegisterOngoingSessionEntry(this.ongoingSessions.get(request.sessionID), sessionInfo)) {
+
+      this.ongoingSessions.set(request.sessionID, {
+
+        abortController: sessionInfo.abortController,
+        ffmpeg: [activeFfmpeg],
+        rtpDemuxer: sessionInfo.rtpDemuxer,
+        rtpPortReservations: sessionInfo.rtpPortReservations,
+        toggleLight: sessionInfo.toggleLight
+      });
+    }
 
     if(useTsb) {
 
       // Feed segments to FFmpeg with backpressure handling...if FFmpeg can't keep up, segments are queued and written when it's ready.
-      segmentWriter = new BackpressureWriter(() => ffmpegStream.stdin, { signal: sessionInfo.abortController.signal });
+      tsbWriterRail = createTsbSegmentWriterRail({ feedState: tsbFeedState, getStdin: () => activeFfmpeg.stdin,
+        onRotateSegmentWriter: this.streamTestOptions?.onRotateSegmentWriter, signal: sessionInfo.abortController.signal });
 
       // Subscribe to the pooled livestream via the camera seam. This call is synchronous and returns the subscription handle immediately; the underlying connection
       // begins establishing in the background. We start consuming segments below within the same synchronous frame, before any asynchronous segment can be delivered.
@@ -1144,10 +1315,21 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       // share ONE pooled session only because BOTH go through this same seam with the same defaults - the live call OMITS segmentLength, so the seam default
       // (PROTECT_SEGMENT_RESOLUTION = 100) matches the timeshift's explicit 100. If either consumer's opts ever diverge, the session silently splits into two sockets
       // (double controller load, broken self-heal/discontinuity coupling).
-      subscription = this.protectCamera.livestream(channelProfile, { signal: sessionInfo.abortController.signal, urgency: () => PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_MS });
+      const livestreamChannelProfile = subscriptionChannelProfile ?? channelProfile;
+
+      subscription = this.protectCamera.livestream(livestreamChannelProfile, { signal: sessionInfo.abortController.signal,
+        urgency: () => PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_MS });
 
       // Drive the segment iterator in the background.
-      void this.consumeStreamSegments(ffmpegStream, subscription, segmentWriter, tsBuffer, (): void => {
+      void this.consumeStreamSegments(() => activeFfmpeg, tsbFeedState, subscription, (): BackpressureWriter => {
+
+        if(!tsbWriterRail) {
+
+          throw new Error("TSB segment writer is missing.");
+        }
+
+        return tsbWriterRail.getSegmentWriter();
+      }, tsBuffer, (): void => {
 
         this.recordTsbMediaSegmentForOwner(request.sessionID, sessionDiagnostics);
       });
@@ -1162,6 +1344,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         if(establishmentReason) {
 
           this.logStreamSessionStopForOwner(request.sessionID, sessionDiagnostics, establishmentReason);
+          sessionDiagnostics.stopLogged = true;
         }
 
         this.endStreamDiagnosticsIfStillOwned(request.sessionID, sessionDiagnostics);
@@ -1186,16 +1369,28 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     }
 
     // Some housekeeping for our FFmpeg and demuxer sessions.
-    this.ongoingSessions.set(request.sessionID, {
+    // Copy escalation may register ongoingSessions early with the video FFmpeg before TSB establishment completes; refresh ffmpeg[0] or register if still absent.
+    const ongoingEntry = this.ongoingSessions.get(request.sessionID);
 
-      abortController: sessionInfo.abortController,
-      ffmpeg: [ffmpegStream],
-      rtpDemuxer: sessionInfo.rtpDemuxer,
-      rtpPortReservations: sessionInfo.rtpPortReservations,
-      toggleLight: sessionInfo.toggleLight
-    });
+    if(ongoingEntry?.abortController === sessionInfo.abortController) {
 
-    this.pendingSessions.delete(request.sessionID);
+      ongoingEntry.ffmpeg[0] = activeFfmpeg;
+    } else if(shouldRegisterOngoingSessionEntry(ongoingEntry, sessionInfo)) {
+
+      this.ongoingSessions.set(request.sessionID, {
+
+        abortController: sessionInfo.abortController,
+        ffmpeg: [activeFfmpeg],
+        rtpDemuxer: sessionInfo.rtpDemuxer,
+        rtpPortReservations: sessionInfo.rtpPortReservations,
+        toggleLight: sessionInfo.toggleLight
+      });
+    }
+
+    if(shouldRemovePendingSessionEntry(this.pendingSessions.get(request.sessionID), sessionInfo)) {
+
+      this.pendingSessions.delete(request.sessionID);
+    }
 
     // If we aren't doing two-way audio, we're done here. For two-way audio...we have some more plumbing to do.
     if(!sessionInfo.hasAudioSupport || !this.protectCamera.hints.twoWayAudio) {
@@ -1423,7 +1618,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     sessionInfo.abortController.abort(new HbpuAbortError("shutdown"));
 
     // Turn the package-camera flashlight back off if this session lit it. We explicitly want to call the set handler for the flashlight.
-    sessionInfo.toggleLight?.setCharacteristic(this.hap.Characteristic.On, false);
+    if(sessionInfo.toggleLight) {
+
+      sessionInfo.toggleLight.setCharacteristic(this.hap.Characteristic.On, false);
+      sessionInfo.toggleLight = undefined;
+    }
 
     // Release the port reservations. Disposal is a pure in-memory release that resolves on the same microtask (no I/O), so the fire-and-forget keeps this synchronous.
     for(const reservation of sessionInfo.rtpPortReservations) {
@@ -1431,7 +1630,16 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       void reservation[Symbol.asyncDispose]();
     }
 
-    this.pendingSessions.delete(sessionId);
+    if(shouldRemovePendingSessionEntry(this.pendingSessions.get(sessionId), sessionInfo)) {
+
+      this.pendingSessions.delete(sessionId);
+    }
+
+    // Early registration before TSB establishment leaves an ongoing entry without a successful start; drop it only when this SessionInfo still owns the map slot.
+    if(shouldRemoveOngoingSessionEntry(this.ongoingSessions.get(sessionId), sessionInfo)) {
+
+      this.ongoingSessions.delete(sessionId);
+    }
   }
 
   // Close a video stream.
@@ -1488,8 +1696,15 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         this.disposePreparedSession(sessionId, pendingSession);
       }
 
-      // Delete the ongoing entry. The pending entry, if there was one, was already deleted by the disposal helper.
-      this.ongoingSessions.delete(sessionId);
+      if(ongoingSession) {
+
+        // Delete the ongoing entry. The pending entry, if there was one, was already deleted by the disposal helper.
+        // When copy escalation registered ongoingSessions early, delete only if shouldRemoveOngoingSessionEntry still matches this SessionInfo.
+        if(shouldRemoveOngoingSessionEntry(this.ongoingSessions.get(sessionId), ongoingSession)) {
+
+          this.ongoingSessions.delete(sessionId);
+        }
+      }
 
       if(diagnosticsOwner) {
 

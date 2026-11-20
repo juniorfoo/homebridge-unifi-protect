@@ -256,8 +256,8 @@ describe("doorbell + package camera family construction (suite B)", () => {
     assert.ok(doorbell.packageCamera, "the package camera instance is live");
 
     // The hints the package computes independently through its own configureHints from the shared parent MAC scope.
-    for(const hint of [ "tsbStreaming", "hardwareDecoding", "hardwareTranscoding", "highResSnapshots", "logHksv", "transcode", "transcodeBitrate",
-      "transcodeHighLatency", "transcodeHighLatencyBitrate" ] as const) {
+    for(const hint of [ "tsbStreaming", "hardwareDecoding", "hardwareTranscoding", "highResSnapshots", "logHksv", "transcodeBitrate",
+      "transcodeHighLatencyBitrate" ] as const) {
 
       assert.equal(doorbell.packageCamera.hints[hint], doorbell.hints[hint], "the package independently derives the identical " + hint + " hint");
     }
