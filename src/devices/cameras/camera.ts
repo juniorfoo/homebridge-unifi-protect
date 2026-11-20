@@ -117,9 +117,7 @@ export class ProtectCamera extends ProtectDevice implements ProtectCameraHost {
     this.hints.probesize = 16384;
     this.hints.smartDetect = this.ufp.featureFlags.hasSmartDetect && this.hasFeature("Motion.SmartDetect");
     this.hints.smartDetectSensors = this.hints.smartDetect && this.hasFeature("Motion.SmartDetect.ObjectSensors");
-    this.hints.transcode = this.hasFeature("Video.Transcode");
     this.hints.transcodeBitrate = this.getFeatureNumber("Video.Transcode.Bitrate") ?? -1;
-    this.hints.transcodeHighLatency = this.hasFeature("Video.Transcode.HighLatency");
     this.hints.transcodeHighLatencyBitrate = this.getFeatureNumber("Video.Transcode.HighLatency.Bitrate") ?? -1;
     this.hints.twoWayAudio = this.ufp.featureFlags.hasSpeaker && this.hasFeature("Audio") && this.hasFeature("Audio.TwoWay");
     this.hints.twoWayAudioDirect = this.ufp.featureFlags.hasSpeaker && this.hasFeature("Audio") && this.hasFeature("Audio.TwoWay.Direct");

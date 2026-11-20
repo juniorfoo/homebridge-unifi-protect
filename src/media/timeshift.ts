@@ -425,6 +425,30 @@ export class ProtectTimeshiftBuffer extends EventEmitter<TimeshiftBufferEvents> 
     return true;
   }
 
+  /**
+   * Init segment plus all buffered media from the most recent keyframe through the tail (for copy-escalation FFmpeg priming). Returns null when init is missing or no
+   * keyframe has been admitted yet (callers fall back to init-only priming).
+   */
+  public getInitPlusTrailingFromLastKeyframe(): Nullable<Buffer> {
+
+    if(!this.subscription?.initSegment) {
+
+      return null;
+    }
+
+    for(let i = this._segments.length - 1; i >= 0; i--) {
+
+      const seg = this._segments[i];
+
+      if(seg?.isKeyframe) {
+
+        return Buffer.concat([ this.subscription.initSegment.data, ...this._segments.slice(i).map((entry) => entry.data) ]);
+      }
+    }
+
+    return null;
+  }
+
   // Return the last duration milliseconds of the buffer, with an initialization segment.
   public getLast(duration: number): Nullable<Buffer> {
 

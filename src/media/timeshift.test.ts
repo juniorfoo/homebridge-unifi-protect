@@ -927,4 +927,51 @@ describe("timeshift buffer behavior", () => {
     assert.equal(host.rebootCalls.length, 1, "the reboot was attempted before it failed");
     assert.ok(logEntries.some((entry) => (entry.level === "error") && String(entry.parameters[0]).includes("could not be rebooted")), "the failed reboot is logged");
   });
+
+  describe("getInitPlusTrailingFromLastKeyframe", () => {
+
+    test("returns init plus fragments from the last keyframe through the tail in order", async () => {
+
+      const initBytes = Buffer.from("fmp4-init-for-prime");
+      const double = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: initBytes } });
+      const { timeshift } = await buildStartedTimeshift({ double });
+      const firstKeyframe = makeKeyframeFragment();
+      const middle = makeNonKeyframeFragment();
+      const lastKeyframe = makeKeyframeFragment();
+      const tail = makeNonKeyframeFragment();
+
+      double.push({ codec: "h264", data: initBytes, type: "init" });
+      await settle();
+      double.push(makeMediaSegment(firstKeyframe));
+      await settle();
+      double.push(makeMediaSegment(middle));
+      await settle();
+      double.push(makeMediaSegment(lastKeyframe));
+      await settle();
+      double.push(makeMediaSegment(tail));
+      await settle();
+
+      const primed = timeshift.getInitPlusTrailingFromLastKeyframe();
+      const expected = Buffer.concat([ initBytes, lastKeyframe.data, tail.data ]);
+
+      assert.ok(primed);
+      assert.ok(primed.equals(expected), "prime buffer must be init then last keyframe then trailing fragments");
+      assert.equal(primed.length, initBytes.length + lastKeyframe.data.length + tail.data.length);
+    });
+
+    test("returns null when no keyframe is buffered (init-only fallback)", async () => {
+
+      const initBytes = Buffer.from("fmp4-init-only");
+      const double = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: initBytes } });
+      const { timeshift } = await buildStartedTimeshift({ double });
+
+      double.push({ codec: "h264", data: initBytes, type: "init" });
+      await settle();
+      double.push(makeMediaSegment(makeNonKeyframeFragment()));
+      await settle();
+
+      assert.equal(timeshift.getInitPlusTrailingFromLastKeyframe(), null);
+    });
+
+  });
 });

@@ -95,14 +95,8 @@ export interface ProtectHints {
   // Whether the Protect device name is synced to HomeKit.
   syncName: boolean;
 
-  // Whether the camera's video stream is transcoded rather than passed through.
-  transcode: boolean;
-
   // The target bitrate, in kilobits per second, used when transcoding; -1 leaves the bitrate unconstrained.
   transcodeBitrate: number;
-
-  // Whether high-latency transcoding settings apply to this camera's stream.
-  transcodeHighLatency: boolean;
 
   // The target bitrate, in kilobits per second, used when transcoding under high-latency conditions; -1 leaves the bitrate unconstrained.
   transcodeHighLatencyBitrate: number;
