@@ -118,8 +118,8 @@ function makePrepareRequest(overrides?: { addressVersion?: "ipv4" | "ipv6"; sess
   } as unknown as PrepareStreamRequest;
 }
 
-const APPLE_TRANSCODE_DECODER_ARGS = [ "-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld" ];
-const APPLE_INPUT_CODEC_DECODER_ARGS = [ "-hwaccel", "videotoolbox" ];
+const APPLE_TRANSCODE_DECODER_ARGS = [ "-hwaccel", "videotoolbox" ];
+const APPLE_INPUT_CODEC_DECODER_ARGS = [ "-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld" ];
 
 function patchCodecSupportRecord(platform: { codecSupport: unknown }, patch: Record<string, unknown>): void {
 
@@ -262,7 +262,7 @@ function assertSpawnedDecoderMatchesTranscodePipeline(delegate: ProtectStreaming
 
   assert.deepEqual(decoderPrefix, expectedDecoder, "spawned decoder argv must match videoDecoder(transcode pipeline)");
   assert.notDeepEqual(decoderPrefix, inputCodecOnly, "spawned decoder argv must not be inputCodec-only on Apple interpolating transcode");
-  assert.deepEqual(decoderPrefix, APPLE_TRANSCODE_DECODER_ARGS, "Apple interpolating transcode must use videotoolbox_vld decoder argv");
+  assert.deepEqual(decoderPrefix, APPLE_TRANSCODE_DECODER_ARGS, "Apple interpolating transcode must use plain videotoolbox (CPU frames), not videotoolbox_vld");
 }
 
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 8000): Promise<void> {

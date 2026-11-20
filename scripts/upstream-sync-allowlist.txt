@@ -2,14 +2,14 @@
 LOST:docs/FeatureOptions.md:203:docs list upstream Video.Transcode.Bitrate=<value> syntax; fork keeps legacy dot form
 LOST:docs/FeatureOptions.md:205:docs FeatureOptions row differs from upstream v8.2.2 generated bitrate option names
 LOST:src/media/stream.ts:7:upstream v8.2.2 import list differs after stream-live extraction and policy modules
-LOST:src/media/stream.ts:8:upstream transcode-default line missing on fork copy-first head: FfmpegStreamingProcess, H264Level, H264Profile, HKSV_FRAGMENT_LENGTH, HbpuAbortError,
-LOST:src/media/stream.ts:9:upstream transcode-default line missing on fork copy-first head: VideoCodecType, formatBps, formatErrorMessage, formatUrlHost, guardedDispatch, isHbpu
+LOST:src/media/stream.ts:8:upstream v8.2.2 import line absent on fork head after stream-live module extraction (import block differs)
+LOST:src/media/stream.ts:9:upstream v8.2.2 import line absent on fork head after stream-live module extraction (import block differs)
 LOST:src/media/stream.ts:12:upstream v8.2.2 import list differs after stream-live extraction and policy modules
 LOST:src/media/stream.ts:19:upstream factors transcode + high-latency via resolveTranscodeDecision; fork inlines packet_time and crop hints in startStream
-LOST:src/media/stream.ts:213:upstream transcode-default line missing on fork copy-first head: constructor(protectCamera: ProtectCameraHost, resolutions: Resolution[], derived: Pic
-LOST:src/media/stream.ts:214:upstream transcode-default line missing on fork copy-first head: probe: null }) {
+LOST:src/media/stream.ts:213:upstream v8.2.2 streaming delegate constructor carries derived-audio probe default; fork ctor shape differs (not copy-first start-only)
+LOST:src/media/stream.ts:214:upstream v8.2.2 constructor closing default for derived probe; fork delegate ctor differs
 LOST:src/media/stream.ts:216:upstream v8.2.2 comment not on fork head: The recording audio format we advertise, computed from the stream the derivation read
-LOST:src/media/stream.ts:485:upstream transcode-default line missing on fork copy-first head: rtpDemuxer = new RtpDemuxer({ clock: this.platform.clock, inputPort: audioIncomingPor
+LOST:src/media/stream.ts:485:upstream always constructs RtpDemuxer inline; fork prepareStream prefers streamTestOptions.substituteRtpDemuxer harness hook then falls back
 LOST:src/media/stream.ts:579:upstream transcode-default line missing on fork copy-first head: for await(const segment of subscription) {
 LOST:src/media/stream.ts:638:upstream v8.2.2 comment not on fork head: The moment HomeKit's start request reached us, which is when HAP's own timer for answ
 LOST:src/media/stream.ts:665:upstream factors transcode + high-latency via resolveTranscodeDecision; fork inlines packet_time and crop hints in startStream

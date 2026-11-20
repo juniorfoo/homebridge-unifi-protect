@@ -231,13 +231,13 @@ def self_test_resurrection(config: dict, allow_path: Path) -> int:
     """Verify the guard fails when a resurrected upstream-removed line appears on head."""
     global _GIT_SHOW_OVERRIDE
     probe = "src/media/stream.ts"
-    fork_lines = git_show(config["fork_base"], probe)
+    old_upstream_lines = git_show(config["old_upstream"], probe)
     upstream_lines = git_show(config["new_upstream"], probe)
     head_lines = git_show(config["head"], probe)
-    if not fork_lines or not upstream_lines:
+    if not old_upstream_lines or not upstream_lines:
         print("self-test-resurrection: skip (missing stream.ts snapshots)", file=sys.stderr)
         return 0
-    base_c = collections.Counter(line.strip() for line in fork_lines)
+    base_c = collections.Counter(line.strip() for line in old_upstream_lines)
     up_c = collections.Counter(line.strip() for line in upstream_lines)
     resurrected = [line for line in (base_c - up_c) if line and up_c[line] == 0]
     if not resurrected:
