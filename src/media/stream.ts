@@ -135,13 +135,17 @@ export interface ProtectStreamingDelegateTestOptions {
 
   onRotateSegmentWriter?: (event: { poisoned: BackpressureWriter; replacement: BackpressureWriter }) => void;
   recordCreateTsbResumeInvocation?: () => void;
+  recordReturnAudioFfmpegArgs?: (args: string[]) => void;
+  /** When set, skip awaiting rtpDemuxer.mediaReady before spawning return-audio FFmpeg (harness only). */
+  skipTalkbackMediaReadyWait?: boolean;
 }
 
 function isProtectStreamingDelegateTestOptions(value: Pick<AdvertisedStreams, "audioFormat" | "probe"> | ProtectStreamingDelegateTestOptions):
   value is ProtectStreamingDelegateTestOptions {
 
   return (typeof value === "object") &&
-    (("onRotateSegmentWriter" in value) || ("recordCreateTsbResumeInvocation" in value));
+    (("onRotateSegmentWriter" in value) || ("recordCreateTsbResumeInvocation" in value) || ("recordReturnAudioFfmpegArgs" in value) ||
+    ("skipTalkbackMediaReadyWait" in value));
 }
 
 /* One camera's probesize self-tuning: how many bytes FFmpeg is told to analyze before it may act on a stream, raised whenever FFmpeg gives up trying to make sense of
@@ -232,9 +236,9 @@ class ProbesizeSelfTune {
 // Camera streaming delegate implementation for Protect.
 export class ProtectStreamingDelegate implements CameraStreamingDelegate, StreamingDelegate {
 
-  // The frozen audio-options identity the CameraController was built for, captured at construction from the same live-volatile inputs the audio options freeze below:
-  // isDoorbell (the recording and streaming sample rates) and the two-way audio hint (the streaming twoWayAudio flag). The live capability reconcile reads this off
-  // this.stream to detect a stale controller (a camera the controller late-reports as a doorbell or as having a speaker) and rebuilds only when a capability appeared.
+  // The controller identity the CameraController was built for, captured at construction through the one derivation the live capability reconcile also reads, from
+  // the same live-volatile camera facts the options below freeze. The reconcile reads this off this.stream to detect a stale controller (a camera the controller
+  // reports a capability for only after adoption) and rebuilds only when a term has appeared.
   public readonly builtFor: ControllerIdentity;
   public controller: CameraController;
   public readonly ffmpegOptions: FfmpegOptions;
@@ -399,9 +403,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
               audioChannels: 1,
 
-              // Protect doorbells and the Opus audio track over RTSP both use a 48 kHz audio sampling rate, which HomeKit doesn't support; the samplerate helper hands
-              // HomeKit both 16 and 24 kHz to choose from there (each divides 48 cleanly) and just 16 kHz when the buffer-backed livestream API delivers it. This surface
-              // is constructor-frozen, so usesTimeshiftLivestream is sampled at construction here; a later toggle change re-derives it through the delegate rebuild.
+              // The samplerate helper hands HomeKit 16 and 24 kHz to choose from for a doorbell and 16 kHz alone for every other camera. This surface is
+              // constructor-frozen, so doorbell-ness is sampled at construction here and is a term of the controller identity for exactly that reason.
               samplerate: streamingSamplerates({ isDoorbell: this.protectCamera.ufp.featureFlags.isDoorbell }),
               type: AudioStreamingCodecType.AAC_ELD
             }
@@ -705,8 +708,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       "-nostats",
       "-fflags", "+discardcorrupt",
       "-err_detect", "ignore_err",
-      ...this.ffmpegOptions.videoDecoder((encodeDecision.mode === "transcode") ?
-        (pipelineOptions) : pipelineOptions),
+      ...this.ffmpegOptions.videoDecoder(encodeDecision.mode === "transcode" ? pipelineOptions : { inputCodec: this.protectCamera.ufp.videoCodec }),
       "-max_delay", "500000",
       "-flags", "low_delay",
       "-probesize", this.probesize.toString()
@@ -912,8 +914,10 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         const pipelineOptions = resolveLiveStreamTranscodePipelineOptions(this.protectCamera, encodeDecision, ctx.channelProfile, rebuild.request, ctx.targetBitrate,
           ctx.useInterpolationFilter);
+        const ffmpegArgsThroughVideoMap = this.buildLiveFfmpegArgsThroughVideoMap(ctx.channelProfile, rebuild.request, rebuild.sessionInfo as SessionInfo, ctx.useTsb,
+          encodeDecision, pipelineOptions);
 
-        return this.spawnLiveVideoFfmpeg(ctx.ffmpegArgsThroughVideoMap, encodeDecision, ctx.channelProfile, rebuild.request,
+        return this.spawnLiveVideoFfmpeg(ffmpegArgsThroughVideoMap, encodeDecision, ctx.channelProfile, rebuild.request,
           rebuild.sessionInfo as SessionInfo, ctx.targetBitrate, ctx.useInterpolationFilter, ctx.useTsb, ffmpegAbort, pipelineOptions);
       },
       transcodeReason: transcodeReason,
@@ -990,18 +994,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       return;
     }
 
-    // We transcode based in the following circumstances:
-    //
-    //   1. The user has explicitly configured transcoding.
-    //   2. The user has configured cropping for the video stream.
-    //   3. We are on a high latency streaming session (e.g. cellular). If we're high latency, we'll transcode by default unless the user has asked us not to. Why? It
-    //      generally results in a speedier experience, at the expense of some stream quality (HomeKit tends to request far lower bitrates than Protect is capable of
-    //      producing).
-    //   4. The codec in use on the Protect camera isn't H.264.
-    //
-    // How do we determine if we're a high latency connection? We look at the RTP packet time of the audio packet time for a hint. HomeKit uses values of 20, 30, 40,
-    // and 60ms. We make an assumption, validated by lots of real-world testing, that when we see 60ms used by HomeKit, it's a high latency connection and act
-    // accordingly.
+    // High-latency live views (HomeKit audio packet_time >= 60ms) bias toward transcode unless the user opts out via Video.Transcode / Video.Transcode.HighLatency.
     const isHighLatency = request.audio.packet_time >= 60;
 
     // Copy vs transcode is decided in resolveStartStreamEncodePlan / decideLiveVideoEncode (user options, crop, codec, RTSP, avcC prefix, geometry).
@@ -1241,6 +1234,10 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       formatBps(egressBitrateBps), channelProfile.name, this.protectCamera.videoCodecName,
       formatBps(channelProfile.channel.bitrate), streamPathLabel);
 
+    // The info line names the bitrate we target...HomeKit's own request, which HAP states in kbps, goes to the debug log beside it.
+    this.log.debug("HomeKit requested up to %s for this stream, and the target bitrate is %s.", formatBps(request.video.max_bit_rate * 1000),
+      formatBps(encoderBitrate * 1000));
+
     const sessionStartedAt = Date.now();
     const outputWatchdog = new StreamOutputWatchdog((): void => {
 
@@ -1461,9 +1458,15 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         this.recordTsbMediaSegmentForOwner(request.sessionID, sessionDiagnostics);
       });
 
-      // Wait for the session to establish. If it fails (provisioning deadline expired), dispose the prepared session and bail. The FFmpeg was spawned above before this
-      // await, so it must be torn down here rather than left to sit until its returnPort watchdog fires; aborting the umbrella controller inside the disposal helper
-      // cascades through the shared signal to the FFmpeg, the writer, and the subscription, so no separate manual teardown of the three is needed.
+      /* Wait for the session to establish, within the live view's start deadline. HomeKit's answer comes from the FFmpeg ready bridge above, and FFmpeg says nothing
+       * until video reaches it, so a livestream that never delivers would otherwise hold HomeKit's request until HAP times it out. The deadline is measured from
+       * HomeKit's start request, where HAP's own timer began, so the work ahead of this wait counts against it on any host.
+       *
+       * If the session fails or misses the deadline, dispose the prepared session and bail. The FFmpeg was spawned above before this await, so it must be torn down here
+       * rather than left to sit until its returnPort watchdog fires; aborting the umbrella controller inside the disposal helper cascades through the shared signal to
+       * the FFmpeg, the writer, and the subscription, so no separate manual teardown of the three is needed, and the FFmpeg's abort settles the ready bridge, which
+       * answers HomeKit with an error exactly once.
+       */
       if(!(await establishedWithin({ clock: this.platform.clock, established: subscription.whenEstablished(),
         withinMs: PROTECT_LIVE_VIEW_START_DEADLINE_MS - (this.platform.clock.monotonic() - requestedAt) }))) {
 
@@ -1624,7 +1627,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     // aborts before any RTP arrives. That rejection has two reachable causes: our own session tearing down (the session signal aborted - a clean stop with nothing to
     // say), or the demuxer's socket faulting beneath a session that lives on (return audio is lost for the rest of the session, and the catch narrates it). The
     // null-narrow mirrors prepareStream: rtpDemuxer is non-null whenever two-way audio is active, which is the only path that reaches here.
-    if(sessionInfo.rtpDemuxer) {
+    if(sessionInfo.rtpDemuxer && !this.streamTestOptions?.skipTalkbackMediaReadyWait) {
 
       try {
 
@@ -1652,6 +1655,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     // udp://camera, and the controller-relayed path drains its ADTS stdout into the talkback session. It uses the plain FfmpegStreamingProcess (no returnPort
     // watchdog because it is outbound, and no subclass suppression/probesize because that is a livestream-API concern). The homebridge-plugin-utils process spawns
     // on construction, so stdin is available immediately for the SDP.
+    this.streamTestOptions?.recordReturnAudioFfmpegArgs?.(ffmpegReturnAudioCmd);
+
     const ffmpegReturnAudio = new FfmpegStreamingProcess(this.ffmpegOptions, { args: ffmpegReturnAudioCmd, signal: sessionInfo.abortController.signal });
 
     // Setup housekeeping for the twoway FFmpeg session.

@@ -26,7 +26,9 @@ import { setLiveVideoFfmpegSpawnerForTests } from "./stream-live-ffmpeg-spawn.ts
 import { TestLiveStreamingFfmpegProcess } from "./test-live-ffmpeg-process.ts";
 import type { ProtectStreamingFfmpegProcess } from "./stream-ffmpeg-process.ts";
 import { VIDEO_COPY_FAILURE_PATTERNS } from "./stream-transcode-policy.ts";
-import { shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
+import { resolveLiveStreamTranscodePipelineOptions, shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
+import type { LiveVideoEncodeDecision } from "./stream-transcode-policy.ts";
+import type { LiveStreamEncoderPipelineOptions } from "./stream-live-wiring.ts";
 
 const SESSION_ID = "sess-start-integration";
 
@@ -166,6 +168,63 @@ function argsUseVideoCopy(args: string[]): boolean {
   return (idx >= 0) && (args[idx + 1] === "copy");
 }
 
+function teeSinkArgument(args: string[]): string {
+
+  for(let i = 1; i < args.length; i += 1) {
+
+    if((args[i - 1] === "-f") && (args[i] === "tee")) {
+
+      return args[i + 1] ?? "";
+    }
+  }
+
+  return "";
+}
+
+function videoDecoderArgvPrefix(args: string[]): string[] {
+
+  const errDetectIdx = args.indexOf("-err_detect");
+
+  if(errDetectIdx >= 0) {
+
+    const maxDelayIdx = args.indexOf("-max_delay", errDetectIdx);
+
+    if(maxDelayIdx > errDetectIdx) {
+
+      return args.slice(errDetectIdx + 2, maxDelayIdx);
+    }
+  }
+
+  const mapIdx = args.indexOf("-map");
+
+  return (mapIdx >= 0) ? args.slice(0, mapIdx) : args;
+}
+
+function assertSpawnedDecoderMatchesTranscodePipeline(delegate: ProtectStreamingDelegate, channelProfile: ChannelProfile, request: StartStreamRequest,
+  useInterpolation: boolean, spawnedArgs: string[], inputCodec: string): void {
+
+  const encodeDecision: LiveVideoEncodeDecision = { logReason: "integration", mode: "transcode" };
+  const pipeline = resolveLiveStreamTranscodePipelineOptions(delegate.protectCamera, encodeDecision, channelProfile, request, request.video.max_bit_rate,
+    useInterpolation) as LiveStreamEncoderPipelineOptions;
+  const decoderPrefix = videoDecoderArgvPrefix(spawnedArgs);
+  const inputCodecOnly = delegate.ffmpegOptions.videoDecoder({ inputCodec: inputCodec });
+  const expectedDecoder = delegate.ffmpegOptions.videoDecoder(pipeline);
+
+  assert.deepEqual(decoderPrefix, expectedDecoder, "spawned decoder argv must match videoDecoder(transcode pipeline)");
+
+  const decoderMatchesInputCodecOnly = (decoderPrefix.length === inputCodecOnly.length) &&
+    decoderPrefix.every((value, index) => value === inputCodecOnly[index]);
+
+  if(decoderMatchesInputCodecOnly) {
+
+    assert.match(spawnedArgs.join(" "), /minterpolate=|fps=/,
+      "when decoder argv matches inputCodec-only on this host, spawned encoder chain must still carry interpolation filters");
+  } else {
+
+    assert.notDeepEqual(decoderPrefix, inputCodecOnly, "spawned decoder argv must not be inputCodec-only on Apple interpolating transcode");
+  }
+}
+
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 8000): Promise<void> {
 
   const started = Date.now();
@@ -239,6 +298,11 @@ function logLineIncludes(entries: readonly TestLogEntry[], fragment: string): bo
   return entries.some((entry) => formatLogEntry(entry).includes(fragment));
 }
 
+function logInfoLineIncludes(entries: readonly TestLogEntry[], fragment: string): boolean {
+
+  return entries.some((entry) => (entry.level === "info") && formatLogEntry(entry).includes(fragment));
+}
+
 interface HarnessContext {
 
   delegate: ProtectStreamingDelegate;
@@ -262,7 +326,7 @@ function syncLiveUfpChannelsForStubBuffer(host: TestCameraHost): void {
   host.ufp = { ...host.ufp, channels };
 }
 
-function createHarness(options?: { delegateTestOptions?: ProtectStreamingDelegateTestOptions; enableHardwareTranscodeFeature?: boolean;
+function createHarness(options?: { appleSilicon?: boolean; delegateTestOptions?: ProtectStreamingDelegateTestOptions; enableHardwareTranscodeFeature?: boolean;
   hardwareTranscodingHint?: boolean; livestreamSegments?: number; transcodeBitrateKbps?: number; videoCodec?: string; }): HarnessContext {
 
   const { host, logEntries } = makeTestCameraHost();
@@ -274,6 +338,22 @@ function createHarness(options?: { delegateTestOptions?: ProtectStreamingDelegat
   host.selectChannel = (): ChannelProfile => stubChannel;
   host.selectSubstrateChannel = (): ChannelProfile => stubChannel;
   host.livestreamSubscriptions = [makeLivestreamSubscriptionDouble({ mediaSegments: options?.livestreamSegments ?? 1 })];
+
+  if(options?.appleSilicon) {
+
+    const platform = host.platform as { codecSupport: Record<string, unknown> };
+
+    Object.assign(platform.codecSupport, {
+
+      cpuGeneration: 3,
+      ffmpegAtLeast: (): boolean => true,
+      hasDecoder: (): boolean => true,
+      hasEncoder: (): boolean => true,
+      hasHwAccel: (): boolean => true,
+      hostSystem: "macOS.Apple"
+    });
+    host.hints = { ...host.hints, hardwareDecoding: true, hardwareTranscoding: true };
+  }
 
   if(options?.hardwareTranscodingHint) {
 
@@ -402,8 +482,8 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     assert.ok(logLineIncludes(ctx.logEntries, "Streaming live video with H.264 copy"));
     const expectedSourceEgress = formatBps(stubChannel.channel.bitrate);
 
-    assert.ok(logLineIncludes(ctx.logEntries, expectedSourceEgress), "egress log must show source channel bitrate on copy");
-    assert.ok(!logLineIncludes(ctx.logEntries, formatBps(800000)), "copy must not log HomeKit target as egress");
+    assert.ok(logInfoLineIncludes(ctx.logEntries, expectedSourceEgress), "egress log must show source channel bitrate on copy");
+    assert.ok(!logInfoLineIncludes(ctx.logEntries, formatBps(800000)), "copy info line must not use HomeKit target as egress");
 
     await waitFor(() => (ctx.spawnedProcesses[0]?.stdinWrites.length ?? 0) > 0, "first stdin write on copy");
 
@@ -651,6 +731,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     let createTsbResumeCalls = 0;
     const ctx = createHarness({
 
+      appleSilicon: true,
       delegateTestOptions: {
 
         onRotateSegmentWriter: (event) => rotationEvents.push(event),
@@ -733,6 +814,8 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     await waitFor(() => rotationEvents.length >= 1, "TSB writer rotation on escalation", 25000);
 
     assert.equal(createTsbResumeCalls, 1, "copy escalation must invoke createTsbResume exactly once");
+
+    assertSpawnedDecoderMatchesTranscodePipeline(ctx.delegate, stubChannel, makeStartRequest(), true, ctx.spawnedArgs[1] ?? [], "h264");
 
     const copyProcess = ctx.spawnedProcesses[0];
     const replacement = ctx.spawnedProcesses[1];
@@ -1655,6 +1738,164 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     assert.equal(shouldSubstituteSelectChannelForSession(true, "bufferDegraded", null, true), false,
       "standing prefix blocks selectChannel even when buffer isStarted is false");
+  });
+
+  test("TSB Apple hardware transcode start uses shared transcode decoder argv (not inputCodec-only)", async () => {
+
+    const ctx = createHarness({ appleSilicon: true });
+    const defaultHasFeature = ctx.host.hasFeature.bind(ctx.host);
+
+    ctx.host.hasFeature = (option: string): boolean => (option === "Video.Transcode") ? true : defaultHasFeature(option);
+
+    const highFpsChannel: ChannelProfile = {
+
+      channel: { ...stubChannel.channel, fps: 30 },
+      name: stubChannel.name
+    } as ChannelProfile;
+
+    ctx.host.selectChannel = (): ChannelProfile => highFpsChannel;
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = highFpsChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    const request = makeStartRequest();
+
+    request.video.fps = 15;
+
+    await prepareAndStart(ctx, request);
+
+    assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), false);
+    assertSpawnedDecoderMatchesTranscodePipeline(ctx.delegate, highFpsChannel, request, true, ctx.spawnedArgs[0] ?? [], "h264");
+  });
+
+  test("TSB Apple hardware HEVC transcode start uses shared transcode decoder argv", async () => {
+
+    const ctx = createHarness({ appleSilicon: true, videoCodec: "hevc" });
+
+    const defaultHasFeature = ctx.host.hasFeature.bind(ctx.host);
+
+    ctx.host.hasFeature = (option: string): boolean => (option === "Video.Transcode") ? true : defaultHasFeature(option);
+
+    const highFpsChannel: ChannelProfile = {
+
+      channel: { ...stubChannel.channel, fps: 30 },
+      name: stubChannel.name
+    } as ChannelProfile;
+
+    ctx.host.selectChannel = (): ChannelProfile => highFpsChannel;
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = highFpsChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    const request = makeStartRequest();
+
+    request.video.fps = 15;
+
+    await prepareAndStart(ctx, request);
+
+    assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), false);
+    assertSpawnedDecoderMatchesTranscodePipeline(ctx.delegate, highFpsChannel, request, true, ctx.spawnedArgs[0] ?? [], "hevc");
+  });
+
+  test("tee audio sink uses srtpDestination (not raw host concatenation)", async () => {
+
+    const ctx = createHarness();
+    const platform = ctx.host.platform as { codecSupport: Record<string, unknown> };
+
+    Object.assign(platform.codecSupport, { hasEncoder: (): boolean => true });
+    ctx.host.hasFeature = (option: string): boolean => (option === "Audio") ? true : false;
+    ctx.host.ufp = { ...ctx.host.ufp, featureFlags: { ...ctx.host.ufp.featureFlags, hasMic: true } };
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    await prepareAndStart(ctx, makeStartRequest(), makePrepareRequest({ addressVersion: "ipv6", targetAddress: "fd00::1:2" }));
+
+    const tee = teeSinkArgument(ctx.spawnedArgs[0] ?? []);
+
+    assert.ok(tee.includes("]srtp://[fd00::1:2]:"), "video sink must bracket IPv6");
+    const audioPart = tee.split("|").find((part) => part.includes("select=a"));
+
+    assert.ok(audioPart, "audio tee sink must exist");
+    assert.ok(audioPart.includes("]srtp://[fd00::1:2]:"), "audio sink must use srtpDestination bracketing (M8b)");
+    assert.doesNotMatch(audioPart, /srtp_out_params=[^]]+\]srtp:\/\/fd00/);
+  });
+
+  test("two-way audio direct start uses talkbackDestination for UDP output", async () => {
+
+    const returnAudioArgs: string[][] = [];
+    const ctx = createHarness({
+
+      delegateTestOptions: {
+
+        recordReturnAudioFfmpegArgs: (args: string[]) => returnAudioArgs.push(args),
+        skipTalkbackMediaReadyWait: true
+      }
+    });
+
+    const defaultHasFeature = ctx.host.hasFeature.bind(ctx.host);
+    const platform = ctx.host.platform as { codecSupport: Record<string, unknown> };
+
+    Object.assign(platform.codecSupport, { hasEncoder: (): boolean => true });
+    ctx.host.hasFeature = (option: string): boolean => (option === "Audio") ? true : defaultHasFeature(option);
+    ctx.host.hints = { ...ctx.host.hints, twoWayAudio: true, twoWayAudioDirect: true };
+    ctx.host.ufp = {
+
+      ...ctx.host.ufp,
+      featureFlags: { ...ctx.host.ufp.featureFlags, hasMic: true },
+      host: "fd00::1:2",
+      talkbackSettings: { bindPort: 7000, channels: 1, samplingRate: 16000 }
+    };
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    await prepareAndStart(ctx);
+
+    assert.equal(returnAudioArgs.length, 1);
+    const destination = returnAudioArgs[0]?.at(-1) ?? "";
+
+    assert.equal(destination, "udp://[fd00::1:2]:7000", "return audio must use talkbackDestination (M9)");
+    assert.doesNotMatch(destination, /^udp:\/\/fd00::/);
+  });
+
+  test("RECONFIGURE debug log formats HomeKit bitrate in bps (times 1000)", async () => {
+
+    const ctx = createHarness();
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    await prepareAndStart(ctx);
+
+    const request = makeStartRequest();
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({ ...request, type: StreamRequestTypes.RECONFIGURE },
+        (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    const expected = formatBps(request.video.max_bit_rate * 1000);
+
+    assert.ok(logLineIncludes(ctx.logEntries, "Streaming parameters adjustment requested by HomeKit") &&
+      logLineIncludes(ctx.logEntries, expected), "RECONFIGURE must log HomeKit max bitrate via formatBps(kbps*1000) (M11)");
+  });
+
+  test("IPv6 zone refusal on start disposes prepared session without spawning video ffmpeg", async () => {
+
+    const ctx = createHarness();
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    await assert.rejects(() => prepareAndStart(ctx, makeStartRequest(), makePrepareRequest({ addressVersion: "ipv6", targetAddress: "fe80::1%en0" })),
+      /zone/);
+    assert.equal(ctx.spawnedArgs.length, 0, "SRTP refusal must dispose prepared session before spawn (M12)");
   });
 
 });

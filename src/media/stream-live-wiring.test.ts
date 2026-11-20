@@ -664,8 +664,6 @@ describe("resolveLiveStreamTranscodePipelineOptions — decoder/encoder object p
     assert.equal(pipelineOptions.inputCodec, inputCodec);
     assert.notDeepEqual(decoderArgs, decoderInputCodecOnly,
       "interpolating transcode must not use a decoder bag with inputCodec alone (macOS Apple HW regression)");
-    assert.deepEqual(decoderArgs, ffmpegOptions.videoDecoder(pipelineOptions),
-      "videoDecoder must consume the same options object passed to streamEncoder");
     assert.ok(encoderArgs.includes("-filter:v"), "encoder must receive interpolation filters when Apple interpolation is active");
     assert.match(encoderArgs.join(" "), /minterpolate=/);
   }

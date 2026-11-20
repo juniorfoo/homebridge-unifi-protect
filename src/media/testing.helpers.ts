@@ -470,6 +470,12 @@ export interface ControllableLivestreamDouble extends LivestreamSubscription {
  *
  * An iterator created after global terminate with no pending orphan items completes immediately (does not park forever).
  */
+/** After the drain loop, park only when the iterator has not terminated (end/error drain paths set terminated true). */
+function shouldParkControllableIteratorAfterDrain(terminated: boolean): boolean {
+
+  return !terminated;
+}
+
 export function makeControllableLivestreamDouble(options: { deferEstablishment?: boolean; description?: LivestreamDescription; id?: string;
   initSegment?: LivestreamInit | null; state?: LivestreamSubscriptionState; whenEstablished?: boolean; } = {}): ControllableLivestreamDouble {
 
@@ -625,8 +631,7 @@ export function makeControllableLivestreamDouble(options: { deferEstablishment?:
             }
           }
 
-          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- fanout.terminated is cleared by drain paths in the same loop turn.
-          if(!fanout.terminated) {
+          if(shouldParkControllableIteratorAfterDrain(fanout.terminated)) {
 
             // eslint-disable-next-line no-await-in-loop -- The park is intentionally serial: the generator suspends here until a push/end/throwError/dispose wakes it.
             await new Promise<void>((resolve) => { fanout.wakeResolver = resolve; });

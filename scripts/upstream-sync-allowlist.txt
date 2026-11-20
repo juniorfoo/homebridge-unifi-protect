@@ -1,255 +1,255 @@
-# Deliberate fork deltas (v8.2.2 sync; see PR decision table).
-
-# docs/FeatureOptions.md: deliberate fork (2 upstream-added absent, 0 resurrected)
-| <A NAME="Video.Transcode.Bitrate"></A>`Video.Transcode.Bitrate=<value>`                          | Bitrate, in kilobits per second, to use when transcoding to low-latency (e.g. at home) clients, ignoring the bitrate HomeKit requests. HomeKit typically requests lower video quality than you may desire in your environment. **(default: 2000)**.
-| <A NAME="Video.Transcode.HighLatency.Bitrate"></A>`Video.Transcode.HighLatency.Bitrate=<value>`  | Bitrate, in kilobits per second, to use when transcoding to high-latency (e.g. cellular) clients, ignoring the bitrate HomeKit requests. HomeKit typically requests lower video quality than you may desire in your environment. **(default: 1000)**.
-
-# src/media/stream.ts: deliberate fork (132 upstream-added absent, 66 resurrected)
-import { AudioRecordingCodecType, AudioStreamingCodecType, AudioStreamingSamplerate, BackpressureWriter, FfmpegOptions,
-FfmpegStreamingProcess, H264Level, H264Profile, HKSV_FRAGMENT_LENGTH, HbpuAbortError, MediaContainerType, RtpDemuxer, SRTPCryptoSuites, StreamRequestTypes,
-VideoCodecType, formatBps, formatErrorMessage, formatUrlHost, guardedDispatch, isHbpuAbortReason, mqttTopic } from "homebridge-plugin-utils";
-import type { Clock, HomebridgePluginLogging, IpFamily, Nullable, PortReservation } from "homebridge-plugin-utils";
-import { resolveChannelRequest, resolveTranscodeDecision, resolveVideoEncoding } from "./stream-encode-policy.ts";
-// Whether this session lit the package-camera flashlight, recorded so the single prepared-session disposal path (and a normal stop) can turn it back off. It is set at
-// definition, so the clean-versus-fault decision lives in a single place. The signal.aborted arm is required, not the error type alone: a clean send-stop rejects with
-// ProtectNetworkError rather than ProtectAbortedError, because the shared signal's abort listener races ahead of send's own onAbort.
-// The controller identity the CameraController was built for, captured at construction through the one derivation the live capability reconcile also reads, from
-// the same live-volatile camera facts the options below freeze. The reconcile reads this off this.stream to detect a stale controller (a camera the controller
-// reports a capability for only after adoption) and rebuilds only when a term has appeared.
-// Create an instance of a HomeKit streaming delegate. The derived audio half - the recording audio format the camera's derivation read from its livestream and the
-// probe subscription that read it - defaults to nothing read, which advertises the stand-in and hands the supervisor nothing to adopt.
-constructor(protectCamera: ProtectCameraHost, resolutions: Resolution[], derived: Pick<AdvertisedStreams, "audioFormat" | "probe"> = { audioFormat: null,
-probe: null }) {
-// The recording audio format we advertise, computed from the stream the derivation read by the one helper the supervisor's restart hint also compares through.
-// The samplerate helper hands HomeKit 16 and 24 kHz to choose from for a doorbell and 16 kHz alone for every other camera. This surface is
-// constructor-frozen, so doorbell-ness is sampled at construction here and is a term of the controller identity for exactly that reason.
-// Setup the RTP demuxer for two-way audio scenarios. The talkback URL is negotiated separately: camera.talkback() resolves it in startStream.
-// eslint-disable-next-line camelcase -- The property name is the one the HomeKit streaming response type defines.
-for await(const segment of subscription) {
-// The moment HomeKit's start request reached us, which is when HAP's own timer for answering it began. The livestream wait below is bounded against it.
-// Decide whether this session re-encodes the video, and read the connection's latency from the negotiated audio packet time. Both are a pure policy over the user's
-// configured hints and the camera's codec - stream-encode-policy.ts carries the full rationale for each circumstance that forces a transcode.
-const { isHighLatency, isTranscoding } = resolveTranscodeDecision({
-crop: this.protectCamera.hints.crop,
-packetTime: request.audio.packet_time,
-transcode: this.protectCamera.hints.transcode,
-transcodeHighLatency: this.protectCamera.hints.transcodeHighLatency,
-// camera's current facts (the buffer-backed-livestreaming toggle, the recording demand, the buffer's liveness, the package preference, the AV1 constraint, whether
-// an RTSP-enabled stream exists to dial, and the internal A/B test). The A/B test flip is captured and the toggle advanced here so the policy itself stays pure.
-// Whether this host encodes live video on hardware is frozen when the FFmpeg options are constructed, so one read serves both the source-dimension bias below and
-// the hardware-acceleration hint in the streaming-request log further down.
-// Find the best RTSP stream based on what we're looking for. The dimensions and the posture are a pure policy; the selection call and the host's source-pixel cap -
-// a hardware capability rather than a decision, applied with the higher posture alone - stay here.
-const channelRequest = resolveChannelRequest({
-isTranscoding,
-requestHeight: request.video.height,
-requestWidth: request.video.width,
-usesHardwareEncoder
-channelProfile ??= this.protectCamera.selectChannel(channelRequest.width, channelRequest.height,
-{ bias: channelRequest.bias, maxPixels: (channelRequest.bias === "higher") ? this.ffmpegOptions.maxSourcePixels("stream") : undefined });
-// Decide how the video reaches HomeKit - copied from the camera or re-encoded - and the bitrate we target either way. The channel's bitrate ceiling arrives from the
-// controller in bits per second and the policy works in kbps throughout, so we convert it here at the boundary.
-const encoding = resolveVideoEncoding({
-channelBitrate: channelProfile.channel.bitrate / 1000,
-channelFps: channelProfile.channel.fps,
-cpuGeneration: this.platform.codecSupport.cpuGeneration,
-hostSystem: this.platform.codecSupport.hostSystem,
-isHighLatency,
-requestBitrate: request.video.max_bit_rate,
-requestFps: request.video.fps,
-requestLevel: request.video.level,
-requestProfile: request.video.profile,
-transcodeBitrate: this.protectCamera.hints.transcodeBitrate,
-transcodeHighLatencyBitrate: this.protectCamera.hints.transcodeHighLatencyBitrate,
-useTsb,
-// If we are streaming the package camera, and it's dark outside, activate the flashlight on the camera. We record that on the session itself so the single
-// The camera runs the flashlight's own set body, past the refusal a HomeKit write meets.
-...this.ffmpegOptions.videoDecoder((encoding.mode === "transcode") ? encoding.encoderOptions : { inputCodec: this.protectCamera.ufp.videoCodec }),
-// explicit map disables FFmpeg's automatic stream selection for the whole output...which is why the audio map must stay optional: when the input carries no
-hinting.push(...(isTranscoding && usesHardwareEncoder ? [HARDWARE_TRANSCODE_MARKER] : []));
-formatBps(encoding.targetBitrate * 1000), channelProfile.name, this.protectCamera.videoCodecName,
-// The info line names the bitrate we target...HomeKit's own request, which HAP states in kbps, goes to the debug log beside it.
-this.log.debug("HomeKit requested up to %s for this stream, and the target bitrate is %s.", formatBps(request.video.max_bit_rate * 1000),
-formatBps(encoding.targetBitrate * 1000));
-// Render the encoding the policy resolved. The decision is already made - all that happens here is turning it into FFmpeg arguments.
-if(encoding.mode === "transcode") {
-ffmpegArgs.push(...this.ffmpegOptions.streamEncoder(encoding.encoderOptions));
-if(encoding.transmux) {
-//                                  no-op. The :a specifier is required, not incidental: with a single output, an unqualified option binds to every stream it can
-//                                  apply to, and a global header on the video encoder would strip the in-band SPS and PPS that HomeKit requires from RTP video.
-// If we are audio filtering, address it here, at the output rate HomeKit requested for this stream.
-// Send the stream to HomeKit through a single tee-muxed output rather than two top-level outputs. The distinction matters: a top-level output that ends up
-// input does, and FFmpeg's organic exit on input EOF is a rule this design relies on here...the teardown in consumeStreamSegments depends on it.
-const errorMessage = "Unable to start video stream: the HomeKit client's IPv6 address carries a zone, which a streaming destination cannot include.";
-this.log.error(errorMessage, { address: sessionInfo.address });
-// FFmpeg still needs its subscription/writer reclaimed - so the same cleanup runs on either branch. The check that tells the two apart reads signal.reason:
-// stopStream aborts with an explicit HbpuAbortError("shutdown"), so isHbpuAbortReason(reason, "shutdown") suppresses the self-stop double-fire; the entry-existence
-// guard is defense-in-depth. This is the started-then-died force-stop, and the returnPort watchdog timeout flows through the same path.
-// Subscribe to the pooled livestream via the camera interface. This call is synchronous and returns the subscription handle immediately; the underlying connection
-// POOL-SHARING RULE: the unifi-protect library's pool sharing key includes segmentLength/chunkSize/timestamps. The live and HKSV-timeshift subscribers share
-// ONE pooled session only because BOTH go through this same interface with the same defaults - the live call OMITS segmentLength, so the interface default
-/* Wait for the session to establish, within the live view's start deadline. HomeKit's answer comes from the FFmpeg ready bridge above, and FFmpeg says nothing
-* until video reaches it, so a livestream that never delivers would otherwise hold HomeKit's request until HAP times it out. The deadline is measured from
-* HomeKit's start request, where HAP's own timer began, so the work ahead of this wait counts against it on any host.
-* If the session fails or misses the deadline, dispose the prepared session and bail. The FFmpeg was spawned above before this await, so it must be torn down here
-* rather than left to sit until its returnPort watchdog fires; aborting the umbrella controller inside the disposal helper cascades through the shared signal to
-* the FFmpeg, the writer, and the subscription, so no separate manual teardown of the three is needed, and the FFmpeg's abort settles the ready bridge, which
-* answers HomeKit with an error exactly once.
-// -map 0:a:0             Select the single incoming audio track from the SDP input before re-encoding it.
-// return-audio FFmpeg ended or faulted), proactively closing on return-audio exit; it is safe to run again alongside the stopStream abort backstop.
-// Dispose a prepared (pending) session. This is the single teardown body for a session that was prepared but never became a registered ongoing session: every path
-// that ends a never-registered session routes through it. Aborting the umbrella AbortController is the convergence point - it fans out through the shared signal to
-// the demuxer and any FFmpeg, backpressure writer, and livestream subscription hung off it - while the port reservations and the pending-map entry are released
-// explicitly (the abort alone does not free them), and a package-camera flashlight this session lit is turned back off. It is safe to call more than once:
-// Turn the package-camera flashlight back off if this session lit it. The camera runs the flashlight's own set body, so a session that fails in an outage still does.
-// backpressure writer, the talkback session, and the livestream subscription. The explicit HbpuAbortError("shutdown") reason is required, not incidental - the
-// .exited force-stop bridge reads isHbpuAbortReason(reason, "shutdown") to suppress the self-stop double-fire; a bare abort() would set the reason to a
-// DOMException the check never matches.
-// Dispose the talkback session as a backstop. The abort above already closed it through the shared signal, so this is safe to call again as a no-op (no
-// double error).
-// Turn off the flashlight on package cameras, if enabled. This HomeKit-state side effect cannot fold into the abort, so it stays explicit. The camera runs the
-// flashlight's own set body, so a session that stops in an outage still does.
-/* Shut down all our video streams and end this camera's probesize self-tuning with them.
-* Every path that calls shutdown is ending this instance's service life, so the teardown here is total: every session the delegate still holds ends, streaming or
-* still establishing, and the self-tuning story ends with them. A pending auto-reset timer would otherwise keep a retired delegate reachable for the remainder of its
-* window, and resetProbesizeOverride owns the clear-and-reset, so the tuning state and its timer always end together.
-* Safe to call more than once - a repeat call finds no sessions and nothing to reset. That holds structurally rather than through a latch: both session maps drain on
-* the first call, and the reset assigns fixed values, so a latch field here would add state without adding a guarantee.
-// A session still mid-establishment holds a spawned FFmpeg, an RTP demuxer, port reservations, and an establishing subscription on its umbrella controller, and the
-// loop above walks only the registered ongoing sessions. Routing each pending session through the shared disposal aborts its resources as one cascade under the
-// same "shutdown" reason stopStream uses, so neither a session resource nor a later "failed" classification can outlive the delegate. Deleting the current entry
-// during the iteration is safe, as is calling the helper more than once. Each disposal is caught on its own, mirroring stopStream's log-and-swallow posture, so one
-// failure strands neither the sessions behind it nor the reset below.
-/* Reset the probesize self-tuning back to this camera's baseline.
-* This is the single owner of the clear-and-reset: the override, its retry count, and any pending auto-reset timer end together here, so every role that needs the
-* tuning wound back routes through this one body rather than reaching for the timer itself. The override and its retry count accumulate as FFmpeg repeatedly fails to
-* estimate the stream rate, and at the permanent ceiling (PROTECT_PROBESIZE_OVERRIDE_PERMANENT_THRESHOLD adjustments) no auto-reset timer is armed, so the elevated
-* probesize - and the startup latency it costs - otherwise persists for the whole life of the delegate.
-* A controller reboot restarts this camera's stream from scratch, the natural boundary to clear the latch and let it re-tune from its baseline; the NVR calls this on
-* the reboot edge, where the trade-off is one possibly-wasted baseline spawn on a chronically-flaky camera in exchange for not penalizing every camera forever -
-* probesize is read only when ffmpegArgs is built at spawn, so this never disturbs an in-flight process, and a fresh failure cheaply re-arms it. The delegate's own
-* shutdown is the terminal role instead: nothing re-arms afterward, and the point of the reset is to leave no timer pending on an instance whose service life is over.
-* Wait for a livestream to establish, giving up at a deadline. The establishment's own answer wins when it arrives first, and the deadline passing first answers
-* false, so a caller holding a time budget treats a livestream that is late exactly as one that failed. The deadline's timer is released as soon as the wait settles,
-* so an establishment that answers in time leaves nothing armed behind it.
-* @param options             - Wait inputs.
-* @param options.clock       - The clock the deadline is armed on.
-* @param options.established - The livestream's establishment answer.
-* @param options.withinMs    - How long to wait, in milliseconds. A budget already spent answers false on the clock's next turn.
-* @returns Whether the livestream established before the deadline.
-// The package-camera flashlight this session lit, if any, recorded so the single prepared-session disposal path (and a normal stop) can turn it back off. It is set at
-// decision lives in a single place. The signal.aborted arm is required, not the error type alone: a clean send-stop rejects with ProtectNetworkError rather than
-// ProtectAbortedError, because the shared signal's abort listener races ahead of send's own onAbort.
-// The frozen audio-options identity the CameraController was built for, captured at construction from the same live-volatile inputs the audio options freeze below:
-// isDoorbell (the recording and streaming sample rates) and the two-way audio hint (the streaming twoWayAudio flag). The live capability reconcile reads this off
-// this.stream to detect a stale controller (a camera the controller late-reports as a doorbell or as having a speaker) and rebuilds only when a capability appeared.
-// Create an instance of a HomeKit streaming delegate.
-// Protect doorbells and the Opus audio track over RTSP both use a 48 kHz audio sampling rate, which HomeKit doesn't support; the samplerate helper hands
-// HomeKit both 16 and 24 kHz to choose from there (each divides 48 cleanly) and just 16 kHz when the buffer-backed livestream API delivers it. This surface
-// is constructor-frozen, so usesTimeshiftLivestream is sampled at construction here; a later toggle change re-derives it through the delegate rebuild.
-// Setup the RTP demuxer for two-way audio scenarios. The talkback URL is no longer fetched here - camera.talkback() negotiates it in startStream.
-// eslint-disable-next-line camelcase
-// We transcode based in the following circumstances:
-//   1. The user has explicitly configured transcoding.
-//   2. The user has configured cropping for the video stream.
-//   3. We are on a high latency streaming session (e.g. cellular). If we're high latency, we'll transcode by default unless the user has asked us not to. Why? It
-//      generally results in a speedier experience, at the expense of some stream quality (HomeKit tends to request far lower bitrates than Protect is capable of
-//      producing).
-//   4. The codec in use on the Protect camera isn't H.264.
-// How do we determine if we're a high latency connection? We look at the RTP packet time of the audio packet time for a hint. HomeKit uses values of 20, 30, 40,
-// and 60ms. We make an assumption, validated by lots of real-world testing, that when we see 60ms used by HomeKit, it's a high latency connection and act
-// accordingly.
-const isHighLatency = request.audio.packet_time >= 60;
-// Set the initial bitrate we should use for this request based on what HomeKit is requesting.
-let targetBitrate = request.video.max_bit_rate;
-// camera's current facts (the buffer-backed-livestreaming toggle, the recording demand, the buffer's liveness, the package preference, the AV1 constraint, and the
-// internal A/B test). The A/B test flip is captured and the toggle advanced here so the policy itself stays pure.
-// When the live encode runs on the host's hardware encoder we bias toward the highest-quality source the pipeline can ingest, because fixed-function encoders
-// perform better with higher-bitrate sources; a software encode is fed a source matched to the requested resolution instead, so the CPU cost tracks what HomeKit
-// actually asked for.
-usesHardwareEncoder ? 3840 : request.video.width,
-usesHardwareEncoder ? 2160 : request.video.height,
-// If we have specified the bitrates we want to use when transcoding, let's honor those here.
-// If we're targeting a bitrate that's beyond the capabilities of our input channel, match the bitrate of the input channel.
-// If we are streaming the package camera, and it's dark outside, activate the flashlight on the camera. We record the lit service on the session itself so the single
-// explicit map disables FFmpeg's automatic stream selection for the whole output...that is load-bearing for the audio map's optionality: when the input carries no
-const useInterpolationFilter = useTsb && !isPackageCameraContext(this.protectCamera.accessory.context) &&
-((this.platform.codecSupport.hostSystem === "macOS.Apple") && (this.platform.codecSupport.cpuGeneration >= 3));
-//                                  no-op. The :a specifier is load-bearing: with a single output, an unqualified option binds to every stream it can apply to, and
-//                                  a global header on the video encoder would strip the in-band SPS and PPS that HomeKit requires from RTP video.
-// If we are audio filtering, address it here.
-// The input sample rate FFmpeg's audio filters operate on is the camera's livestream (fMP4) audio rate that livestreamAudioSampleRate owns, independent of the
-// output rate HomeKit requests. getAudioFilters checks each filter's frequency against that rate's Nyquist limit, so a doorbell's higher source rate lifts the
-// ceiling far enough that a user's 8-24 kHz highpass/lowpass passes through on a doorbell.
-// Send the stream to HomeKit through a single tee-muxed output rather than two top-level outputs. The distinction is load-bearing: a top-level output that ends up
-// input does, and FFmpeg's organic exit on input EOF is a design invariant here...the teardown in consumeStreamSegments depends on it.
-// FFmpeg still needs its subscription/writer reclaimed - so the same cleanup runs on either branch. The organic discriminator reads signal.reason: stopStream
-// aborts with an explicit HbpuAbortError("shutdown"), so isHbpuAbortReason(reason, "shutdown") suppresses the self-stop double-fire; the entry-existence guard is
-// defense-in-depth. This is the started-then-died force-stop, and the returnPort watchdog timeout flows through the same path.
-// Subscribe to the pooled livestream via the camera seam. This call is synchronous and returns the subscription handle immediately; the underlying connection
-// POOL-SHARING INVARIANT: the unifi-protect library's pool sharing key includes segmentLength/chunkSize/timestamps. The live and HKSV-timeshift subscribers
-// share ONE pooled session only because BOTH go through this same seam with the same defaults - the live call OMITS segmentLength, so the seam default
-// Wait for the session to establish. If it fails (provisioning deadline expired), dispose the prepared session and bail. The FFmpeg was spawned above before this
-// await, so it must be torn down here rather than left to sit until its returnPort watchdog fires; aborting the umbrella controller inside the disposal helper
-// cascades through the shared signal to the FFmpeg, the writer, and the subscription, so no separate manual teardown of the three is needed.
-// return-audio FFmpeg ended or faulted), proactively closing on return-audio exit; it is idempotent with the stopStream abort backstop.
-// Dispose a prepared (pending) session. This is the single teardown body for a session that was prepared but never became a registered ongoing session: every failed
-// start in startStream and stopStream's own pending branch route through it. Aborting the umbrella AbortController is the convergence point - it fans out through the
-// shared signal to the demuxer and any FFmpeg, backpressure writer, and livestream subscription hung off it - while the port reservations and the pending-map entry
-// are released explicitly (the abort alone does not free them), and a package-camera flashlight this session lit is turned back off. It is safe to call more than once:
-// backpressure writer, the talkback session, and the livestream subscription. The explicit HbpuAbortError("shutdown") reason is load-bearing - the .exited
-// force-stop bridge reads isHbpuAbortReason(reason, "shutdown") to suppress the self-stop double-fire; a bare abort() would set the reason to a DOMException
-// the discriminator never matches.
-// Dispose the talkback session as a backstop. The abort above already closed it through the shared signal, so this is an idempotent no-op (no double error).
-// Turn off the flashlight on package cameras, if enabled. This HomeKit-state side effect cannot fold into the abort, so it stays explicit. We explicitly want
-// to call the set handler for the flashlight.
-
-# src/media/testing.helpers.ts: deliberate fork (48 upstream-added absent, 0 resurrected)
-function makeMediaFragment(options: { keyframe?: boolean } = {}): { data: Buffer; mdat: Buffer; moof: Buffer } {
-const moof = makeContainer("moof", [makeContainer("traf", [makeTrunBox({ sampleFlagsValue: keyframe ? 0 : SAMPLE_FLAG_NON_SYNC, useFirstSampleFlags: true })])]);
-const mdat = makeBox("mdat");
-return { data: Buffer.concat([ moof, mdat ]), mdat, moof };
-export function makeNonKeyframeFragment(): { data: Buffer; mdat: Buffer; moof: Buffer } {
-return makeMediaFragment({ keyframe: false });
-* The iterator is the lost-wakeup-safe drain-loop the parking double established, generalized to a runtime-fed queue: it holds a queue of items
-* ({ kind: "segment" } | { kind: "end" } | { kind: "error" }), and on each turn it DRAINS THE WHOLE QUEUE - shifting and acting on every queued item (yield a segment,
-* return on end, throw on error) - and ONLY parks on a fresh one-shot resolver when the queue is empty and the double is not yet terminated; on wake it RE-CHECKS the
-* queue and continues the drain. Draining the whole queue per wake is required: a naive park/yield-one/re-park strands a second segment pushed under one wake
-* (empirically reproduced), so a two-push-then-drain self-test would observe only the first.
-* The park keeps isStarted true: while the queue is open and the double is not ended/disposed the generator NEVER completes (it parks), so the timeshift's
-* consumeSegments for-await stays open, its finally does not run, the subscription stays committed, and timeshift.isStarted reports true. end()/throwError()/dispose are
-* the iterator-termination drivers that feed that finally: each enqueues its terminal item AFTER any queued segments (drain-then-close, so queued media is not
-* dropped) and wakes the iterator. whenEstablished resolves immediately (default true) so start() commits the subscription before the test pushes media; setting
-* deferEstablishment instead holds whenEstablished open until releaseEstablishment() resolves it true, so a start can be held in flight across a racing shutdown().
-* The terminal transition is one-shot and safe to repeat: once the generator has returned (end/dispose) or thrown (error), the double is terminated and
-* push/end/throwError and a second dispose are NO-OPS, and the parking resolver is resolved at most once (guarded so no double-resolve). asyncDispose records disposed =
-* true and signals a graceful end if the double is not already terminated.
-// The runtime-fed item queue and the lifecycle flags. terminated latches once the generator returns or throws, after which every control method no-ops.
-const queue: ({ kind: "segment"; segment: Segment } | { kind: "end" } | { kind: "error"; error: unknown })[] = [];
-// Resolve the init segment, distinguishing "option omitted" (default to a populated init so start() commits, described by the description option or as no tracks)
-// from "option explicitly null" (the start-validation arm the timeshift declines on). A plain ?? cannot make that distinction - it treats an explicit null as nullish
-// and would override it with the default - so we branch on strict undefined.
-// The one-shot park resolver: the generator stores its resolver here before awaiting, and wake() resolves and clears it. Holding at most one resolver and clearing it
-// on resolve guarantees no double-resolve and no stale wake.
-let wakeResolver: (() => void) | null = null;
-// The deferred-establishment gate for the shutdown-versus-in-flight-start race. When deferEstablishment is set, whenEstablished() parks on this resolver until the
-// test calls releaseEstablishment(), so a start can be held in flight while shutdown() runs and then committed afterward. The release resolves to true specifically,
-// since a release-to-decline would never commit the subscription. Without the gate, whenEstablished resolves immediately.
-// Wake a parked generator, if one is parked. Resolving and clearing in one step keeps the resolver one-shot.
-const wake = (): void => {
-const resolve = wakeResolver;
-wakeResolver = null;
-// Enqueue an item and wake the iterator, unless the double has already terminated (in which case every control method is a no-op).
-const enqueue = (item: { kind: "segment"; segment: Segment } | { kind: "end" } | { kind: "error"; error: unknown }): void => {
-queue.push(item);
-wake();
-// The drain-loop: process the whole queue, then park only when it is empty and we have not yet terminated. On wake, the outer while re-checks the queue.
-while(!terminated) {
-// Drain every queued item before considering a park, so no item pushed under a single wake is stranded.
-while(queue.length > 0) {
-const item = queue.shift();
-// The queue is empty, so park on a fresh one-shot resolver until a control method wakes us, then re-check the queue. For the one consumer the double
-// serves, the loop's condition is the only terminated check the park needs: the drain sets the flag only where it leaves the generator at once.
-await new Promise<void>((resolve) => { wakeResolver = resolve; });
-// Record the dispose and, if the double has not already terminated, signal a graceful end so the parked iterator completes its finally. Safe to repeat: a second
-// dispose after termination no-ops via the enqueue terminated-guard.
+# path:line:reason — deliberate fork deltas vs upstream v8.2.2
+docs/FeatureOptions.md:203:fork FeatureOptions / docs for copy-first and diagnostics
+docs/FeatureOptions.md:205:fork FeatureOptions / docs for copy-first and diagnostics
+src/media/stream.ts:1000:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1002:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1003:streamTestOptions harness hooks
+src/media/stream.ts:1004:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1005:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1006:fork logging / diagnostics on live start path
+src/media/stream.ts:1012:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1013:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1016:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1017:streamTestOptions harness hooks
+src/media/stream.ts:1050:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1051:Hbpu abort normalization at copy escalation
+src/media/stream.ts:1052:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:106:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1072:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1078:pool-sharing rule wording (fork copy-first pools)
+src/media/stream.ts:1079:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1087:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1088:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1089:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1091:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1092:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1093:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1094:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1112:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1113:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1114:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1118:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1119:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1125:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1126:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1174:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1187:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1211:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1212:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:126:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:127:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1290:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:12:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1342:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1343:Hbpu abort normalization at copy escalation
+src/media/stream.ts:1344:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1360:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1361:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1362:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1363:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1370:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1396:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1397:Hbpu abort normalization at copy escalation
+src/media/stream.ts:1398:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1401:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1402:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1405:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1406:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1435:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1441:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1441:pool-sharing rule wording (fork copy-first pools)
+src/media/stream.ts:1442:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1443:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1444:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1445:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1447:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1448:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1457:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1458:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1459:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1460:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1461:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1464:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1465:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1466:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1486:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1488:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1489:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1490:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1491:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1493:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1494:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1495:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1496:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1511:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1512:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1513:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1515:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1516:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1517:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1518:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1520:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1682:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1752:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1753:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1754:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1755:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1804:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1805:Hbpu abort normalization at copy escalation
+src/media/stream.ts:1806:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1809:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1812:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1813:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:189:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:190:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:191:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:19:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:211:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:212:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:213:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:214:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:216:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:235:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:236:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:237:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:259:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:343:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:344:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:402:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:403:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:404:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:484:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:543:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:544:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:545:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:553:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:555:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:579:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:603:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:605:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:613:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:615:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:638:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:663:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:664:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:665:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:667:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:668:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:669:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:670:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:675:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:676:streamTestOptions harness hooks
+src/media/stream.ts:732:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:733:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:736:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:737:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:738:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:739:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:740:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:741:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:742:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:743:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:746:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:747:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:75:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:762:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:763:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:764:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:765:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:766:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:767:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:768:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:769:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:770:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:772:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:773:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:774:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:775:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:776:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:777:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:778:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:779:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:780:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:781:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:782:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:783:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:784:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:785:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:795:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:7:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:827:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:843:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:848:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:857:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:881:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:895:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:898:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:899:restored upstream debug bitrate line
+src/media/stream.ts:8:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:900:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:902:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:903:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:906:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:918:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:936:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:937:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:94:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:954:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:958:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:95:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:963:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:993:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:995:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:996:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:997:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:998:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:999:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:9:Hbpu abort normalization at copy escalation
+src/media/testing.helpers.ts:278:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:281:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:282:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:284:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:299:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:301:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:414:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:415:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:416:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:417:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:418:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:420:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:421:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:422:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:423:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:424:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:426:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:427:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:428:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:433:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:434:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:439:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:440:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:441:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:445:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:446:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:447:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:449:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:450:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:451:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:454:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:455:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:457:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:459:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:463:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:464:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:471:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:472:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:510:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:511:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:513:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:514:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:516:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:553:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:554:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:556:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:561:FO2 fanout double / harness helpers
+src/media/testing.helpers.ts:562:FO2 fanout double / harness helpers
