@@ -79,5 +79,26 @@ describe("stream-reconfigure", () => {
       previous: previous,
       previousEncode: "copy"
     }).material, false);
+
+    const appliedTranscode = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, max_bit_rate: 800 });
+    const negotiate750 = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, max_bit_rate: 750 });
+
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: negotiate750,
+      nextEncode: "transcode",
+      previous: appliedTranscode,
+      previousEncode: "transcode"
+    }).material, false);
+
+    const negotiate650 = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, max_bit_rate: 650 });
+
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: negotiate650,
+      nextEncode: "transcode",
+      previous: appliedTranscode,
+      previousEncode: "transcode"
+    }).material, true);
   });
 });
