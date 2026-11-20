@@ -41,6 +41,12 @@ jobs:
           cache: npm
           node-version: ${{ matrix.node-version }}
 
+      - name: Fetch upstream release tags for sync guard.
+        run: |
+          git fetch --depth 1 https://github.com/hjdhjd/homebridge-unifi-protect.git \
+            refs/tags/v8.1.0:refs/tags/v8.1.0 \
+            refs/tags/v8.2.2:refs/tags/v8.2.2
+
       - name: Install dependencies and run tests.
         env:
           CI: true
