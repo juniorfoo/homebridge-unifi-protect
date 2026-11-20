@@ -1,48 +1,37 @@
 # path:line:reason — deliberate fork deltas vs upstream v8.2.2
 docs/FeatureOptions.md:203:fork FeatureOptions / docs for copy-first and diagnostics
 docs/FeatureOptions.md:205:fork FeatureOptions / docs for copy-first and diagnostics
-src/media/stream.ts:1000:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1002:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1003:streamTestOptions harness hooks
 src/media/stream.ts:1004:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1005:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1006:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1006:fork logging / diagnostics on live start path
-src/media/stream.ts:1012:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1013:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1016:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1017:streamTestOptions harness hooks
+src/media/stream.ts:1009:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1010:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1050:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1051:Hbpu abort normalization at copy escalation
 src/media/stream.ts:1052:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:106:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1072:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1078:pool-sharing rule wording (fork copy-first pools)
+src/media/stream.ts:1078:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1079:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1087:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1088:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1089:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1091:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1092:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1093:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1094:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1105:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1106:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1107:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1111:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1112:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1113:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1114:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1118:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1119:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1125:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1126:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1174:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1187:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1211:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1212:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1180:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1204:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1205:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:126:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:127:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1290:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:12:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1342:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1343:Hbpu abort normalization at copy escalation
-src/media/stream.ts:1344:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1339:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1340:Hbpu abort normalization at copy escalation
+src/media/stream.ts:1341:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1360:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1361:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1362:fork copy-first live start path vs upstream transcode-default
@@ -55,10 +44,10 @@ src/media/stream.ts:1401:fork copy-first live start path vs upstream transcode-d
 src/media/stream.ts:1402:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1405:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1406:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1435:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1432:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1438:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1439:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1441:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1441:pool-sharing rule wording (fork copy-first pools)
-src/media/stream.ts:1442:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1443:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1444:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1445:fork copy-first live start path vs upstream transcode-default
@@ -69,9 +58,6 @@ src/media/stream.ts:1458:fork copy-first live start path vs upstream transcode-d
 src/media/stream.ts:1459:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1460:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1461:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1464:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1465:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1466:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1486:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1488:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1489:fork copy-first live start path vs upstream transcode-default
@@ -89,46 +75,35 @@ src/media/stream.ts:1516:fork copy-first live start path vs upstream transcode-d
 src/media/stream.ts:1517:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1518:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1520:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1682:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1752:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1753:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1754:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1755:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1804:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1805:Hbpu abort normalization at copy escalation
-src/media/stream.ts:1806:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1687:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1757:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1758:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1759:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1760:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:1809:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1812:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:1813:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:189:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:190:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:191:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1810:Hbpu abort normalization at copy escalation
+src/media/stream.ts:1811:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1814:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1817:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:1818:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:19:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:211:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:212:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:213:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:214:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:216:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:235:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:236:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:237:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:259:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:343:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:344:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:402:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:403:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:404:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:263:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:484:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:543:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:544:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:545:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:547:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:553:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:555:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:579:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:603:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:605:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:613:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:615:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:606:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:608:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:616:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:618:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:638:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:663:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:664:fork copy-first live start path vs upstream transcode-default
@@ -138,13 +113,12 @@ src/media/stream.ts:668:fork copy-first live start path vs upstream transcode-de
 src/media/stream.ts:669:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:670:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:675:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:676:streamTestOptions harness hooks
+src/media/stream.ts:676:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:732:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:733:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:736:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:737:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:738:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:739:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:740:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:741:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:742:fork copy-first live start path vs upstream transcode-default
@@ -155,7 +129,6 @@ src/media/stream.ts:75:fork copy-first live start path vs upstream transcode-def
 src/media/stream.ts:762:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:763:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:764:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:765:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:766:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:767:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:768:fork copy-first live start path vs upstream transcode-default
@@ -171,20 +144,18 @@ src/media/stream.ts:778:fork copy-first live start path vs upstream transcode-de
 src/media/stream.ts:779:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:780:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:781:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:782:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:783:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:784:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:785:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:786:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:787:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:795:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:7:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:827:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:843:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:848:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:845:fork copy-first live start path vs upstream transcode-default
+src/media/stream.ts:850:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:857:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:881:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:895:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:898:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:899:restored upstream debug bitrate line
 src/media/stream.ts:8:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:900:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:902:fork copy-first live start path vs upstream transcode-default
@@ -198,12 +169,7 @@ src/media/stream.ts:954:fork copy-first live start path vs upstream transcode-de
 src/media/stream.ts:958:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:95:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:963:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:993:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:995:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:996:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:997:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:998:fork copy-first live start path vs upstream transcode-default
-src/media/stream.ts:999:fork copy-first live start path vs upstream transcode-default
 src/media/stream.ts:9:Hbpu abort normalization at copy escalation
 src/media/testing.helpers.ts:278:FO2 fanout double / harness helpers
 src/media/testing.helpers.ts:281:FO2 fanout double / harness helpers
