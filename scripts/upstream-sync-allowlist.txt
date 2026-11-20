@@ -1,6 +1,6 @@
 # path:line:reason — deliberate fork deltas vs upstream v8.2.2
-LOST:docs/FeatureOptions.md:203:docs list upstream Video.Transcode.Bitrate=<value> syntax; fork keeps legacy dot form
-LOST:docs/FeatureOptions.md:205:docs FeatureOptions row differs from upstream v8.2.2 generated bitrate option names
+LOST:docs/FeatureOptions.md:203:upstream v8.2.2 Transcode.Bitrate row ignores HomeKit bitrate; HEAD row matches fork options.ts (zero hint uses HomeKit request, capped at source)
+LOST:docs/FeatureOptions.md:205:upstream v8.2.2 HighLatency.Bitrate row ignores HomeKit; HEAD row matches fork options.ts zero-hint + cap semantics
 LOST:src/media/stream.ts:7:upstream v8.2.2 import list differs after stream-live extraction and policy modules
 LOST:src/media/stream.ts:8:upstream v8.2.2 import line absent on fork head after stream-live module extraction (import block differs)
 LOST:src/media/stream.ts:9:upstream v8.2.2 import line absent on fork head after stream-live module extraction (import block differs)
