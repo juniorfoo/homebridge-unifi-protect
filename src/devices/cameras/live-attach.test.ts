@@ -5,42 +5,40 @@
  * doorbell-ness.
  *
  * Suite C (live-attach) drives a real ProtectCamera constructed as a plain camera (isDoorbell false, a real stub-factory stream built with builtFor.isDoorbell false) and
- * pushes isDoorbell true: the always-armed isDoorbell observer attaches it, and the featureFlags observer drives the capability reconcile, whose audio rebuild
- * fires the in-place controller rebuild a late doorbell-ness needs. The capability attaches, the Doorbell service is primary, the census grows to eighteen, the
+ * pushes isDoorbell true: the always-armed isDoorbell observer attaches it, and the featureFlags observer drives the capability reconcile, whose controller-identity
+ * reconcile fires the in-place controller rebuild a late doorbell-ness needs. The capability attaches, the Doorbell service is primary, the census grows to nineteen, the
  * accessory's ordered controller-event log shows EXACTLY one removeController then one configureController (the rebuild), the stream's builtFor.isDoorbell is now
  * true, the ring MQTT is registered exactly once, and one promotion INFO is logged. It then pins the no-churn cases: a construction-attach (a flag-true construction)
- * yields the same service set with ZERO removeController (the stub stream is built with builtFor.isDoorbell true, so the gate is a no-op), an idempotent re-push does
+ * yields the same service set with ZERO removeController (the stub stream is built with builtFor.isDoorbell true, so the gate is a no-op), an unchanged re-push does
  * not re-attach or churn the controller, a within-drain flap self-collapses to no WARN and no churn, and a SETTLED demotion raises exactly one WARN while removing
  * nothing. Suite D (sweep-stale) pre-seeds a plain camera accessory with stale doorbell-only services and asserts removeServices strips exactly those - the chime
  * switches, the volume lightbulb, the auth sensor, and a message switch - while leaving the Doorbell, mute, HKSV-recording, and UFP-recording switches untouched, and
- * asserts the stub delegate's builtFor.isDoorbell tracks the constructed isDoorbell (the harness observability into the otherwise-frozen audio derivation).
+ * asserts the stub delegate's builtFor.isDoorbell tracks the constructed isDoorbell (the harness observability into the otherwise-frozen controller identity).
  *
  * Honesty notes recorded rather than papered over: the hub-side behavior of the rebuilt CameraController (the HKSV factory reset, the supported-config hash change) is a
  * live-gate concern - the harness proves the remove-then-configure ORDERING and COUNT at this event, which is the assertable contract; and the post-attach ring-delivery
  * path is exercised only to the registration boundary (the subscription is recorded), not through a live MQTT broker.
  */
 import { G2_PRO_CHANNELS, G6_PRO_ENTRY_CHANNELS } from "../../camera.fixtures.ts";
-import { Service, TestCameraProjection, TestStateStore, makeCameraConfig, makeProtectState, makeTestAccessory, makeTestNvr, settle } from "../../testing.helpers.ts";
-import type { TestAccessory, TestLogEntry, TestProtectNvr } from "../../testing.helpers.ts";
+import { Service, TestStateStore, controllerEvents, makeProtectState, makeTestAccessory } from "../../testing.helpers.ts";
+import { TestCameraProjection, makeCameraConfig } from "../testing.helpers.ts";
 import { describe, test } from "node:test";
+import { logCount, settle } from "homebridge-plugin-utils/testing";
+import { makeTestNvr, restoreAccessories } from "../../nvr/testing.helpers.ts";
+import { ACCESSORY_SAVE_WINDOW_MS } from "homebridge-plugin-utils";
 import type { Camera } from "unifi-protect";
-import type { ProtectAccessory } from "../../types.ts";
 import { ProtectCamera } from "./camera.ts";
 import type { ProtectNvr } from "../../nvr/nvr.ts";
 import { ProtectReservedNames } from "../../types.ts";
+import type { TestProtectAccessory } from "../../testing.helpers.ts";
+import type { TestProtectNvr } from "../../nvr/testing.helpers.ts";
 import assert from "node:assert/strict";
+import { configured } from "../device-base.ts";
 
-// Construct a real ProtectCamera, with the casts confined to this one seam - the instance under test is the production class and its composed capability.
-function construct(nvr: TestProtectNvr, accessory: TestAccessory, projection: TestCameraProjection): ProtectCamera {
+// Construct a real ProtectCamera, with the casts confined to this one boundary - the instance under test is the production class and its composed capability.
+function construct(nvr: TestProtectNvr, accessory: TestProtectAccessory, projection: TestCameraProjection): ProtectCamera {
 
-  return new ProtectCamera(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Camera);
-}
-
-// The count of log lines at the given level whose rendered text contains the given fragment - the harness records the line the real Homebridge logger would emit into
-// entry.formatted, so we match against that rendered line.
-function countLogs(entries: TestLogEntry[], level: TestLogEntry["level"], fragment: string): number {
-
-  return entries.filter((entry) => (entry.level === level) && entry.formatted.includes(fragment)).length;
+  return configured(new ProtectCamera(nvr as unknown as ProtectNvr, accessory, projection as unknown as Camera));
 }
 
 describe("live-attach reclassification (suite C)", () => {
@@ -50,7 +48,7 @@ describe("live-attach reclassification (suite C)", () => {
     const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { isDoorbell: false }, name: "Front Door" });
     const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
     const { controller, logEntries, mqtt, nvr } = makeTestNvr({ mqtt: true, store });
-    const accessory = makeTestAccessory("Front Door", "uuid:74ACB9000001");
+    const accessory = makeTestAccessory("Front Door", "74ACB9000001");
     const camera = construct(nvr, accessory, new TestCameraProjection(cameraConfig.id, store));
 
     await settle();
@@ -60,8 +58,8 @@ describe("live-attach reclassification (suite C)", () => {
     assert.equal(camera.stream?.builtFor.isDoorbell, false, "the construction-built stream was built for a non-doorbell");
     assert.equal(accessory.getService(Service.Doorbell), undefined, "no Doorbell service exists before the flip");
 
-    const churnBaseline = accessory.controllerEvents.length;
-    const ringBefore = mqtt?.subscriptions.filter((subscription) => subscription.topic.endsWith("/doorbell")).length ?? 0;
+    const churnBaseline = controllerEvents(accessory).length;
+    const ringBefore = mqtt?.subscriptions.filter((subscription) => subscription.topic.endsWith("/doorbell/set")).length ?? 0;
 
     assert.equal(ringBefore, 0, "the plain camera registered no ring-trigger MQTT");
 
@@ -70,31 +68,31 @@ describe("live-attach reclassification (suite C)", () => {
 
     await settle();
 
-    // The capability composed onto the running instance, the Doorbell service is present and primary, and the census grew to eighteen (the capability four onto the
-    // plain-camera-plus-base fourteen, which already carries the always-armed isDoorbell observer, the bare-motion lastMotion observer, the capability-reconcile
-    // featureFlags observer, and the Access-lock supportUnlock observer).
+    // The capability composed onto the running instance, the Doorbell service is present and primary, and the census grew to nineteen (the capability four onto the
+    // plain-camera-plus-base fifteen, which already carries the always-armed isDoorbell observer, the bare-motion lastMotion observer, the capability-reconcile
+    // featureFlags observer, the Access-lock supportUnlock observer, and the HomeKit Secure Video eligibility observer).
     assert.ok(camera.doorbell, "the doorbell capability attached onto the live camera");
 
     const doorbellService = accessory.getService(Service.Doorbell);
 
     assert.ok(doorbellService, "the Doorbell service now exists");
-    assert.equal(doorbellService.isPrimary, true, "the Doorbell service is primary");
-    assert.equal(store.observerCount, 18, "the promoted camera carries the eighteen-observer doorbell census");
+    assert.equal(doorbellService.isPrimaryService, true, "the Doorbell service is primary");
+    assert.equal(store.observerCount, 20, "the promoted camera carries the doorbell census, with its MQTT availability observer");
 
     // The rebuild fires exactly one removeController then one configureController, in that order, at this event, since the CameraController is the one HAP
     // object that cannot change in place and must be torn down and reconfigured to pick up the HKSV factory reset and supported-config hash change.
-    const churn = accessory.controllerEvents.slice(churnBaseline);
+    const churn = controllerEvents(accessory).slice(churnBaseline);
 
     assert.equal(churn.length, 2, "the rebuild fired exactly two controller events");
     assert.equal(churn[0]?.kind, "remove", "the first controller event is the removeController");
     assert.equal(churn[1]?.kind, "configure", "the second controller event is the configureController");
 
     // The freshly built stream is now built for a doorbell, and the ring MQTT registered exactly once.
-    assert.equal(camera.stream?.builtFor.isDoorbell, true, "the rebuilt stream is now built for a doorbell");
-    assert.equal(mqtt?.subscriptions.filter((subscription) => subscription.topic.endsWith("/doorbell")).length, 1, "the ring-trigger MQTT registered exactly once");
+    assert.equal(camera.stream.builtFor.isDoorbell, true, "the rebuilt stream is now built for a doorbell");
+    assert.equal(mqtt?.subscriptions.filter((subscription) => subscription.topic.endsWith("/doorbell/set")).length, 1, "the ring-trigger MQTT registered exactly once");
 
     // Exactly one user-facing promotion INFO.
-    assert.equal(countLogs(logEntries, "info", "now reports this camera as a doorbell"), 1, "the promotion logged exactly one INFO line");
+    assert.equal(logCount(logEntries, "info", "now reports this camera as a doorbell"), 1, "the promotion logged exactly one INFO line");
 
     controller.abort();
   });
@@ -104,7 +102,7 @@ describe("live-attach reclassification (suite C)", () => {
     const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { isDoorbell: true }, name: "Front Door" });
     const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
     const { controller, nvr } = makeTestNvr({ store });
-    const accessory = makeTestAccessory("Front Door", "uuid:74ACB9000002");
+    const accessory = makeTestAccessory("Front Door", "74ACB9000002");
     const camera = construct(nvr, accessory, new TestCameraProjection(cameraConfig.id, store));
 
     await settle();
@@ -112,20 +110,20 @@ describe("live-attach reclassification (suite C)", () => {
     // The same end state as the late flip - the capability and a primary Doorbell service - but the stream was built for a doorbell at construction, so the rebuild gate
     // never fired: exactly one configureController and ZERO removeController.
     assert.ok(camera.doorbell, "the construction-attach produced the capability");
-    assert.equal(accessory.getService(Service.Doorbell)?.isPrimary, true, "the Doorbell service is present and primary");
-    assert.equal(accessory.removeControllerCalls.length, 0, "a construction-attach performs zero removeController - no stale controller to rebuild");
-    assert.equal(accessory.configureControllerCalls.length, 1, "the construction-attach registered its controller exactly once");
+    assert.equal(accessory.getService(Service.Doorbell)?.isPrimaryService, true, "the Doorbell service is present and primary");
+    assert.deepEqual(controllerEvents(accessory).map((event) => event.kind), ["configure"],
+      "a construction-attach registered its controller exactly once and removed none - no stale controller to rebuild");
     assert.equal(camera.stream?.builtFor.isDoorbell, true, "the construction-built stream was built for a doorbell from the start");
 
     controller.abort();
   });
 
-  test("an idempotent re-push of isDoorbell does not re-attach or churn the controller", async () => {
+  test("a repeated isDoorbell push does not re-attach or churn the controller", async () => {
 
     const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { isDoorbell: false }, name: "Front Door" });
     const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
     const { controller, nvr } = makeTestNvr({ store });
-    const accessory = makeTestAccessory("Front Door", "uuid:74ACB9000003");
+    const accessory = makeTestAccessory("Front Door", "74ACB9000003");
     const camera = construct(nvr, accessory, new TestCameraProjection(cameraConfig.id, store));
 
     await settle();
@@ -133,7 +131,7 @@ describe("live-attach reclassification (suite C)", () => {
     await settle();
 
     const capabilityAfterFirst = camera.doorbell;
-    const churnAfterFirst = accessory.controllerEvents.length;
+    const churnAfterFirst = controllerEvents(accessory).length;
 
     // A second push of the same value: the store dedups it, but even a redundant wake resolves to "none" (hasCapability true, isDoorbell true), so nothing re-attaches
     // and the controller does not churn.
@@ -141,7 +139,7 @@ describe("live-attach reclassification (suite C)", () => {
     await settle();
 
     assert.equal(camera.doorbell, capabilityAfterFirst, "the same capability instance persists - no re-attach");
-    assert.equal(accessory.controllerEvents.length, churnAfterFirst, "the redundant push drove zero further controller churn");
+    assert.equal(controllerEvents(accessory).length, churnAfterFirst, "the redundant push drove zero further controller churn");
 
     controller.abort();
   });
@@ -151,13 +149,13 @@ describe("live-attach reclassification (suite C)", () => {
     const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { isDoorbell: true }, name: "Front Door" });
     const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
     const { controller, logEntries, nvr } = makeTestNvr({ store });
-    const accessory = makeTestAccessory("Front Door", "uuid:74ACB9000004");
+    const accessory = makeTestAccessory("Front Door", "74ACB9000004");
     const camera = construct(nvr, accessory, new TestCameraProjection(cameraConfig.id, store));
 
     await settle();
 
     const warnBaseline = logEntries.filter((entry) => entry.level === "warn").length;
-    const churnBaseline = accessory.controllerEvents.length;
+    const churnBaseline = controllerEvents(accessory).length;
 
     // The flap: isDoorbell drops then returns before any consumer drains. The reconcile re-reads live state, which has recovered to true, so it resolves to "none".
     store.pushCameraFeatureFlags(cameraConfig.id, { isDoorbell: false });
@@ -167,17 +165,18 @@ describe("live-attach reclassification (suite C)", () => {
 
     assert.ok(camera.doorbell, "the capability survives the flap");
     assert.equal(logEntries.filter((entry) => entry.level === "warn").length, warnBaseline, "the within-drain flap raised no withdrawal warning");
-    assert.equal(accessory.controllerEvents.length, churnBaseline, "the flap drove zero controller churn");
+    assert.equal(controllerEvents(accessory).length, churnBaseline, "the flap drove zero controller churn");
 
     controller.abort();
   });
 
   test("a settled demotion raises exactly one withdrawal warning and removes nothing", async () => {
 
-    const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { isDoorbell: true }, name: "Front Door" });
+    // The doorbell carries a microphone, so the demotion's block keeps a true flag and is a reading rather than the controller's drain frame.
+    const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { hasMic: true, isDoorbell: true }, name: "Front Door" });
     const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
     const { controller, logEntries, nvr } = makeTestNvr({ store });
-    const accessory = makeTestAccessory("Front Door", "uuid:74ACB9000005");
+    const accessory = makeTestAccessory("Front Door", "74ACB9000005");
     const camera = construct(nvr, accessory, new TestCameraProjection(cameraConfig.id, store));
 
     await settle();
@@ -195,19 +194,64 @@ describe("live-attach reclassification (suite C)", () => {
 
     controller.abort();
   });
+
+  /* The controller's drain frame against a real demotion. A deep re-adopt delivers the whole featureFlags block with every flag false before the real values follow,
+   * so the doorbell reads false alongside every other flag and the narrator has to read the block as no reading: no withdrawal is warned and the doorbell's services
+   * stay. Once the real values land, a genuine demotion - isDoorbell false beside a microphone the block still reports - warns exactly once.
+   */
+  test("the drain frame raises no doorbell withdrawal and keeps the services, while a demotion beside a true flag warns once", async () => {
+
+    const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { hasMic: true, isDoorbell: true }, name: "Front Door" });
+    const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
+    const { controller, logEntries, nvr } = makeTestNvr({ store });
+    const accessory = makeTestAccessory("Front Door", "74ACB9000006");
+    const camera = construct(nvr, accessory, new TestCameraProjection(cameraConfig.id, store));
+    const withdrawal = "no longer reports this camera as a doorbell";
+
+    await settle();
+
+    assert.ok(camera.doorbell, "the doorbell capability attached at construction");
+
+    store.pushCameraFeatureFlagsDrain(cameraConfig.id);
+
+    await settle();
+
+    assert.equal(camera.ufp.featureFlags.isDoorbell, false, "the vacuity guard: the drain frame reads the doorbell false");
+    assert.equal(logCount(logEntries, "warn", withdrawal), 0, "the drain frame raised no doorbell withdrawal");
+    assert.ok(camera.doorbell, "the capability remains attached across the drain frame");
+    assert.ok(accessory.getService(Service.Doorbell), "the Doorbell service remains across the drain frame");
+
+    // The real values land, then the controller genuinely stops reporting the doorbell while the microphone stays reported.
+    store.pushCameraFeatureFlags(cameraConfig.id, { hasMic: true, hasMotionDetection: true, isDoorbell: true });
+
+    await settle();
+
+    store.pushCameraFeatureFlags(cameraConfig.id, { isDoorbell: false });
+
+    await settle();
+
+    assert.equal(logCount(logEntries, "warn", withdrawal), 1, "the genuine demotion raised exactly one doorbell withdrawal");
+    assert.ok(accessory.getService(Service.Doorbell), "the Doorbell service remains after the demotion warning");
+
+    camera.cleanup();
+    controller.abort();
+  });
 });
 
-describe("sweep-stale removal and the audio-derivation observability (suite D)", () => {
+describe("sweep-stale removal and the controller-identity observability (suite D)", () => {
 
   test("removeServices strips exactly the doorbell-only services, leaving the Doorbell, mute, HKSV, and UFP services untouched", () => {
 
-    // The SSOT removal contract, exercised directly through the NVR's sweep seam (which routes to the real DoorbellCapability.removeServices). We hand-seed an accessory
+    // The SSOT removal contract, exercised directly through the NVR's sweep hook (which routes to the real DoorbellCapability.removeServices). We hand-seed an accessory
     // with the doorbell-only services a demoted-while-down doorbell would leave behind, plus the camera-level / owned-elsewhere services that must survive, then assert
     // the sweep strips exactly the former. Driving removeServices directly isolates its own selectivity from the feature-gated construction configures (the mute switch,
     // HKSV switch, and Doorbell service each have their own removers in the construction path).
     const store = new TestStateStore(makeProtectState({ cameras: [makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { isDoorbell: false } })] }));
-    const { controller, nvr } = makeTestNvr({ store });
-    const accessory = makeTestAccessory("Front Door", "uuid:74ACB9000006");
+    const { api, clock, controller, nvr } = makeTestNvr({ store });
+    const accessory = makeTestAccessory("Front Door", "74ACB9000006");
+
+    // The accessory is the cached one a restart restores, on the bridge, so the persistence saves it.
+    restoreAccessories(nvr, [accessory]);
 
     // The doorbell-only services that must be removed.
     accessory.addService(Service.Switch, "Physical Chime None", ProtectReservedNames.SWITCH_DOORBELL_CHIME_NONE);
@@ -221,7 +265,7 @@ describe("sweep-stale removal and the audio-derivation observability (suite D)",
     accessory.addService(Service.Switch, "HKSV Recording", ProtectReservedNames.SWITCH_HKSV_RECORDING);
     accessory.addService(Service.Switch, "UFP Recording Always", ProtectReservedNames.SWITCH_UFP_RECORDING_ALWAYS);
 
-    nvr.removeStaleDoorbellServices(accessory as unknown as ProtectAccessory);
+    nvr.removeStaleDoorbellServices(accessory);
 
     // The doorbell-only services are gone.
     assert.equal(accessory.getServiceById(Service.Switch, ProtectReservedNames.SWITCH_DOORBELL_CHIME_NONE), undefined, "the physical-chime switch was swept");
@@ -235,6 +279,19 @@ describe("sweep-stale removal and the audio-derivation observability (suite D)",
     assert.ok(accessory.getServiceById(Service.Switch, ProtectReservedNames.SWITCH_HKSV_RECORDING), "the HKSV-recording switch is untouched by removeServices");
     assert.ok(accessory.getServiceById(Service.Switch, ProtectReservedNames.SWITCH_UFP_RECORDING_ALWAYS), "the UFP-recording switch is untouched by removeServices");
 
+    // A sweep that removed something marks the accessory, so the window it opened saves it once, while a sweep with nothing left to remove marks nothing, so a steady
+    // plain camera's sweep asks for no save.
+    const saves = (): number => api.calls.filter((call) => (call.kind === "update") && call.accessories.includes(accessory)).length;
+
+    clock.advance(ACCESSORY_SAVE_WINDOW_MS);
+
+    assert.equal(saves(), 1, "the sweep that removed services saved the accessory once");
+
+    nvr.removeStaleDoorbellServices(accessory);
+    clock.advance(ACCESSORY_SAVE_WINDOW_MS);
+
+    assert.equal(saves(), 1, "a sweep with nothing left to remove asks for no save");
+
     controller.abort();
   });
 
@@ -246,7 +303,7 @@ describe("sweep-stale removal and the audio-derivation observability (suite D)",
     const cameraConfig = makeCameraConfig({ channels: G6_PRO_ENTRY_CHANNELS, featureFlags: { isDoorbell: false }, name: "Front Door" });
     const store = new TestStateStore(makeProtectState({ cameras: [cameraConfig] }));
     const { controller, nvr } = makeTestNvr({ store });
-    const accessory = makeTestAccessory("Front Door", "uuid:74ACB9000009");
+    const accessory = makeTestAccessory("Front Door", "74ACB9000009");
 
     accessory.addService(Service.Switch, "Physical Chime None", ProtectReservedNames.SWITCH_DOORBELL_CHIME_NONE);
     accessory.addService(Service.Lightbulb, "Chime Volume", ProtectReservedNames.LIGHTBULB_DOORBELL_VOLUME);
@@ -264,19 +321,19 @@ describe("sweep-stale removal and the audio-derivation observability (suite D)",
     controller.abort();
   });
 
-  test("the stub delegate's builtFor.isDoorbell tracks the constructed isDoorbell - the harness observability into the frozen audio derivation", async () => {
+  test("the stub delegate's builtFor.isDoorbell tracks the constructed isDoorbell - the harness observability into the frozen controller identity", async () => {
 
-    // A plain camera builds a stream for a non-doorbell; a doorbell builds one for a doorbell. This is the only harness window into the otherwise constructor-frozen
-    // audio-options derivation, and it is exactly the value the capability reconcile's staleness gate reads.
+    // A plain camera builds a stream for a non-doorbell; a doorbell builds one for a doorbell. This is the harness window into the otherwise constructor-frozen
+    // controller identity, and it is exactly the value the capability reconcile's staleness gate reads.
     const plainConfig = makeCameraConfig({ channels: G2_PRO_CHANNELS, featureFlags: { isDoorbell: false } });
     const plainStore = new TestStateStore(makeProtectState({ cameras: [plainConfig] }));
     const plain = makeTestNvr({ store: plainStore });
-    const plainCamera = construct(plain.nvr, makeTestAccessory("Plain", "uuid:74ACB9000007"), new TestCameraProjection(plainConfig.id, plainStore));
+    const plainCamera = construct(plain.nvr, makeTestAccessory("Plain", "74ACB9000007"), new TestCameraProjection(plainConfig.id, plainStore));
 
     const doorbellConfig = makeCameraConfig({ channels: G2_PRO_CHANNELS, featureFlags: { isDoorbell: true } });
     const doorbellStore = new TestStateStore(makeProtectState({ cameras: [doorbellConfig] }));
     const door = makeTestNvr({ store: doorbellStore });
-    const doorbellCamera = construct(door.nvr, makeTestAccessory("Doorbell", "uuid:74ACB9000008"), new TestCameraProjection(doorbellConfig.id, doorbellStore));
+    const doorbellCamera = construct(door.nvr, makeTestAccessory("Doorbell", "74ACB9000008"), new TestCameraProjection(doorbellConfig.id, doorbellStore));
 
     await settle();
 

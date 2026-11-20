@@ -2,56 +2,19 @@
  *
  * fob.ts: Fob device class for UniFi Protect.
  */
-import type { Fob, ProtectFobConfig } from "unifi-protect";
-import type { ProtectAccessory, WithoutIdentity } from "../types.ts";
-import type { Nullable } from "homebridge-plugin-utils";
+import { USL_FOB_BUTTONS, resolveFobButtons } from "./fob-buttons.ts";
+import { presenceChanged, validCharacteristic } from "homebridge-plugin-utils";
+import type { Fob } from "unifi-protect";
+import type { FobButton } from "./fob-buttons.ts";
+import type { ProtectAccessory } from "../types.ts";
 import { ProtectDevice } from "./device.ts";
 import type { ProtectNvr } from "../nvr/nvr.ts";
 import { ProtectReservedNames } from "../types.ts";
-import { deviceSelectors } from "unifi-protect";
+import { describeDeviceModel } from "./device-descriptor.ts";
+import { isDeviceAdopted } from "unifi-protect";
 
-// One physical button on a UniFi Protect fob. index is the STABLE 1-based ServiceLabelIndex the button always carries in HomeKit (never a compacted visible-subset
-// position, so a hidden earlier button never renumbers a later one), following the controller's own button numbering. label is the security-action display name AND the
-// stable per-button feature-option identity (Fob.Button.<label>); that identity never follows the controller's active button labeling. positionLabel is the display name
-// the controller's position-hint labeling assigns the button. wireId is the lowercase protocol id the controller's buttonPressed occurrence carries in its `button`
-// field. label and wireId are deliberately distinct derivations - the protocol id is not a display string and must never drift toward one.
-interface FobButton {
-
-  readonly index: number;
-  readonly label: string;
-  readonly positionLabel: string;
-  readonly wireId: string;
-}
-
-// The fixed, region-agnostic button table for the UniFi fob family. The controller config carries no per-button array (a fob is a pure-input device whose presses arrive
-// only as firehose occurrences), so the plugin authors the button set from live-captured wire truth: six buttons whose wire ids are stable across the controller's
-// button-labeling modes. The indices follow the controller's own button numbering - the numbers its position-hint labeling assigns - so HomeKit's button ordering matches
-// the controller's in both label modes. Because the wire ids are labeling-independent, this table, not the controller's labeling choice, is the button-identity source of
-// truth, and it fixes each button's 1-based ServiceLabelIndex.
-const USL_FOB_BUTTONS: readonly FobButton[] = [
-
-  { index: 1, label: "Arm", positionLabel: "1", wireId: "arm" },
-  { index: 2, label: "Night", positionLabel: "2", wireId: "night" },
-  { index: 3, label: "Disarm", positionLabel: "3", wireId: "disarm" },
-  { index: 4, label: "Panic", positionLabel: "4", wireId: "panic" },
-  { index: 5, label: "Right", positionLabel: "Right", wireId: "right" },
-  { index: 6, label: "Left", positionLabel: "Left", wireId: "left" }
-];
-
-// The single region-agnostic chokepoint that decides which button table a fob record maps to, or null when the fob is not a recognized family. It is deliberately
-// nullish-safe: marketName and type are declared non-optional but are runtime-optional (the same caution the base setInfo documents), so a record missing both resolves
-// to null rather than throwing. A fob is recognized when its marketName is exactly "USL Fob" OR its type carries the "USL-Fob-" family prefix.
-function resolveFobButtons(config: ProtectFobConfig): Nullable<readonly FobButton[]> {
-
-  // marketName is optional at runtime despite its non-optional declared type, so the nullish handling below is real, not redundant.
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-  return ((config.marketName === "USL Fob") || (config.type?.startsWith("USL-Fob-") ?? false)) ? USL_FOB_BUTTONS : null;
-}
-
-export class ProtectFob extends ProtectDevice {
-
-  // Narrow the inherited projection handle to the fob projection so the read-through config getter resolves to ProtectFobConfig.
-  declare protected readonly device: Fob;
+// Projects one UniFi Protect LoRa fob's fixed button set and battery state onto a HomeKit accessory.
+export class ProtectFob extends ProtectDevice<Fob> {
 
   // The fob's button table, resolved ONCE from the immutable model identity (marketName/type) at construction. This is a documented, principled exemption to the
   // read-live discipline: the button set is static MODEL identity, not cached live STATE - a fob never changes which physical buttons it has - so resolving it once from
@@ -64,33 +27,21 @@ export class ProtectFob extends ProtectDevice {
     super(nvr, accessory, device);
 
     this.#buttons = resolveFobButtons(device.config) ?? [];
-
-    this.configureHints();
-    this.configureDevice();
-    this.spawnObservers();
   }
 
-  // Read-through to the fob projection's live STATE, narrowed to drop device identity (id/mac/modelKey). Identity flows through the dedicated non-throwing accessors
-  // (protectId/modelKey/.id/.mac), never this throwing config getter; this override mirrors the base getter's body and narrows only the surfaced return type.
-  public override get ufp(): Readonly<WithoutIdentity<ProtectFobConfig>> {
+  // A fob's half of availability is its adoption alone. An idle fob reads disconnected to save its battery and is still there, so the controller's connection report
+  // says nothing about it, and a fob refuses only when the controller is lost or rebooting, or the fob is unadopted or gone.
+  protected override get recordAvailable(): boolean {
 
-    return this.device.config;
+    return this.fromRecord(isDeviceAdopted, false);
   }
 
-  // The stable HomeKit service subtype for one button's stateless-programmable-switch service, keyed by the LOWERCASE wire id. Single-sourced so the create site here and
-  // the router's delivery address (SWITCH_FOB_BUTTON + "." + event.button) name the identical service; a create/address divergence would make getServiceById silently
-  // return undefined and no press would ever fire.
+  // The stable HomeKit service subtype for one button's stateless-programmable-switch service, keyed by the LOWERCASE wire id - the same identity the buttons selection
+  // stores. Single-sourced so the create site here and the router's delivery address (SWITCH_FOB_BUTTON + "." + event.button) name the identical service; a
+  // create/address divergence would make getServiceById silently return undefined and no press would ever fire.
   private buttonSubtype(button: FobButton): string {
 
     return ProtectReservedNames.SWITCH_FOB_BUTTON + "." + button.wireId;
-  }
-
-  // The per-button feature-option identity, keyed by the TITLE-CASED display label so the config reads as "Fob.Button.Panic". Distinct from buttonSubtype by design: the
-  // subtype speaks the protocol (lowercase wire id), the option speaks to the user (title-cased label). Single-sourced so the create-time gate and the option-resolution
-  // test address the identical option string.
-  private buttonOption(button: FobButton): string {
-
-    return "Fob.Button." + button.label;
   }
 
   // Resolve one button's active HomeKit display name from the fob's live button labeling. The position-hint comparison is deliberately the only labeling mode this method
@@ -102,7 +53,7 @@ export class ProtectFob extends ProtectDevice {
   }
 
   // Initialize and configure the fob accessory for HomeKit.
-  private configureDevice(): boolean {
+  protected override configureDevice(): boolean {
 
     // Reset the persisted context to a clean slate and reseed identity, discarding any stray keys a prior configuration of this same accessory left behind. The fob
     // persists no user state, so nothing is preserved across the reset.
@@ -122,20 +73,20 @@ export class ProtectFob extends ProtectDevice {
 
   // Configure a HomeKit stateless-programmable-switch for each of the fob's buttons, grouped under a ServiceLabel when two or more are visible. A fob is a pure-input
   // device: the leaf creates the services here and the event-dispatch router delivers the presses, so there are no onGet/onSet handlers on this path. The button set is
-  // fixed model identity, so this runs once at construction. Each button is individually show/hide-able through its own feature option, and hiding one prunes exactly its
-  // switch. Repeat-safe across restarts and option flips: the ServiceLabel and every switch are validated against the current visibility before being acquired, and a
-  // switch surviving from a prior grouped configure has its stale ServiceLabelIndex dropped when the fob regroups down to a lone visible button. Once the switches are in
-  // place, a configure-time name reconcile brings every button's ConfiguredName to the controller's active button labeling, covering accessories restored from cache and
-  // labeling changes that landed while Homebridge was down.
+  // fixed model identity, so this runs once, when the fob is configured. Which buttons appear is a single selection the user edits as one list, and leaving one out
+  // prunes exactly its switch. Repeat-safe across restarts and option flips: the ServiceLabel and every switch are validated against the current visibility before being
+  // acquired, and a switch surviving from a prior grouped configure has its stale ServiceLabelIndex dropped when the fob regroups down to a lone visible button. Once the
+  // switches are in place, a configure-time name reconcile brings every button's ConfiguredName to the controller's active button labeling, covering accessories restored
+  // from cache and labeling changes that landed while Homebridge was down.
   private configureButtons(): void {
 
     // An unrecognized fob has no button table, so we expose it Battery-only and surface one actionable line - never a silent adoption. The model read is non-throwing: an
     // absent record (a fob lingering in the removal grace) resolves the "unknown" sentinel rather than throwing.
     if(!this.#buttons.length) {
 
-      // marketName is optional at runtime despite its non-optional declared type, so the nullish fallback to type is real, not redundant.
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      const model = this.fromRecord((config) => config.marketName ?? config.type, "unknown");
+      // The "unknown" default covers an absent record; a present one renders its model through the shared resolver, so the warning names the fob exactly as every
+      // other line naming that hardware does.
+      const model = this.fromRecord(describeDeviceModel, "unknown");
 
       this.log.warn("This fob (%s) is not a recognized model, so its buttons were not added to HomeKit. Please open an issue with a capture of a button press so " +
         "support can be added.", model);
@@ -143,61 +94,64 @@ export class ProtectFob extends ProtectDevice {
       return;
     }
 
+    // The buttons the user selected, resolved once for the whole pass so the grouping decision below and the per-button gate in the loop read one answer. The domain is
+    // this fob's own button table, addressed by wire id, so a selection naming a button this model does not have simply does not appear.
+    const selected = new Set(this.getFeatureList("Fob.Buttons", USL_FOB_BUTTONS.map((button) => button.wireId)));
+
     // The visible subset drives the grouping decision. HAP models a multi-button remote as a ServiceLabel plus one StatelessProgrammableSwitch per button (spec 8.21),
     // but a lone button needs no label, so we group only when two or more buttons are actually visible.
-    const visible = this.#buttons.filter((button) => this.hasFeature(this.buttonOption(button)));
+    const visible = this.#buttons.filter((button) => selected.has(button.wireId));
     const grouped = visible.length >= 2;
 
-    // Validate the ServiceLabel against the grouping decision - a fob that drops below two visible buttons (an option flip across a restart) has its label removed - then
-    // acquire it and set its namespace when grouped. serviceLabel non-null is the single source of truth for "grouped" through the loop below.
-    this.validService(this.hap.Service.ServiceLabel, grouped);
-
-    const serviceLabel = grouped ? this.acquireService(this.hap.Service.ServiceLabel) : null;
+    // Validate the ServiceLabel against the grouping decision - a fob that drops below two visible buttons (an option flip across a restart) has its label removed, and a
+    // grouped fob acquires it - then set its namespace when grouped. The grouping decision is also the verdict each button's label index follows in the loop below, so
+    // the label is present exactly when the buttons carry an index to link to it.
+    const { service: serviceLabel } = this.validService({ serviceType: this.hap.Service.ServiceLabel, validate: grouped });
 
     if(serviceLabel) {
 
       serviceLabel.updateCharacteristic(this.hap.Characteristic.ServiceLabelNamespace, this.hap.Characteristic.ServiceLabelNamespace.ARABIC_NUMERALS);
+      this.answerHeld(serviceLabel, this.hap.Characteristic.ServiceLabelNamespace);
     }
 
-    // Iterate the full fixed table, gating each button's switch on its own feature option. Hiding a button prunes exactly its subtyped switch and leaves the siblings and
-    // the accessory intact.
+    // Iterate the full fixed table, gating each button's switch on the selection. Leaving a button out prunes exactly its subtyped switch and leaves the siblings and the
+    // accessory intact.
     for(const button of this.#buttons) {
 
       const subtype = this.buttonSubtype(button);
 
-      // Validate whether this button's switch should exist, gating on the per-button feature option. This prunes exactly this button's subtyped switch when hidden.
-      if(!this.validService(this.hap.Service.StatelessProgrammableSwitch, this.hasFeature(this.buttonOption(button)), subtype)) {
+      // Validate whether this button's switch should exist, gating on the selection resolved above. This prunes exactly this button's subtyped switch when it is left
+      // out of the list, and otherwise acquires it, named by the bare security-action label. displayName and the Name characteristic hold that label as the stable
+      // identity hap-nodejs revalidates through checkName on every construction, including cache-restore, where a single-character name would trip it; ConfiguredName
+      // carries the label the controller's active button labeling assigns, which is what the Home app shows for a grouped switch. The create callback initializes
+      // ConfiguredName so a fresh button is born correctly named and the reconcile below stays silent. An unqualified label reads cleanest ("Arm", not "<Fob> Arm"); the
+      // accessory already supplies the fob's context.
+      const { service } = this.validService({ name: button.label,
+        onServiceCreate: (svc) => svc.updateCharacteristic(this.hap.Characteristic.ConfiguredName, this.buttonName(button)),
+        serviceType: this.hap.Service.StatelessProgrammableSwitch, subtype, validate: selected.has(button.wireId) });
 
-        continue;
-      }
-
-      // Acquire the service, named by the bare security-action label. displayName and the Name characteristic hold that label as the stable identity hap-nodejs
-      // revalidates through checkName on every construction, including cache-restore, where a single-character name would trip it; ConfiguredName carries the label the
-      // controller's active button labeling assigns, which is what the Home app shows for a grouped switch. The create callback initializes ConfiguredName so a fresh
-      // button is born correctly named and the reconcile below stays silent. An unqualified label reads cleanest ("Arm", not "<Fob> Arm"); the accessory already supplies
-      // the fob's context.
-      const service = this.acquireService(this.hap.Service.StatelessProgrammableSwitch, button.label, subtype,
-        (svc) => svc.updateCharacteristic(this.hap.Characteristic.ConfiguredName, this.buttonName(button)));
-
-      // Fail gracefully.
       if(!service) {
 
-        this.log.error("Unable to add the fob button switch for %s.", button.label);
-
         continue;
       }
 
-      if(serviceLabel) {
+      // Validate the switch's ServiceLabelIndex against the same grouping decision. Lone visible, a switch restored from a prior grouped configure has its stale index
+      // removed, while a freshly created lone switch is left untouched, so a single-button fob presents no index and links to no label.
+      const transition = validCharacteristic({ characteristic: this.hap.Characteristic.ServiceLabelIndex, service, validate: grouped });
 
-        // Grouped: stamp the STABLE fixed table index (never the visible-subset position, so hiding an earlier button never renumbers a later one) and link the switch to
-        // the label so HomeKit renders them as one remote.
+      // An index the gate attached or removed changes the switch Homebridge's accessory cache holds, so the accessory is marked for the next save.
+      if(presenceChanged(transition)) {
+
+        this.platform.persistence.persist(this.accessory);
+      }
+
+      // Grouped: stamp the STABLE fixed table index (never the visible-subset position, so hiding an earlier button never renumbers a later one) and link the switch to
+      // the label so HomeKit renders them as one remote. The label exists exactly when the fob is grouped, so a kept or attached index always has one to link to.
+      if(serviceLabel && ((transition === "attached") || (transition === "kept"))) {
+
         service.updateCharacteristic(this.hap.Characteristic.ServiceLabelIndex, button.index);
+        this.answerHeld(service, this.hap.Characteristic.ServiceLabelIndex);
         serviceLabel.addLinkedService(service);
-      } else if(service.testCharacteristic(this.hap.Characteristic.ServiceLabelIndex)) {
-
-        // Lone visible: a switch restored from a prior grouped configure carries a stale ServiceLabelIndex, so we drop it. A single-button fob presents no index and
-        // links to no label. The testCharacteristic guard keeps this side-effect-free when no stale index is present, so a freshly-created lone switch is untouched.
-        service.removeCharacteristic(service.getCharacteristic(this.hap.Characteristic.ServiceLabelIndex));
       }
     }
 
@@ -221,7 +175,7 @@ export class ProtectFob extends ProtectDevice {
 
     for(const button of this.#buttons) {
 
-      // Resolve this button's switch; skip it when absent - hidden by its feature option, or a failed acquire.
+      // Resolve this button's switch; skip it when absent - hidden by its feature option.
       const service = this.accessory.getServiceById(this.hap.Service.StatelessProgrammableSwitch, this.buttonSubtype(button));
 
       if(!service) {
@@ -288,28 +242,21 @@ export class ProtectFob extends ProtectDevice {
   }
 
   // Configure the battery service for HomeKit.
-  private configureBatteryService(): boolean {
+  private configureBatteryService(): void {
 
     // Acquire the service.
-    const service = this.acquireService(this.hap.Service.Battery);
-
-    // Fail gracefully.
-    if(!service) {
-
-      this.log.error("Unable to add the battery service.");
-
-      return false;
-    }
+    const { service } = this.acquireService({ serviceType: this.hap.Service.Battery });
 
     // Initialize the battery state.
     this.updateBatteryStatus();
 
-    return true;
+    this.answerHeld(service, this.hap.Characteristic.BatteryLevel);
+    this.answerHeld(service, this.hap.Characteristic.StatusLowBattery);
   }
 
   // Update the battery status in HomeKit. The fob's battery lives under wirelessConnectionState.batteryStatus (the LoRa link telemetry), NOT the top-level batteryStatus
   // a wired sensor reads - so the read path is nested here. Both reads are non-throwing: an absent record reports a full, not-low battery rather than throwing.
-  private updateBatteryStatus(): boolean {
+  private updateBatteryStatus(): void {
 
     // Find the battery service, if it exists.
     const batteryService = this.accessory.getService(this.hap.Service.Battery);
@@ -321,8 +268,6 @@ export class ProtectFob extends ProtectDevice {
     // Update the battery status.
     batteryService?.updateCharacteristic(this.hap.Characteristic.BatteryLevel, percentage);
     batteryService?.updateCharacteristic(this.hap.Characteristic.StatusLowBattery, isLow);
-
-    return true;
   }
 
   // Spawn the fob's narrow-selector observers. super spawns the universal observers (name sync and firmware/device-info refresh); the fob adds battery observers, one per
@@ -333,7 +278,7 @@ export class ProtectFob extends ProtectDevice {
 
     super.spawnObservers();
 
-    const fob = deviceSelectors.fob.byId(this.device.id);
+    const fob = this.nvr.client.state.selectors.fob.byId(this.device.id);
 
     // The battery-level reaction: when the controller's reported battery percentage changes, re-push BatteryLevel. The selector reads the primitive, so an unrelated fob
     // patch never wakes it.

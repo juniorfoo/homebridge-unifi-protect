@@ -2,7 +2,7 @@
  *
  * camera-host.ts: the camera contract the media delegates depend on for UniFi Protect.
  *
- * This is the dependency-inversion seam on the camera side of the media stack: the streaming, recording, snapshot, and timeshift delegates each operate on a
+ * This is the dependency-inversion boundary on the camera side of the media stack: the streaming, recording, snapshot, and timeshift delegates each operate on a
  * camera, but they read only this narrow slice of it, not the whole concrete ProtectCamera. Typing the delegates against ProtectCameraHost (rather than the
  * class) decouples the media layer from the device leaf and lets a test construct a delegate against a small stub host instead of standing up a full camera.
  * ProtectCameraHost is the camera-specific media surface; it extends ProtectDeviceContext, the shared device-and-plugin-context slice every collaborator reads,
@@ -10,15 +10,16 @@
  * and its type-only reference to StreamingDelegate (mirrored by that module's factory param) is the same benign, erased cycle the camera and its delegate already
  * formed directly.
  */
+import type { ChannelProfile, SelectChannelOptions } from "./resolution.ts";
 import type { ProtectCameraConfig, SnapshotOptions, TalkbackSession } from "unifi-protect";
-import type { ChannelProfile } from "./resolution.ts";
 import type { LivestreamSubscription } from "./livestream.ts";
 import type { Nullable } from "homebridge-plugin-utils";
+import type { ProtectCameraHints } from "../devices/cameras/camera.ts";
 import type { ProtectDeviceContext } from "../devices/device.ts";
 import type { StreamingDelegate } from "./stream-delegate.ts";
 import type { WithoutIdentity } from "../types.ts";
 
-// The per-subscription options a media consumer passes to ProtectCameraHost.livestream(). One definition shared by the seam contract below and ProtectCamera's
+// The per-subscription options a media consumer passes to ProtectCameraHost.livestream(). One definition shared by the interface contract below and ProtectCamera's
 // implementation, so a widening lands in a single place rather than drifting between two inline literals.
 export interface LivestreamHostOptions {
 
@@ -41,8 +42,20 @@ export interface LivestreamHostOptions {
 // camera satisfies it by inheritance. Every member is read-only at the call sites, so properties are readonly and getters satisfy them directly.
 export interface ProtectCameraHost extends ProtectDeviceContext {
 
-  // Builds the FFmpeg audio-filter chain against the camera's true input sample rate (live and HKSV-recording audio paths).
-  getAudioFilters(sampleRate?: number): string[];
+  // Turns the package camera's flashlight on or off for a streaming session, past the refusal a HomeKit write meets, so a session ending in an outage still darkens the
+  // flashlight and clears its heartbeat. Any other camera has no flashlight and does nothing.
+  driveFlashlight(on: boolean): void;
+
+  // Builds the FFmpeg audio-filter chain at an output sample rate in hertz, the rate the live view or the HKSV recording encodes its audio at.
+  getAudioFilters(outputSampleRate: number): string[];
+
+  // Whether the camera currently has at least one RTSP-enabled stream to draw a direct session from. Read by the session-source decision so every RTSP-consuming path
+  // stays honest about what it can actually stream from, on the published list's own freshness envelope.
+  readonly hasRtspStream: boolean;
+
+  // The camera family's hint bag, narrowed from the shared device shape the inherited device context declares: the media delegates read the streaming, transcoding, and
+  // crop hints that live only on the camera extension.
+  readonly hints: ProtectCameraHints;
 
   // Whether this camera can back HomeKit Secure Video - gates recording-delegate construction and the recording/motion controller options.
   readonly isHksvCapable: boolean;
@@ -57,13 +70,13 @@ export interface ProtectCameraHost extends ProtectDeviceContext {
   // Reboots the camera through the controller - the consumer half of livestream self-heal.
   reboot(): Promise<void>;
 
-  // Resolves the best-fit channel profile for a requested live/snapshot resolution.
-  selectChannel(width: number, height: number, opts?: { biasHigher?: boolean; maxPixels?: number }): Nullable<ChannelProfile>;
+  // Resolves the best-fit channel profile for a requested live/snapshot resolution, under the posture and the pixel cap the caller names.
+  selectChannel(width: number, height: number, options: SelectChannelOptions): Nullable<ChannelProfile>;
 
   // Resolves the channel profile that populates the standing timeshift buffer feeding HomeKit Secure Video, buffer-backed live views, and snapshots.
   selectSubstrateChannel(): Nullable<ChannelProfile>;
 
-  // Acquires a snapshot via the controller's snapshot command (the narrow controller-snapshot seam).
+  // Acquires a snapshot via the controller's snapshot command (the narrow controller-snapshot interface).
   snapshotFromController(opts?: SnapshotOptions): Promise<Buffer>;
 
   // The streaming delegate the camera owns - the gateway the recording, snapshot, and timeshift consumers read for ffmpegOptions, hksv, and the controller.
@@ -76,8 +89,8 @@ export interface ProtectCameraHost extends ProtectDeviceContext {
   // dropped - the bare MAC is read through the dedicated mac member above, not this throwing projection.
   readonly ufp: Readonly<WithoutIdentity<ProtectCameraConfig>>;
 
-  // Whether buffer-backed livestreaming is enabled and the camera is capable of it - the streaming demand arm of the standing buffer, read live by the supervisor, the
-  // session-source decision, and the samplerate advertisement.
+  // Whether buffer-backed livestreaming is enabled for the camera - the streaming demand arm of the standing buffer, read live by the supervisor and
+  // the session-source decision.
   readonly usesTimeshiftLivestream: boolean;
 
   // The human-readable video codec label for log lines.

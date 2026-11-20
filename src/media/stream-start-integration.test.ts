@@ -5,30 +5,37 @@
 /* eslint-disable camelcase, sort-imports */
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import type { PrepareStreamRequest, StartStreamRequest } from "homebridge";
+import type { PrepareStreamRequest, StartStreamRequest, StreamingRequest } from "homebridge";
+import type { BackpressureWriter, FfmpegOptions } from "homebridge-plugin-utils";
 import { H264Level, H264Profile, HOMEKIT_IDR_INTERVAL, RtpPortAllocator, StreamRequestTypes, formatBps } from "homebridge-plugin-utils";
+import type { TestLogEntry } from "homebridge-plugin-utils/testing";
+import { formatLogEntry, settle } from "homebridge-plugin-utils/testing";
+import type { TestTimeshiftSupervisor } from "../testing.helpers.ts";
+import { makeTimeshiftSupervisorDouble } from "../testing.helpers.ts";
+import type { ControllableLivestreamDouble, TestCameraHost } from "./testing.helpers.ts";
 import { makeControllableLivestreamDouble, makeKeyframeFragment, makeLivestreamSubscriptionDouble, makeNonKeyframeFragment, makeTestCameraHost,
-  makeTimeshiftSupervisorDouble, makeUntimedNonKeyframeFragment, settle } from "../testing.helpers.ts";
+  makeUntimedNonKeyframeFragment } from "./testing.helpers.ts";
 import { makeChannel } from "../camera.fixtures.ts";
-import type { ControllableLivestreamDouble, TestCameraHost, TestLogEntry, TestTimeshiftSupervisor } from "../testing.helpers.ts";
 import { ProtectTimeshiftBuffer } from "./timeshift.ts";
 import { parseH264AvcCFromFmp4Init } from "./h264-fmp4-avcc.ts";
 import { TEST_H264_MAIN_PPS, testH264SpsForProfileLevel } from "./h264-test-bytes.ts";
 import { ProtectStreamingDelegate } from "./stream.ts";
 import type { ProtectStreamingDelegateTestOptions } from "./stream.ts";
-import type { BackpressureWriter } from "homebridge-plugin-utils";
-import type { ChannelProfile } from "./resolution.ts";
+import type { ChannelProfile, SelectChannelOptions } from "./resolution.ts";
 import { setLiveVideoFfmpegSpawnerForTests } from "./stream-live-ffmpeg-spawn.ts";
 import { TestLiveStreamingFfmpegProcess } from "./test-live-ffmpeg-process.ts";
 import type { ProtectStreamingFfmpegProcess } from "./stream-ffmpeg-process.ts";
 import { VIDEO_COPY_FAILURE_PATTERNS } from "./stream-transcode-policy.ts";
-import { shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
+import { resolveLiveStreamTranscodePipelineOptions, shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
+import type { LiveVideoEncodeDecision } from "./stream-transcode-policy.ts";
+import type { LiveStreamEncoderPipelineOptions } from "./stream-live-wiring.ts";
+import { makeHarnessRtpDemuxer } from "./stream-test-rtp-double.ts";
 
 const SESSION_ID = "sess-start-integration";
 
 const stubChannel: ChannelProfile = {
 
-  channel: { bitrate: 4_000_000, fps: 15, height: 720, id: 1, name: "medium", width: 1280 },
+  channel: { bitrate: 4000000, fps: 15, height: 720, id: 1, name: "medium", width: 1280 },
   name: "medium"
 } as ChannelProfile;
 
@@ -87,6 +94,7 @@ function buildFmp4Init(profileIdc: number, levelIdc: number): Buffer {
 }
 
 const MATCHING_INIT = buildFmp4Init(77, 31);
+const MATCHING_INIT_LIVESTREAM = { codec: "h264", data: MATCHING_INIT, description: { tracks: [] } };
 
 function makeStartRequest(overrides?: { packetTime?: number }): StartStreamRequest {
 
@@ -98,27 +106,74 @@ function makeStartRequest(overrides?: { packetTime?: number }): StartStreamReque
   } as unknown as StartStreamRequest;
 }
 
-function makePrepareRequest(): PrepareStreamRequest {
+function makePrepareRequest(overrides?: { addressVersion?: "ipv4" | "ipv6"; session?: string; targetAddress?: string }): PrepareStreamRequest {
 
   return {
 
-    addressVersion: "ipv4",
-    audio: { port: 12_345, srtpCryptoSuite: 0, srtp_key: Buffer.alloc(16), srtp_salt: Buffer.alloc(14) },
-    sessionID: SESSION_ID,
-    targetAddress: "127.0.0.1",
-    video: { port: 12_347, srtpCryptoSuite: 0, srtp_key: Buffer.alloc(16), srtp_salt: Buffer.alloc(14) }
+    addressVersion: overrides?.addressVersion ?? "ipv4",
+    audio: { port: 12345, srtpCryptoSuite: 0, srtp_key: Buffer.alloc(16), srtp_salt: Buffer.alloc(14) },
+    sessionID: overrides?.session ?? SESSION_ID,
+    targetAddress: overrides?.targetAddress ?? "127.0.0.1",
+    video: { port: 12347, srtpCryptoSuite: 0, srtp_key: Buffer.alloc(16), srtp_salt: Buffer.alloc(14) }
   } as unknown as PrepareStreamRequest;
 }
 
-function installProtectStreamingHarness(host: TestCameraHost): void {
+const APPLE_TRANSCODE_DECODER_ARGS = [ "-hwaccel", "videotoolbox" ];
+const APPLE_INPUT_CODEC_DECODER_ARGS = [ "-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld" ];
 
-  const api = host.api as { hap: Record<string, unknown> };
+function patchCodecSupportRecord(platform: { codecSupport: unknown }, patch: Record<string, unknown>): void {
+
+  Object.assign(platform.codecSupport as Record<string, unknown>, patch);
+}
+
+function patchFfmpegAudioEncoder(ffmpegOptions: FfmpegOptions): void {
+
+  ffmpegOptions.audioEncoder = (): string[] => [ "-c:a", "libfdk_aac" ];
+}
+
+function isLiveStreamEncoderPipelineOptions(opts: Parameters<FfmpegOptions["videoDecoder"]>[0]): opts is LiveStreamEncoderPipelineOptions {
+
+  return (typeof opts === "object") && ("bitrate" in opts);
+}
+
+function patchAppleHwVideoDecoderProbe(ffmpegOptions: FfmpegOptions): void {
+
+  const realVideoDecoder = ffmpegOptions.videoDecoder.bind(ffmpegOptions);
+
+  ffmpegOptions.videoDecoder = (opts): string[] => {
+
+    if(isLiveStreamEncoderPipelineOptions(opts)) {
+
+      return APPLE_TRANSCODE_DECODER_ARGS;
+    }
+
+    if((typeof opts === "object") && ("inputCodec" in opts) && !("bitrate" in opts)) {
+
+      return APPLE_INPUT_CODEC_DECODER_ARGS;
+    }
+
+    return realVideoDecoder(opts);
+  };
+}
+
+async function stopActiveSession(ctx: HarnessContext, sessionId: string = SESSION_ID): Promise<void> {
+
+  await new Promise<void>((resolve, reject) => {
+
+    const stopRequest = { sessionID: sessionId, type: StreamRequestTypes.STOP } satisfies StreamingRequest;
+
+    ctx.delegate.handleStreamRequest(stopRequest,
+      (error) => ((error instanceof Error) ? reject(error) : resolve()));
+  });
+}
+
+function installProtectStreamingHarness(host: TestCameraHost): void {
 
   class MockCameraController {
 
     public static generateSynchronisationSource(): number {
 
-      return 12_345;
+      return 12345;
     }
 
     public forceStopStreamingSession(): void {
@@ -127,9 +182,33 @@ function installProtectStreamingHarness(host: TestCameraHost): void {
     }
   }
 
-  api.hap["CameraController"] = MockCameraController;
+  const api = host.api;
 
-  (host.platform as { rtpPorts: RtpPortAllocator }).rtpPorts = new RtpPortAllocator();
+  host.api = new Proxy(api, {
+
+    get(target, property, receiver): unknown {
+
+      if(property === "hap") {
+
+        return new Proxy(target.hap, {
+
+          get(hapTarget, hapProperty, hapReceiver): unknown {
+
+            if(hapProperty === "CameraController") {
+
+              return MockCameraController;
+            }
+
+            return Reflect.get(hapTarget, hapProperty, hapReceiver);
+          }
+        });
+      }
+
+      return Reflect.get(target, property, receiver);
+    }
+  });
+
+  (host.platform as unknown as { rtpPorts: RtpPortAllocator }).rtpPorts = new RtpPortAllocator();
 }
 
 function argsUseVideoCopy(args: string[]): boolean {
@@ -137,6 +216,53 @@ function argsUseVideoCopy(args: string[]): boolean {
   const idx = args.indexOf("-codec:v");
 
   return (idx >= 0) && (args[idx + 1] === "copy");
+}
+
+function teeSinkArgument(args: string[]): string {
+
+  for(let i = 1; i < args.length; i += 1) {
+
+    if((args[i - 1] === "-f") && (args[i] === "tee")) {
+
+      return args[i + 1] ?? "";
+    }
+  }
+
+  return "";
+}
+
+function videoDecoderArgvPrefix(args: string[]): string[] {
+
+  const errDetectIdx = args.indexOf("-err_detect");
+
+  if(errDetectIdx >= 0) {
+
+    const maxDelayIdx = args.indexOf("-max_delay", errDetectIdx);
+
+    if(maxDelayIdx > errDetectIdx) {
+
+      return args.slice(errDetectIdx + 2, maxDelayIdx);
+    }
+  }
+
+  const mapIdx = args.indexOf("-map");
+
+  return (mapIdx >= 0) ? args.slice(0, mapIdx) : args;
+}
+
+function assertSpawnedDecoderMatchesTranscodePipeline(delegate: ProtectStreamingDelegate, channelProfile: ChannelProfile, request: StartStreamRequest,
+  useInterpolation: boolean, spawnedArgs: string[], inputCodec: string): void {
+
+  const encodeDecision: LiveVideoEncodeDecision = { logReason: "integration", mode: "transcode" };
+  const pipeline = resolveLiveStreamTranscodePipelineOptions(delegate.protectCamera, encodeDecision, channelProfile, request, request.video.max_bit_rate,
+    useInterpolation) as LiveStreamEncoderPipelineOptions;
+  const decoderPrefix = videoDecoderArgvPrefix(spawnedArgs);
+  const inputCodecOnly = delegate.ffmpegOptions.videoDecoder({ inputCodec: inputCodec });
+  const expectedDecoder = delegate.ffmpegOptions.videoDecoder(pipeline);
+
+  assert.deepEqual(decoderPrefix, expectedDecoder, "spawned decoder argv must match videoDecoder(transcode pipeline)");
+  assert.notDeepEqual(decoderPrefix, inputCodecOnly, "spawned decoder argv must not be inputCodec-only on Apple interpolating transcode");
+  assert.deepEqual(decoderPrefix, APPLE_TRANSCODE_DECODER_ARGS, "Apple interpolating transcode must use plain videotoolbox (CPU frames), not videotoolbox_vld");
 }
 
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 8000): Promise<void> {
@@ -170,8 +296,8 @@ interface PooledSharedFeedCouple {
 // Two distinct subscription objects (production never shares ids) fed from one shared push surface.
 function makePooledSharedFeedCouple(): PooledSharedFeedCouple {
 
-  const bufferSub = makeControllableLivestreamDouble({ id: "pooled-buffer-encoder", initSegment: { codec: "h264", data: MATCHING_INIT } });
-  const streamSub = makeControllableLivestreamDouble({ id: "pooled-session-encoder", initSegment: { codec: "h264", data: MATCHING_INIT } });
+  const bufferSub = makeControllableLivestreamDouble({ id: "pooled-buffer-encoder", initSegment: MATCHING_INIT_LIVESTREAM });
+  const streamSub = makeControllableLivestreamDouble({ id: "pooled-session-encoder", initSegment: MATCHING_INIT_LIVESTREAM });
 
   assert.notEqual(bufferSub.id, streamSub.id, "pooled buffer and session subscriptions must be distinct objects");
 
@@ -188,7 +314,7 @@ function makePooledSharedFeedCouple(): PooledSharedFeedCouple {
     bufferSub,
     pushInitToBuffer: (): void => {
 
-      bufferSub.push({ codec: "h264", data: MATCHING_INIT, type: "init" });
+      bufferSub.push({ ...MATCHING_INIT_LIVESTREAM, type: "init" });
     },
     pushMediaToBoth: (fragment): void => {
 
@@ -207,17 +333,21 @@ function makePooledSharedFeedCouple(): PooledSharedFeedCouple {
   };
 }
 
-function logLineIncludes(entries: TestLogEntry[], fragment: string): boolean {
+function logLineIncludes(entries: readonly TestLogEntry[], fragment: string): boolean {
 
-  return entries.some((entry) => entry.formatted.includes(fragment) || entry.parameters.some((parameter) => (typeof parameter === "string") &&
-    parameter.includes(fragment)));
+  return entries.some((entry) => formatLogEntry(entry).includes(fragment));
+}
+
+function logInfoLineIncludes(entries: readonly TestLogEntry[], fragment: string): boolean {
+
+  return entries.some((entry) => (entry.level === "info") && formatLogEntry(entry).includes(fragment));
 }
 
 interface HarnessContext {
 
   delegate: ProtectStreamingDelegate;
   host: TestCameraHost;
-  logEntries: TestLogEntry[];
+  logEntries: readonly TestLogEntry[];
   spawnedArgs: string[][];
   spawnedProcesses: TestLiveStreamingFfmpegProcess[];
   timeshift: TestTimeshiftSupervisor;
@@ -236,8 +366,11 @@ function syncLiveUfpChannelsForStubBuffer(host: TestCameraHost): void {
   host.ufp = { ...host.ufp, channels };
 }
 
-function createHarness(options?: { delegateTestOptions?: ProtectStreamingDelegateTestOptions; enableHardwareTranscodeFeature?: boolean;
-  hardwareTranscodingHint?: boolean; livestreamSegments?: number; transcodeBitrateKbps?: number; videoCodec?: string; }): HarnessContext {
+function createHarness(options?: {
+
+  appleSilicon?: boolean; delegateTestOptions?: ProtectStreamingDelegateTestOptions; enableHardwareTranscodeFeature?: boolean;
+  hardwareTranscodingHint?: boolean; livestreamSegments?: number; patchAppleDecoderProbe?: boolean; transcodeBitrateKbps?: number; videoCodec?: string;
+}): HarnessContext {
 
   const { host, logEntries } = makeTestCameraHost();
 
@@ -245,9 +378,23 @@ function createHarness(options?: { delegateTestOptions?: ProtectStreamingDelegat
   syncLiveUfpChannelsForStubBuffer(host);
   host.isReachable = true;
   host.usesTimeshiftLivestream = true;
-  host.selectChannel = () => stubChannel;
-  host.selectSubstrateChannel = () => stubChannel;
+  host.selectChannel = (): ChannelProfile => stubChannel;
+  host.selectSubstrateChannel = (): ChannelProfile => stubChannel;
   host.livestreamSubscriptions = [makeLivestreamSubscriptionDouble({ mediaSegments: options?.livestreamSegments ?? 1 })];
+
+  if(options?.appleSilicon) {
+
+    patchCodecSupportRecord(host.platform, {
+
+      cpuGeneration: 3,
+      ffmpegAtLeast: (): boolean => true,
+      hasDecoder: (): boolean => true,
+      hasEncoder: (): boolean => true,
+      hasHwAccel: (): boolean => true,
+      hostSystem: "macOS.Apple"
+    });
+    host.hints = { ...host.hints, hardwareDecoding: true, hardwareTranscoding: true };
+  }
 
   if(options?.hardwareTranscodingHint) {
 
@@ -258,7 +405,7 @@ function createHarness(options?: { delegateTestOptions?: ProtectStreamingDelegat
 
     const defaultHasFeature = host.hasFeature.bind(host);
 
-    host.hasFeature = (option) => (option === "Video.Transcode.Hardware") ? true : defaultHasFeature(option);
+    host.hasFeature = (option: string): boolean => (option === "Video.Transcode.Hardware") ? true : defaultHasFeature(option);
   }
 
   if(options?.videoCodec) {
@@ -271,6 +418,11 @@ function createHarness(options?: { delegateTestOptions?: ProtectStreamingDelegat
 
   delegate.timeshift = timeshift as unknown as ProtectStreamingDelegate["timeshift"];
   host.stream = delegate;
+
+  if(options?.appleSilicon || options?.patchAppleDecoderProbe) {
+
+    patchAppleHwVideoDecoderProbe(delegate.ffmpegOptions);
+  }
 
   const spawnedArgs: string[][] = [];
   const spawnedProcesses: TestLiveStreamingFfmpegProcess[] = [];
@@ -288,7 +440,7 @@ function createHarness(options?: { delegateTestOptions?: ProtectStreamingDelegat
   return { delegate, host, logEntries, spawnedArgs, spawnedProcesses, timeshift };
 }
 
-async function wireRealTimeshiftBuffer(ctx: HarnessContext, bufferSub: ControllableLivestreamDouble,
+async function wireRealTimeshiftBuffer(ctx: HarnessContext, _bufferSub: ControllableLivestreamDouble,
   channelProfile: ChannelProfile = stubChannel): Promise<ProtectTimeshiftBuffer> {
 
   const buffer = new ProtectTimeshiftBuffer(ctx.host);
@@ -306,17 +458,18 @@ async function wireRealTimeshiftBuffer(ctx: HarnessContext, bufferSub: Controlla
   ctx.delegate.timeshift = supervisor as unknown as ProtectStreamingDelegate["timeshift"];
   ctx.timeshift = supervisor as unknown as TestTimeshiftSupervisor;
 
-  buffer.configuredDuration = 10_000;
+  buffer.configuredDuration = 10000;
   await buffer.start(channelProfile);
 
   return buffer;
 }
 
-async function prepareAndStart(ctx: HarnessContext, startRequest: StartStreamRequest = makeStartRequest()): Promise<void> {
+async function prepareAndStart(ctx: HarnessContext, startRequest: StartStreamRequest = makeStartRequest(),
+  prepareRequest: PrepareStreamRequest = makePrepareRequest()): Promise<void> {
 
   await new Promise<void>((resolve, reject) => {
 
-    ctx.delegate.prepareStream(makePrepareRequest(), (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    ctx.delegate.prepareStream(prepareRequest, (error) => ((error instanceof Error) ? reject(error) : resolve()));
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -340,6 +493,23 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     setLiveVideoFfmpegSpawnerForTests(undefined);
   });
 
+  test("IPv6 HomeKit client address uses bracketed srtpDestination in tee sinks (not raw concatenation)", async () => {
+
+    const ctx = createHarness();
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+
+    await prepareAndStart(ctx, makeStartRequest(), makePrepareRequest({ addressVersion: "ipv6", targetAddress: "fd00::1:2" }));
+
+    const teeArg = (ctx.spawnedArgs[0] ?? []).find((part) => part.includes("srtp://"));
+
+    assert.ok(teeArg, "tee sink must include an srtp destination");
+    assert.ok(teeArg.includes("srtp://[fd00::1:2]:"), "IPv6 must be bracketed via srtpDestination (raw srtp://fd00:: would be wrong)");
+    assert.doesNotMatch(teeArg, /srtp:\/\/fd00::1:2:/);
+  });
+
   test("buffer with matching init prefix chooses copy (ffmpeg args and decision log)", async () => {
 
     const ctx = createHarness();
@@ -347,7 +517,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = () => prefix;
+    ctx.timeshift.buffer.getLast = (): Buffer => prefix;
 
     await prepareAndStart(ctx);
 
@@ -358,8 +528,8 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     assert.ok(logLineIncludes(ctx.logEntries, "Streaming live video with H.264 copy"));
     const expectedSourceEgress = formatBps(stubChannel.channel.bitrate);
 
-    assert.ok(logLineIncludes(ctx.logEntries, expectedSourceEgress), "egress log must show source channel bitrate on copy");
-    assert.ok(!logLineIncludes(ctx.logEntries, formatBps(800_000)), "copy must not log HomeKit target as egress");
+    assert.ok(logInfoLineIncludes(ctx.logEntries, expectedSourceEgress), "egress log must show source channel bitrate on copy");
+    assert.ok(!logInfoLineIncludes(ctx.logEntries, formatBps(800000)), "copy info line must not use HomeKit target as egress");
 
     await waitFor(() => (ctx.spawnedProcesses[0]?.stdinWrites.length ?? 0) > 0, "first stdin write on copy");
 
@@ -375,10 +545,10 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     const ctx = createHarness();
 
-    ctx.host.hasFeature = (option) => option === "Video.Transcode.HighLatency";
+    ctx.host.hasFeature = (option: string): boolean => option === "Video.Transcode.HighLatency";
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = () => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx, makeStartRequest({ packetTime: 60 }));
 
@@ -392,10 +562,10 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     const ctx = createHarness();
     const defaultHasFeature = ctx.host.hasFeature.bind(ctx.host);
 
-    ctx.host.hasFeature = (option) => (option === "Video.Transcode.HighLatency") ? false : defaultHasFeature(option);
+    ctx.host.hasFeature = (option: string): boolean => (option === "Video.Transcode.HighLatency") ? false : defaultHasFeature(option);
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = () => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx, makeStartRequest({ packetTime: 60 }));
 
@@ -406,16 +576,16 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     const ctx = createHarness();
 
-    ctx.host.hasFeature = (option) => option === "Video.Transcode";
+    ctx.host.hasFeature = (option: string): boolean => option === "Video.Transcode";
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = () => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx);
 
     assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), false);
     assert.ok(logLineIncludes(ctx.logEntries, "-> transcode"));
-    assert.ok(logLineIncludes(ctx.logEntries, formatBps(800_000)));
+    assert.ok(logLineIncludes(ctx.logEntries, formatBps(800000)));
   });
 
   test("null timeshift prefix forces transcode", async () => {
@@ -424,7 +594,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = () => null;
+    ctx.timeshift.buffer.getLast = (): null => null;
 
     await prepareAndStart(ctx);
 
@@ -442,7 +612,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.selectChannel = (): ChannelProfile => ({ ...stubChannel, channel: wrongChannel, name: "wrong" });
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = () => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx);
 
@@ -464,8 +634,8 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.ufp = { ...ctx.host.ufp, channels: [live15] };
     ctx.timeshift.buffer.isStarted = false;
     ctx.timeshift.buffer.channelProfile = null;
-    ctx.host.selectSubstrateChannel = () => buffer30;
-    ctx.timeshift.buffer.getLast = () => null;
+    ctx.host.selectSubstrateChannel = (): ChannelProfile => buffer30;
+    ctx.timeshift.buffer.getLast = (): null => null;
 
     const request = makeStartRequest();
 
@@ -495,7 +665,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.ufp = { ...ctx.host.ufp, channels: [live15] };
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = buffer30;
-    ctx.timeshift.buffer.getLast = () => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx);
 
@@ -515,7 +685,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.ufp = { ...ctx.host.ufp, channels: [liveChannel] };
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = bufferWide;
-    ctx.timeshift.buffer.getLast = () => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx);
 
@@ -534,7 +704,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.ufp = { ...ctx.host.ufp, channels: [liveChannel] };
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = () => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx);
 
@@ -545,16 +715,16 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
   test("bufferDegraded without buffer profile falls back to transcode-biased selectChannel", async () => {
 
     const ctx = createHarness();
-    let selectCall: { biasHigher?: boolean; maxPixels?: number; height: number; width: number } | undefined;
+    let selectCall: { bias?: string; maxPixels?: number; height: number; width: number } | undefined;
 
     ctx.host.ufp = { ...ctx.host.ufp, videoCodec: "av1" };
     ctx.timeshift.buffer.isStarted = false;
     ctx.timeshift.buffer.channelProfile = null;
-    ctx.timeshift.buffer.getLast = () => null;
-    ctx.host.selectSubstrateChannel = () => null;
-    ctx.host.selectChannel = (width, height, options) => {
+    ctx.timeshift.buffer.getLast = (): null => null;
+    ctx.host.selectSubstrateChannel = (): null => null;
+    ctx.host.selectChannel = (width: number, height: number, options: SelectChannelOptions): ChannelProfile => {
 
-      selectCall = { biasHigher: options?.biasHigher, height: height, maxPixels: options?.maxPixels, width: width };
+      selectCall = { bias: options.bias, height: height, maxPixels: options.maxPixels, width: width };
 
       return stubChannel;
     };
@@ -563,8 +733,8 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     assert.equal(ctx.spawnedProcesses.length, 1);
     assert.ok(selectCall);
-    assert.equal(selectCall?.biasHigher, true);
-    assert.ok((selectCall?.maxPixels ?? 0) > 0);
+    assert.equal(selectCall.bias, "higher");
+    assert.ok((selectCall.maxPixels ?? 0) > 0);
   });
 
   test("standing timeshift prefix blocks selectChannel at startStream (BD4/BD5)", async () => {
@@ -575,9 +745,9 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.ufp = { ...ctx.host.ufp, videoCodec: "av1" };
     ctx.timeshift.buffer.isStarted = false;
     ctx.timeshift.buffer.channelProfile = null;
-    ctx.timeshift.buffer.getLast = () => Buffer.concat([ MATCHING_INIT, Buffer.from("standing-prefix") ]);
-    ctx.host.selectSubstrateChannel = () => null;
-    ctx.host.selectChannel = () => {
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("standing-prefix") ]);
+    ctx.host.selectSubstrateChannel = (): null => null;
+    ctx.host.selectChannel = (): ChannelProfile => {
 
       selectChannelCalls += 1;
 
@@ -607,6 +777,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     let createTsbResumeCalls = 0;
     const ctx = createHarness({
 
+      appleSilicon: true,
       delegateTestOptions: {
 
         onRotateSegmentWriter: (event) => rotationEvents.push(event),
@@ -614,10 +785,11 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
           createTsbResumeCalls += 1;
         }
-      }
+      },
+      patchAppleDecoderProbe: true
     });
-    const bufferSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
-    const streamSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
+    const bufferSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
+    const streamSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
     const liveSub = streamSub;
     const bufferedKeyframe = makeKeyframeFragment();
     const bufferedTail = makeNonKeyframeFragment();
@@ -626,7 +798,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     const buffer = await wireRealTimeshiftBuffer(ctx, bufferSub);
 
-    bufferSub.push({ codec: "h264", data: MATCHING_INIT, type: "init" });
+    bufferSub.push({ ...MATCHING_INIT_LIVESTREAM, type: "init" });
     await settle();
     bufferSub.push({ data: bufferedKeyframe.data, mdat: bufferedKeyframe.mdat, moof: bufferedKeyframe.moof, type: "media" });
     await settle();
@@ -676,19 +848,23 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
       return replacement as unknown as ProtectStreamingFfmpegProcess;
     });
 
-    const liveLead = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 3_500, sequenceNumber: 10 });
+    const liveLead = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 3500, sequenceNumber: 10 });
 
     const startPromise = prepareAndStart(ctx);
 
     liveSub.push({ data: liveLead.data, mdat: liveLead.mdat, moof: liveLead.moof, type: "media" });
     await startPromise;
 
-    await waitFor(() => ctx.spawnedProcesses.length >= 2, "copy escalation replacement spawn", 25_000);
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "copy escalation replacement spawn", 25000);
 
-    await waitFor(() => createTsbResumeCalls >= 1, "createTsbResume on copy escalation", 25_000);
-    await waitFor(() => rotationEvents.length >= 1, "TSB writer rotation on escalation", 25_000);
+    await waitFor(() => createTsbResumeCalls >= 1, "createTsbResume on copy escalation", 25000);
+    await waitFor(() => rotationEvents.length >= 1, "TSB writer rotation on escalation", 25000);
 
     assert.equal(createTsbResumeCalls, 1, "copy escalation must invoke createTsbResume exactly once");
+
+    assertSpawnedDecoderMatchesTranscodePipeline(ctx.delegate, stubChannel, makeStartRequest(), true, ctx.spawnedArgs[1] ?? [], "h264");
+    assert.notDeepEqual(videoDecoderArgvPrefix(ctx.spawnedArgs[0] ?? []), videoDecoderArgvPrefix(ctx.spawnedArgs[1] ?? []),
+      "copy-escalation replacement decoder must differ from copy-time decoder argv");
 
     const copyProcess = ctx.spawnedProcesses[0];
     const replacement = ctx.spawnedProcesses[1];
@@ -704,15 +880,15 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), true);
     assert.equal(argsUseVideoCopy(ctx.spawnedArgs[1] ?? []), false);
 
-    await waitFor(() => (replacement.stdinWrites.length >= 1), "replacement receives primed stdin", 15_000);
+    await waitFor(() => (replacement.stdinWrites.length >= 1), "replacement receives primed stdin", 15000);
 
     const primed = replacement.stdinWrites[0] ?? Buffer.alloc(0);
 
-    assert.ok(expectedPrime?.equals(primed), "primed stdin must match init plus keyframe tail from the real buffer");
+    assert.ok(expectedPrime.equals(primed), "primed stdin must match init plus keyframe tail from the real buffer");
     assert.ok(primed.length > MATCHING_INIT.length, "primed buffer must include media after init");
     assert.equal(replacement.stdinWrites.length, 1, "primed buffer must be a single stdin write before live media continues");
 
-    const followUp = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 4_000, sequenceNumber: 11 });
+    const followUp = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 4000, sequenceNumber: 11 });
 
     liveSub.push({ data: followUp.data, mdat: followUp.mdat, moof: followUp.moof, type: "media" });
 
@@ -724,7 +900,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     assert.ok(followWrite.equals(followUp.data));
     assert.ok(!expectedPrime.equals(followWrite), "live media must not repeat the primed init-plus-keyframe-tail blob");
 
-    const fragmentTwo = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 5_000, sequenceNumber: 12 });
+    const fragmentTwo = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 5000, sequenceNumber: 12 });
 
     liveSub.push({ data: fragmentTwo.data, mdat: fragmentTwo.mdat, moof: fragmentTwo.moof, type: "media" });
 
@@ -799,7 +975,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.livestreamSubscriptions = [pooled.streamSub];
 
     const copyFailureLine = VIDEO_COPY_FAILURE_PATTERNS[1] ?? "Error initializing output stream";
-    const escWindowFragment = makeNonKeyframeFragment(ESC_WINDOW_TAG, { baseMediaDecodeTime: 8_000, sequenceNumber: 20 });
+    const escWindowFragment = makeNonKeyframeFragment(ESC_WINDOW_TAG, { baseMediaDecodeTime: 8000, sequenceNumber: 20 });
     let spawnIndex = 0;
 
     setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
@@ -837,8 +1013,8 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     await prepareAndStart(ctx);
 
-    await waitFor(() => ctx.spawnedProcesses.length >= 2, "pooled copy escalation replacement spawn", 25_000);
-    await waitFor(() => rotationEvents.length >= 1, "pooled TSB writer rotation on escalation", 25_000);
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "pooled copy escalation replacement spawn", 25000);
+    await waitFor(() => rotationEvents.length >= 1, "pooled TSB writer rotation on escalation", 25000);
 
     const replacement = ctx.spawnedProcesses[1];
 
@@ -849,15 +1025,15 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
       const trailing = buffer.getInitPlusTrailingFromLastKeyframe() ?? Buffer.alloc(0);
 
       return trailing.includes(tagMarker(ESC_WINDOW_TAG));
-    }, "timeshift buffer absorbed escalation-window fragment from shared pooled feed", 8_000);
+    }, "timeshift buffer absorbed escalation-window fragment from shared pooled feed", 8000);
 
-    await waitFor(() => replacement.stdinWrites.length >= 2, "replacement receives prime and live writes", 8_000);
+    await waitFor(() => replacement.stdinWrites.length >= 2, "replacement receives prime and live writes", 8000);
 
-    const tailFragment = makeNonKeyframeFragment(TAIL_TAG, { baseMediaDecodeTime: 9_000, sequenceNumber: 21 });
+    const tailFragment = makeNonKeyframeFragment(TAIL_TAG, { baseMediaDecodeTime: 9000, sequenceNumber: 21 });
 
     pooled.pushMediaToBoth(tailFragment);
 
-    await waitFor(() => replacement.stdin.writableEnded || (replacement.stdinWrites.length >= 3), "tail fragment after esc", 8_000);
+    await waitFor(() => replacement.stdin.writableEnded || (replacement.stdinWrites.length >= 3), "tail fragment after esc", 8000);
 
     const allStdin = Buffer.concat(replacement.stdinWrites);
     const expectedStdin = Buffer.concat([ expectedPrime, escWindowFragment.data, tailFragment.data ]);
@@ -906,7 +1082,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     const buffer = await wireRealTimeshiftBuffer(ctx, pooled.bufferSub);
     const bufferedKeyframe = makeKeyframeFragment();
-    const escPrePrime = makeNonKeyframeFragment(ESC_WINDOW_TAG, { baseMediaDecodeTime: 6_000, sequenceNumber: 15 });
+    const escPrePrime = makeNonKeyframeFragment(ESC_WINDOW_TAG, { baseMediaDecodeTime: 6000, sequenceNumber: 15 });
 
     pooled.pushInitToBuffer();
     await settle();
@@ -958,18 +1134,18 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     await prepareAndStart(ctx);
 
-    await waitFor(() => ctx.spawnedProcesses.length >= 2, "pooled pre-absorbed esc replacement spawn", 25_000);
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "pooled pre-absorbed esc replacement spawn", 25000);
 
     const replacement = ctx.spawnedProcesses[1];
 
     assert.ok(replacement);
 
-    await waitFor(() => replacement.stdinWrites.length >= 1, "replacement stdin after pre-absorbed esc", 8_000);
+    await waitFor(() => replacement.stdinWrites.length >= 1, "replacement stdin after pre-absorbed esc", 8000);
 
-    const tailFragment = makeNonKeyframeFragment(TAIL_TAG, { baseMediaDecodeTime: 7_000, sequenceNumber: 16 });
+    const tailFragment = makeNonKeyframeFragment(TAIL_TAG, { baseMediaDecodeTime: 7000, sequenceNumber: 16 });
 
     pooled.pushMediaToBoth(tailFragment);
-    await waitFor(() => replacement.stdinWrites.length >= 2, "tail after pre-absorbed esc", 8_000);
+    await waitFor(() => replacement.stdinWrites.length >= 2, "tail after pre-absorbed esc", 8000);
 
     const allStdin = Buffer.concat(replacement.stdinWrites);
     const escInBuffer = countTagInBuffer(primeBeforeLive ?? Buffer.alloc(0), ESC_WINDOW_TAG);
@@ -987,7 +1163,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     const ESC_TAG = 0xD1A1;
     const TAIL_TAG = 0xD1B2;
     const tagMarker = (tag: number): Buffer => Buffer.from([ tag & 0xFF, (tag >> 8) & 0xFF ]);
-    const escTiming = { baseMediaDecodeTime: 50_000, sequenceNumber: 42 };
+    const escTiming = { baseMediaDecodeTime: 50000, sequenceNumber: 42 };
 
     const pooled = makePooledSharedFeedCouple();
     const ctx = createHarness();
@@ -996,7 +1172,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     const buffer = await wireRealTimeshiftBuffer(ctx, pooled.bufferSub);
     const bufferedKeyframe = makeKeyframeFragment();
-    const bufferedTail = makeNonKeyframeFragment(0xD100, { baseMediaDecodeTime: 40_000, sequenceNumber: 41 });
+    const bufferedTail = makeNonKeyframeFragment(0xD100, { baseMediaDecodeTime: 40000, sequenceNumber: 41 });
 
     pooled.pushInitToBuffer();
     await settle();
@@ -1056,17 +1232,17 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     await prepareAndStart(ctx);
 
-    await waitFor(() => ctx.spawnedProcesses.length >= 2, "lagging-session replacement spawn", 25_000);
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "lagging-session replacement spawn", 25000);
 
     const replacement = ctx.spawnedProcesses[1];
 
     assert.ok(replacement);
 
-    const tailFragment = makeNonKeyframeFragment(TAIL_TAG, { baseMediaDecodeTime: 51_000, sequenceNumber: 43 });
+    const tailFragment = makeNonKeyframeFragment(TAIL_TAG, { baseMediaDecodeTime: 51000, sequenceNumber: 43 });
 
     pooled.pushMediaToBoth(tailFragment);
 
-    await waitFor(() => replacement.stdinWrites.length >= 2, "lagging-session tail stdin", 8_000);
+    await waitFor(() => replacement.stdinWrites.length >= 2, "lagging-session tail stdin", 8000);
 
     const allStdin = Buffer.concat(replacement.stdinWrites);
     const expectedStdin = Buffer.concat([ expectedPrime ?? Buffer.alloc(0), tailFragment.data ]);
@@ -1095,7 +1271,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     ctx.host.livestreamSubscriptions = [pooled.streamSub];
 
-    const aheadFragment = makeNonKeyframeFragment(AHEAD_TAG, { baseMediaDecodeTime: 90_000, sequenceNumber: 99 });
+    const aheadFragment = makeNonKeyframeFragment(AHEAD_TAG, { baseMediaDecodeTime: 90000, sequenceNumber: 99 });
 
     const copyFailureLine = VIDEO_COPY_FAILURE_PATTERNS[1] ?? "Error initializing output stream";
     let spawnIndex = 0;
@@ -1129,7 +1305,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     await prepareAndStart(ctx);
 
-    await waitFor(() => ctx.spawnedProcesses.length >= 2, "ahead replacement spawn", 25_000);
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "ahead replacement spawn", 25000);
 
     const replacement = ctx.spawnedProcesses[1];
 
@@ -1138,13 +1314,13 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     pooled.pushMediaToStream(aheadFragment);
     await settle();
 
-    await waitFor(() => replacement.stdinWrites.length >= 2, "ahead fragment on stdin", 8_000);
+    await waitFor(() => replacement.stdinWrites.length >= 2, "ahead fragment on stdin", 8000);
 
     const allStdin = Buffer.concat(replacement.stdinWrites);
     const tagMarker = Buffer.from([ AHEAD_TAG & 0xFF, (AHEAD_TAG >> 8) & 0xFF ]);
 
     assert.ok(allStdin.includes(tagMarker), "session-ahead fragment must still be written after prime");
-    assert.ok(allStdin.equals(Buffer.concat([ expectedPrime ?? Buffer.alloc(0), aheadFragment.data ])));
+    assert.ok(allStdin.equals(Buffer.concat([ expectedPrime, aheadFragment.data ])));
   });
 
   test("copy failure pooled livestream: alternate track at prime decode time is not dropped", async () => {
@@ -1161,7 +1337,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     await settle();
     pooled.pushMediaToBuffer(makeKeyframeFragment());
     await settle();
-    pooled.pushMediaToBuffer(makeNonKeyframeFragment(0xA200, { baseMediaDecodeTime: 3_000, sequenceNumber: 2, trackId: 1 }));
+    pooled.pushMediaToBuffer(makeNonKeyframeFragment(0xA200, { baseMediaDecodeTime: 3000, sequenceNumber: 2, trackId: 1 }));
     await settle();
 
     const expectedPrime = buffer.getInitPlusTrailingFromLastKeyframe();
@@ -1202,22 +1378,22 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     await prepareAndStart(ctx);
 
-    await waitFor(() => ctx.spawnedProcesses.length >= 2, "alternate-track replacement spawn", 25_000);
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "alternate-track replacement spawn", 25000);
 
     const replacement = ctx.spawnedProcesses[1];
 
     assert.ok(replacement);
 
-    const altTrackFragment = makeNonKeyframeFragment(ALT_TRACK_TAG, { baseMediaDecodeTime: 3_000, sequenceNumber: 3, trackId: 2 });
+    const altTrackFragment = makeNonKeyframeFragment(ALT_TRACK_TAG, { baseMediaDecodeTime: 3000, sequenceNumber: 3, trackId: 2 });
 
     pooled.pushMediaToStream(altTrackFragment);
     await settle();
 
-    await waitFor(() => replacement.stdinWrites.length >= 2, "alternate track live stdin", 8_000);
+    await waitFor(() => replacement.stdinWrites.length >= 2, "alternate track live stdin", 8000);
 
     const allStdin = Buffer.concat(replacement.stdinWrites);
 
-    assert.ok(allStdin.equals(Buffer.concat([ expectedPrime ?? Buffer.alloc(0), altTrackFragment.data ])),
+    assert.ok(allStdin.equals(Buffer.concat([ expectedPrime, altTrackFragment.data ])),
       "a live fragment on another track with the same decode time as the prime floor must still be forwarded");
   });
 
@@ -1285,13 +1461,13 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     await prepareAndStart(ctx);
 
-    await waitFor(() => ctx.spawnedProcesses.length >= 2, "unreadable-id replacement spawn", 25_000);
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "unreadable-id replacement spawn", 25000);
 
     const replacement = ctx.spawnedProcesses[1];
 
     assert.ok(replacement);
 
-    await waitFor(() => replacement.stdinWrites.length >= 2, "unreadable-id duplicate esc on live path", 8_000);
+    await waitFor(() => replacement.stdinWrites.length >= 2, "unreadable-id duplicate esc on live path", 8000);
 
     const allStdin = Buffer.concat(replacement.stdinWrites);
 
@@ -1302,13 +1478,13 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
   test("copy escalation init-only prime when buffer channel id differs from live subscription (PM3)", async () => {
 
     const ctx = createHarness();
-    const bufferSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
-    const streamSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
+    const bufferSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
+    const streamSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
 
     ctx.host.livestreamSubscriptions = [bufferSub];
     const buffer = await wireRealTimeshiftBuffer(ctx, bufferSub);
 
-    bufferSub.push({ codec: "h264", data: MATCHING_INIT, type: "init" });
+    bufferSub.push({ ...MATCHING_INIT_LIVESTREAM, type: "init" });
     await settle();
     const bufferedKeyframe = makeKeyframeFragment();
 
@@ -1358,13 +1534,13 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     streamSub.push({ data: liveLead.data, mdat: liveLead.mdat, moof: liveLead.moof, type: "media" });
     await startPromise;
-    await waitFor(() => ctx.spawnedProcesses.length >= 2, "copy escalation replacement spawn", 25_000);
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "copy escalation replacement spawn", 25000);
 
     const replacement = ctx.spawnedProcesses[1];
 
     assert.ok(replacement);
 
-    await waitFor(() => (replacement.stdinWrites.length >= 1), "replacement receives primed stdin", 15_000);
+    await waitFor(() => (replacement.stdinWrites.length >= 1), "replacement receives primed stdin", 15000);
 
     const primed = replacement.stdinWrites[0] ?? Buffer.alloc(0);
 
@@ -1375,14 +1551,14 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
   test("copy escalation init-only prime when buffer lens differs from live subscription (PM3 lens)", async () => {
 
     const ctx = createHarness();
-    const bufferSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
-    const streamSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
+    const bufferSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
+    const streamSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
     const bufferProfile: ChannelProfile = { ...stubChannel, lens: 0 };
 
     ctx.host.livestreamSubscriptions = [bufferSub];
     const buffer = await wireRealTimeshiftBuffer(ctx, bufferSub, bufferProfile);
 
-    bufferSub.push({ codec: "h264", data: MATCHING_INIT, type: "init" });
+    bufferSub.push({ ...MATCHING_INIT_LIVESTREAM, type: "init" });
     await settle();
     const bufferedKeyframe = makeKeyframeFragment();
 
@@ -1431,13 +1607,13 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     streamSub.push({ data: liveLead.data, mdat: liveLead.mdat, moof: liveLead.moof, type: "media" });
     await startPromise;
-    await waitFor(() => ctx.spawnedProcesses.length >= 2, "copy escalation replacement spawn", 25_000);
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "copy escalation replacement spawn", 25000);
 
     const replacement = ctx.spawnedProcesses[1];
 
     assert.ok(replacement);
 
-    await waitFor(() => (replacement.stdinWrites.length >= 1), "replacement receives primed stdin", 15_000);
+    await waitFor(() => (replacement.stdinWrites.length >= 1), "replacement receives primed stdin", 15000);
 
     const primed = replacement.stdinWrites[0] ?? Buffer.alloc(0);
 
@@ -1450,13 +1626,13 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     const ctx = createHarness();
     const defaultHasFeature = ctx.host.hasFeature.bind(ctx.host);
 
-    const bufferSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
-    const streamSub = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: MATCHING_INIT } });
+    const bufferSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
+    const streamSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
 
     ctx.host.livestreamSubscriptions = [bufferSub];
     const buffer = await wireRealTimeshiftBuffer(ctx, bufferSub);
 
-    bufferSub.push({ codec: "h264", data: MATCHING_INIT, type: "init" });
+    bufferSub.push({ ...MATCHING_INIT_LIVESTREAM, type: "init" });
     await settle();
     const bufferedKeyframe = makeKeyframeFragment();
 
@@ -1473,7 +1649,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     assert.ok(expectedPrime, "buffer retains keyframe for RTSP-debug case");
 
-    ctx.host.hasFeature = (option) => (option === "Debug.Video.Timeshift.UseRtsp") ? true : defaultHasFeature(option);
+    ctx.host.hasFeature = (option: string): boolean => (option === "Debug.Video.Timeshift.UseRtsp") ? true : defaultHasFeature(option);
     ctx.host.livestreamSubscriptions = [streamSub];
 
     const copyFailureLine = VIDEO_COPY_FAILURE_PATTERNS[1] ?? "Error initializing output stream";
@@ -1508,13 +1684,13 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     streamSub.push({ data: liveLead.data, mdat: liveLead.mdat, moof: liveLead.moof, type: "media" });
     await startPromise;
-    await waitFor(() => ctx.spawnedProcesses.length >= 2, "RTSP-debug copy escalation", 25_000);
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "RTSP-debug copy escalation", 25000);
 
     const replacement = ctx.spawnedProcesses[1];
 
     assert.ok(replacement);
 
-    await waitFor(() => (replacement.stdinWrites.length >= 1), "replacement stdin", 15_000);
+    await waitFor(() => (replacement.stdinWrites.length >= 1), "replacement stdin", 15000);
 
     const primed = replacement.stdinWrites[0] ?? Buffer.alloc(0);
 
@@ -1545,11 +1721,11 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.usesTimeshiftLivestream = false;
     ctx.timeshift.buffer.isStarted = false;
 
-    let selectCall: { biasHigher?: boolean; height: number; maxPixels?: number; width: number } | undefined;
+    let selectCall: { bias?: string; height: number; maxPixels?: number; width: number } | undefined;
 
-    ctx.host.selectChannel = (width, height, options) => {
+    ctx.host.selectChannel = (width: number, height: number, options: SelectChannelOptions): ChannelProfile => {
 
-      selectCall = { biasHigher: options?.biasHigher, height: height, maxPixels: options?.maxPixels, width: width };
+      selectCall = { bias: options.bias, height: height, maxPixels: options.maxPixels, width: width };
 
       return stubChannel;
     };
@@ -1557,10 +1733,10 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     await prepareAndStart(ctx);
 
     assert.ok(selectCall, "copy-first RTSP transcode must reselect a source channel");
-    assert.equal(selectCall?.width, 3840);
-    assert.equal(selectCall?.height, 2160);
-    assert.equal(selectCall?.biasHigher, true);
-    assert.ok((selectCall?.maxPixels ?? 0) > 0);
+    assert.equal(selectCall.width, 3840);
+    assert.equal(selectCall.height, 2160);
+    assert.equal(selectCall.bias, "higher");
+    assert.ok((selectCall.maxPixels ?? 0) > 0);
     assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), false);
   });
 
@@ -1584,15 +1760,15 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     });
 
     Object.defineProperty(ctx.delegate, "ffmpegOptions", { value: hardwareFfmpegOptions });
-    let selectCall: { biasHigher?: boolean; height: number; maxPixels?: number; width: number } | undefined;
+    let selectCall: { bias?: string; height: number; maxPixels?: number; width: number } | undefined;
 
     ctx.timeshift.buffer.isStarted = false;
     ctx.timeshift.buffer.channelProfile = null;
-    ctx.timeshift.buffer.getLast = () => null;
-    ctx.host.selectSubstrateChannel = () => null;
-    ctx.host.selectChannel = (width, height, options) => {
+    ctx.timeshift.buffer.getLast = (): null => null;
+    ctx.host.selectSubstrateChannel = (): null => null;
+    ctx.host.selectChannel = (width: number, height: number, options: SelectChannelOptions): ChannelProfile => {
 
-      selectCall = { biasHigher: options?.biasHigher, height: height, maxPixels: options?.maxPixels, width: width };
+      selectCall = { bias: options.bias, height: height, maxPixels: options.maxPixels, width: width };
 
       return stubChannel;
     };
@@ -1600,10 +1776,10 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     await prepareAndStart(ctx);
 
     assert.ok(selectCall);
-    assert.equal(selectCall?.width, 3840);
-    assert.equal(selectCall?.height, 2160);
-    assert.equal(selectCall?.biasHigher, true);
-    assert.ok((selectCall?.maxPixels ?? 0) > 0);
+    assert.equal(selectCall.width, 3840);
+    assert.equal(selectCall.height, 2160);
+    assert.equal(selectCall.bias, "higher");
+    assert.ok((selectCall.maxPixels ?? 0) > 0);
     assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), false);
   });
 
@@ -1611,6 +1787,207 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     assert.equal(shouldSubstituteSelectChannelForSession(true, "bufferDegraded", null, true), false,
       "standing prefix blocks selectChannel even when buffer isStarted is false");
+  });
+
+  test("TSB Apple hardware transcode start uses shared transcode decoder argv (not inputCodec-only)", async () => {
+
+    const ctx = createHarness({ appleSilicon: true });
+    const defaultHasFeature = ctx.host.hasFeature.bind(ctx.host);
+
+    ctx.host.hasFeature = (option: string): boolean => (option === "Video.Transcode") ? true : defaultHasFeature(option);
+
+    const highFpsChannel: ChannelProfile = {
+
+      channel: { ...stubChannel.channel, fps: 30 },
+      name: stubChannel.name
+    } as ChannelProfile;
+
+    ctx.host.selectChannel = (): ChannelProfile => highFpsChannel;
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = highFpsChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    const request = makeStartRequest();
+
+    request.video.fps = 15;
+
+    await prepareAndStart(ctx, request);
+
+    assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), false);
+    assertSpawnedDecoderMatchesTranscodePipeline(ctx.delegate, highFpsChannel, request, true, ctx.spawnedArgs[0] ?? [], "h264");
+  });
+
+  test("TSB Apple hardware HEVC transcode start uses shared transcode decoder argv", async () => {
+
+    const ctx = createHarness({ appleSilicon: true, videoCodec: "hevc" });
+
+    const defaultHasFeature = ctx.host.hasFeature.bind(ctx.host);
+
+    ctx.host.hasFeature = (option: string): boolean => (option === "Video.Transcode") ? true : defaultHasFeature(option);
+
+    const highFpsChannel: ChannelProfile = {
+
+      channel: { ...stubChannel.channel, fps: 30 },
+      name: stubChannel.name
+    } as ChannelProfile;
+
+    ctx.host.selectChannel = (): ChannelProfile => highFpsChannel;
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = highFpsChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    const request = makeStartRequest();
+
+    request.video.fps = 15;
+
+    await prepareAndStart(ctx, request);
+
+    assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), false);
+    assertSpawnedDecoderMatchesTranscodePipeline(ctx.delegate, highFpsChannel, request, true, ctx.spawnedArgs[0] ?? [], "hevc");
+  });
+
+  test("tee audio sink uses srtpDestination (not raw host concatenation)", async () => {
+
+    const ctx = createHarness();
+
+    patchCodecSupportRecord(ctx.host.platform, { hasEncoder: (): boolean => true });
+    ctx.host.hasFeature = (option: string): boolean => (option === "Audio") ? true : false;
+    ctx.host.ufp = { ...ctx.host.ufp, featureFlags: { ...ctx.host.ufp.featureFlags, hasMic: true } };
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    await prepareAndStart(ctx, makeStartRequest(), makePrepareRequest({ addressVersion: "ipv6", targetAddress: "fd00::1:2" }));
+
+    const tee = teeSinkArgument(ctx.spawnedArgs[0] ?? []);
+
+    assert.ok(tee.includes("]srtp://[fd00::1:2]:"), "video sink must bracket IPv6");
+    const audioPart = tee.split("|").find((part) => part.includes("select=a"));
+
+    assert.ok(audioPart, "audio tee sink must exist");
+    assert.ok(audioPart.includes("]srtp://[fd00::1:2]:"), "audio sink must use srtpDestination bracketing (M8b)");
+    assert.doesNotMatch(audioPart, /srtp_out_params=[^]]+\]srtp:\/\/fd00/);
+  });
+
+  test("two-way audio direct start uses talkbackDestination for UDP output", async () => {
+
+    const returnAudioArgs: string[][] = [];
+    const ctx = createHarness({
+
+      delegateTestOptions: {
+
+        recordReturnAudioFfmpegArgs: (args: string[]) => returnAudioArgs.push(args),
+        substituteRtpDemuxer: makeHarnessRtpDemuxer
+      }
+    });
+
+    const defaultHasFeature = ctx.host.hasFeature.bind(ctx.host);
+
+    patchCodecSupportRecord(ctx.host.platform, { hasEncoder: (): boolean => true });
+    patchFfmpegAudioEncoder(ctx.delegate.ffmpegOptions);
+    ctx.host.hasFeature = (option: string): boolean => (option === "Audio") ? true : defaultHasFeature(option);
+    ctx.host.hints = { ...ctx.host.hints, twoWayAudio: true, twoWayAudioDirect: true };
+    ctx.host.ufp = {
+
+      ...ctx.host.ufp,
+      featureFlags: { ...ctx.host.ufp.featureFlags, hasMic: true, hasSpeaker: true },
+      host: "fd00::1:2",
+      talkbackSettings: {
+
+        bindAddr: "0.0.0.0",
+        bindPort: 7000,
+        bitsPerSample: 16,
+        channels: 1,
+        filterAddr: null,
+        filterPort: null,
+        quality: 1,
+        samplingRate: 22050,
+        typeFmt: "aac",
+        typeIn: "aac",
+        url: ""
+      }
+    };
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    await prepareAndStart(ctx);
+
+    const teeHasAudio = teeSinkArgument(ctx.spawnedArgs[0] ?? []).includes("select=a");
+
+    assert.ok(teeHasAudio, "live ffmpeg must include HomeKit audio sink when two-way is enabled");
+    await waitFor(() => returnAudioArgs.length > 0, "return-audio ffmpeg");
+
+    assert.equal(returnAudioArgs.length, 1);
+    const destination = returnAudioArgs[0]?.at(-1) ?? "";
+
+    assert.equal(destination, "udp://[fd00::1:2]:7000", "return audio must use talkbackDestination (M9)");
+    assert.doesNotMatch(destination, /^udp:\/\/fd00::/);
+
+    await stopActiveSession(ctx);
+  });
+
+  test("RECONFIGURE debug log formats HomeKit bitrate in bps (times 1000)", async () => {
+
+    const ctx = createHarness();
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    const startRequest = makeStartRequest();
+
+    startRequest.video.max_bit_rate = 400;
+
+    await prepareAndStart(ctx, startRequest);
+
+    const reconfigureRequest = { ...startRequest, video: { ...startRequest.video, max_bit_rate: 1200 } };
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({ ...reconfigureRequest, type: StreamRequestTypes.RECONFIGURE },
+        (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    const expectedReconfigure = formatBps(1200 * 1000);
+    const expectedStartOnly = formatBps(400 * 1000);
+    const adjustmentLines = ctx.logEntries.filter((entry) => entry.message.includes("Streaming parameters adjustment requested by HomeKit")).map(formatLogEntry);
+
+    assert.equal(adjustmentLines.length, 1, "RECONFIGURE must emit exactly one adjustment line (M11)");
+    assert.ok(adjustmentLines[0]?.includes(expectedReconfigure),
+      "RECONFIGURE line must use formatBps(HomeKit kbps×1000) for the new request");
+    assert.ok(!adjustmentLines[0]?.includes(expectedStartOnly),
+      "RECONFIGURE line must not repeat the prior start-session bitrate without ×1000");
+
+    await stopActiveSession(ctx, startRequest.sessionID);
+  });
+
+  test("IPv6 zone refusal on start disposes prepared session without spawning video ffmpeg", async () => {
+
+    let disposeCalls = 0;
+    const ctx = createHarness({
+
+      delegateTestOptions: { recordDisposePreparedSession: () => { disposeCalls += 1; } }
+    });
+
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    const sessionId = SESSION_ID + "-ipv6-zone";
+
+    await assert.rejects(() => prepareAndStart(ctx, { ...makeStartRequest(), sessionID: sessionId },
+      makePrepareRequest({ addressVersion: "ipv6", session: sessionId, targetAddress: "fe80::1%en0" })), /zone/);
+    assert.equal(ctx.spawnedArgs.length, 0, "SRTP refusal must dispose prepared session before spawn (M12)");
+    assert.equal(disposeCalls, 1, "zone refusal must call disposePreparedSession (M12)");
+
+    await prepareAndStart(ctx, { ...makeStartRequest(), sessionID: sessionId },
+      makePrepareRequest({ session: sessionId, targetAddress: "127.0.0.1" }));
+
+    assert.equal(ctx.spawnedArgs.length, 1, "re-prepare after zone refusal must release reservations and allow a normal start (M12)");
+    await stopActiveSession(ctx, sessionId);
   });
 
 });

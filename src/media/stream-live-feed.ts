@@ -73,7 +73,7 @@ export async function consumeLiveStreamSegments(getFfmpeg: () => ProtectStreamin
 
   try {
 
-    for await (const segment of subscription) {
+    for await(const segment of subscription) {
 
       // The init segment is consumed through the cached subscription.initSegment getter and prepended once below as the header, not written here. Skip it.
       if(segment.type === "init") {

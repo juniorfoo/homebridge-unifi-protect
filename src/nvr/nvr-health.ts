@@ -3,22 +3,24 @@
  * nvr-health.ts: Cohesive observability for the NVR's current operating condition.
  *
  * This module models the *health* of a UniFi Protect NVR as a first-class, NVR-scoped concept that the rest of the plugin can read instead of having to stitch
- * the picture together from per-component counters and per-camera errors. The design follows three principles:
+ * the picture together from per-component counters and per-camera errors. The design follows these principles:
  *
- *   1. Health is *derived*, not *set*. Inputs are typed symptoms (`HealthSymptom`) flowing in from the components that observe them - the unifi-protect API
- *      layer for request results and throttle transitions, the livestream subscription seam for stall events. The state is computed by a pure reducer over a sliding
+ *   1. Health is *derived*, not *set*. Inputs are typed symptoms (`HealthSymptom`) flowing in from the controller's health bridge, which translates the library's
+ *      diagnostics wire - request outcomes, throttle transitions, livestream recovery episodes - into them. The state is computed by a pure reducer over a sliding
  *      window of those symptoms with hysteresis. There is no `setState` method. Callers can only `observe` symptoms.
  *
- *   2. Single source of truth, single home. There is exactly one NvrHealth per ProtectNvr. Every subsystem that wants to know "is the NVR OK?" reads
- *      `nvr.health.state`. Every subsystem that observes a symptom calls `nvr.health.observe(...)`. No parallel "is X stressed" flags scattered across classes.
+ *   2. Single source of truth, single home. There is exactly one NvrHealth per ProtectNvr, owned by that controller's health bridge. Every subsystem that wants to
+ *      know "is the NVR OK?" reads `nvr.health.state`, and the bridge is the one caller observing symptoms into it. No parallel "is X stressed" flags scattered
+ *      across classes.
  *
  *   3. Mechanism vs policy separation. This module owns the *mechanism*: the symptom buffer, the eviction window, the threshold transitions. The recovery
  *      policy that consumes the resulting state lives elsewhere (e.g., in livestream-recovery-policy.ts). State here is a value other code can map to actions; this
  *      module does not decide what to do.
  *
  * The reducer is a pure function `(state, symptom, now) => state'`, exported and independently testable. The class is a thin event-sink wrapper that drives
- * the reducer with a wall clock and emits a `stateChange` event when the derived state crosses a boundary.
+ * the reducer with the clock its constructor is handed and emits a `stateChange` event when the derived state crosses a boundary.
  */
+import type { Clock } from "homebridge-plugin-utils";
 import { EventEmitter } from "node:events";
 
 // Sliding window over which symptoms are weighed, in milliseconds. One minute is long enough to absorb a single retry burst without flipping state, short enough
@@ -52,8 +54,8 @@ export type NvrHealthState = "degraded" | "healthy" | "stressed";
 
 /**
  * Symptoms feed the reducer. Each variant carries the timestamp when the symptom occurred (stamped by the caller, so the reducer remains pure with respect to
- * wall time), and a discriminating `kind`. A `cameraId` is included on livestream variants so future policies can distinguish per-camera vs. correlated stress
- * without changing the symptom shape.
+ * wall time), and a `kind` field that marks the variant. A `cameraId` is included on livestream variants so future policies can distinguish per-camera vs.
+ * correlated stress without changing the symptom shape.
  *
  *   - `apiError`: an API request returned a failure (timeout, 4xx/5xx, network error, etc.).
  *   - `apiSuccess`: an API request returned a successful response. Counted as evidence of recovery; reduces the apparent symptom rate.
@@ -233,16 +235,6 @@ function transitionState(prev: NvrHealthState, weight: number): NvrHealthState {
 }
 
 /**
- * Injectable clock for testability. Production uses {@link systemClock}; tests can substitute a deterministic clock to drive eviction without real time.
- */
-export interface Clock {
-
-  now(): number;
-}
-
-export const systemClock: Clock = { now: (): number => Date.now() };
-
-/**
  * Event surface for {@link NvrHealth}. Listeners receive the new state on every transition; the previous state is provided for context (so listeners can
  * render directional log lines like "healthy -> degraded" without tracking it themselves).
  */
@@ -258,16 +250,17 @@ export interface NvrHealthEvents {
  *
  * Lifecycle integration notes for future maintainers:
  *
- *   - `suspend()` / `resume()` are normally driven from `ProtectNvr.transition()` rather than called directly. The NVR's phase is the single source of truth for
- *      "induced vs organic disruption"; this class follows along. Calling `suspend()` directly is fine for tests but in production code should go through phase
- *      transitions so all derived effects (logApiErrors, future signals) stay aligned.
- *   - `reset()` clears the symptom buffer and forces the state back to `healthy` without emitting `stateChange`. Called after a successful reconnect, whether
- *      following a disconnect (`ProtectNvr.connect()`) or an induced reboot (`ProtectNvr.resumeFromInducedReboot()`); pre-disruption symptoms are no longer
- *      relevant. We deliberately do not emit on reset because that would surface a "responsive again" message at every reset boundary, which is
- *      misleading...the reset is internal bookkeeping, not a recovery event.
+ *   - `suspend()` / `resume()` are driven from the health bridge's `notePhase`, which the controller calls on every lifecycle transition, rather than called
+ *      directly. The NVR's phase is the single source of truth for "induced vs organic disruption"; this class follows along. Calling `suspend()` directly is fine
+ *      for tests but in production code should go through phase transitions so symptom observation stays aligned with every other reader of the phase. `logApiErrors`
+ *      reads the phase and the reboot scheduler's gate beside it, so it can move with no transition at all, and nothing in this class decides it.
+ *   - `reset()` clears the symptom buffer and forces the state back to `healthy` without emitting `stateChange`. Reached through the bridge's own `reset()` after a
+ *      successful reconnect, whether following a disconnect or an induced reboot; pre-disruption symptoms are no longer relevant. We deliberately do not emit on
+ *      reset because that would surface a "responsive again" message at every reset boundary, which is misleading...the reset is internal bookkeeping, not a
+ *      recovery event.
  *   - There is no "force healthy" method. Use `reset()` if you need to clear state. A force-healthy that emits a recovery event would be a footgun.
- *   - Initial state is `healthy`; the plugin assumes normalcy until proven otherwise. The NVR suspends observation in `connecting` phase so initial-connect
- *      errors do not bias the baseline.
+ *   - Initial state is `healthy`; the plugin assumes normalcy until proven otherwise. The bridge constructs this observer suspended, so initial-connect errors do
+ *      not bias the baseline.
  */
 export class NvrHealth extends EventEmitter<NvrHealthEvents> {
 
@@ -275,7 +268,7 @@ export class NvrHealth extends EventEmitter<NvrHealthEvents> {
   private suspended: boolean;
   private readonly clock: Clock;
 
-  public constructor(clock: Clock = systemClock) {
+  public constructor(clock: Clock) {
 
     super();
 
@@ -287,8 +280,8 @@ export class NvrHealth extends EventEmitter<NvrHealthEvents> {
   /**
    * Record a symptom. Drives the reducer with the current clock and emits a `stateChange` event if the derived state crossed a transition.
    *
-   * The caller stamps the symptom's `at` field at the call site (typically `Date.now()`, but a different value is acceptable for replayed or queued symptoms).
-   * The clock injected into NvrHealth is used as the eviction-window reference time on each call; it is not a fallback for `symptom.at`.
+   * The caller stamps the symptom's `at` field at the call site (the bridge stamps it from the same clock it injects here, but a different value is acceptable for
+   * replayed or queued symptoms). The clock injected into NvrHealth is used as the eviction-window reference time on each call; it is not a fallback for `symptom.at`.
    *
    * No-op while suspended: symptoms observed during operations the plugin is intentionally driving are not signal we want to surface to consumers.
    */
@@ -316,7 +309,7 @@ export class NvrHealth extends EventEmitter<NvrHealthEvents> {
 
   /**
    * Stop observing symptoms until {@link resume} is called. Used to bracket operations the plugin is intentionally driving (controlled disconnects, scheduled
-   * reboots) so the induced API errors and stalls do not get surfaced as if they were organic controller stress. Idempotent.
+   * reboots) so the induced API errors and stalls do not get surfaced as if they were organic controller stress. Safe to call more than once.
    */
   public suspend(): void {
 
@@ -324,8 +317,8 @@ export class NvrHealth extends EventEmitter<NvrHealthEvents> {
   }
 
   /**
-   * Resume observing symptoms. Idempotent. Does not change the current state...if the parent wants a clean slate after the suspend window, it should call
-   * {@link reset} explicitly.
+   * Resume observing symptoms. Safe to call more than once. Does not change the current state...if the parent wants a clean slate after the suspend window, it
+   * should call {@link reset} explicitly.
    */
   public resume(): void {
 

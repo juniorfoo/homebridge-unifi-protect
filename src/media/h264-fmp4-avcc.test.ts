@@ -7,6 +7,18 @@ import { h264LevelIdcToRank, h264ProfileIdcToRank, parseH264AvcCFromFmp4Init } f
 import { resolveDeclaredH264FromFmp4Init } from "./stream-transcode-policy.ts";
 import { TEST_H264_MAIN31_SPS, TEST_H264_MAIN_PPS, testH264SpsForProfileLevel } from "./h264-test-bytes.ts";
 
+type KnownAvcCParse = Extract<ReturnType<typeof parseH264AvcCFromFmp4Init>, { known: true }>;
+
+function requireKnownAvcC(parsed: ReturnType<typeof parseH264AvcCFromFmp4Init>): KnownAvcCParse {
+
+  if(!parsed.known) {
+
+    assert.fail("expected known parse");
+  }
+
+  return parsed;
+}
+
 function writeBox(type: string, payload: Buffer): Buffer {
 
   const header = Buffer.alloc(8);
@@ -263,27 +275,17 @@ describe("parseH264AvcCFromFmp4Init", () => {
 
   test("Main 3.1 via nested box tree", () => {
 
-    const parsed = parseH264AvcCFromFmp4Init(buildFmp4WithAvcC(77, 31));
+    const parsed = requireKnownAvcC(parseH264AvcCFromFmp4Init(buildFmp4WithAvcC(77, 31)));
 
-    assert.equal(parsed.known, true);
-
-    if(parsed.known) {
-
-      assert.equal(parsed.profileIdc, 77);
-      assert.equal(parsed.levelIdc, 31);
-    }
+    assert.equal(parsed.profileIdc, 77);
+    assert.equal(parsed.levelIdc, 31);
   });
 
   test("Main 4.0", () => {
 
-    const parsed = parseH264AvcCFromFmp4Init(buildFmp4WithAvcC(77, 40));
+    const parsed = requireKnownAvcC(parseH264AvcCFromFmp4Init(buildFmp4WithAvcC(77, 40)));
 
-    assert.ok(parsed.known);
-
-    if(parsed.known) {
-
-      assert.equal(parsed.levelIdc, 40);
-    }
+    assert.equal(parsed.levelIdc, 40);
   });
 
   test("Main 4.1", () => {
@@ -295,15 +297,10 @@ describe("parseH264AvcCFromFmp4Init", () => {
 
   test("High 5.1", () => {
 
-    const parsed = parseH264AvcCFromFmp4Init(buildFmp4WithAvcC(100, 51));
+    const parsed = requireKnownAvcC(parseH264AvcCFromFmp4Init(buildFmp4WithAvcC(100, 51)));
 
-    assert.ok(parsed.known);
-
-    if(parsed.known) {
-
-      assert.equal(parsed.profileIdc, 100);
-      assert.equal(parsed.levelIdc, 51);
-    }
+    assert.equal(parsed.profileIdc, 100);
+    assert.equal(parsed.levelIdc, 51);
   });
 
   test("truncated right after the level byte returns unknown", () => {
@@ -328,14 +325,9 @@ describe("parseH264AvcCFromFmp4Init", () => {
 
   test("avc3 sample entry", () => {
 
-    const parsed = parseH264AvcCFromFmp4Init(buildFmp4WithAvcC(77, 40, { sampleEntryType: "avc3" }));
+    const parsed = requireKnownAvcC(parseH264AvcCFromFmp4Init(buildFmp4WithAvcC(77, 40, { sampleEntryType: "avc3" })));
 
-    assert.ok(parsed.known);
-
-    if(parsed.known) {
-
-      assert.equal(parsed.profileIdc, 77);
-    }
+    assert.equal(parsed.profileIdc, 77);
   });
 
   test("Main level 30 (level_idc <= 30) is unknown", () => {
@@ -388,14 +380,9 @@ describe("parseH264AvcCFromFmp4Init", () => {
     const moov = writeBox("moov", trak);
     const fmp4 = Buffer.concat([ writeBox("ftyp", Buffer.from("isom00000008", "ascii")), moov ]);
 
-    const parsed = parseH264AvcCFromFmp4Init(fmp4);
+    const parsed = requireKnownAvcC(parseH264AvcCFromFmp4Init(fmp4));
 
-    assert.ok(parsed.known);
-
-    if(parsed.known) {
-
-      assert.equal(parsed.levelIdc, 40);
-    }
+    assert.equal(parsed.levelIdc, 40);
   });
 
   test("avcC child size spills past avc1 parent while payload remains in buffer is unknown (Copilot r4580058541 / P8)", () => {
@@ -445,15 +432,10 @@ describe("parseH264AvcCFromFmp4Init", () => {
   test("UniFi-style 1080p Main 4.0 init fixture", () => {
 
     const protectStyle = buildFmp4WithAvcC(77, 40);
-    const parsed = parseH264AvcCFromFmp4Init(protectStyle);
+    const parsed = requireKnownAvcC(parseH264AvcCFromFmp4Init(protectStyle));
 
-    assert.ok(parsed.known);
-
-    if(parsed.known) {
-
-      assert.equal(parsed.profileIdc, 77);
-      assert.equal(parsed.levelIdc, 40);
-    }
+    assert.equal(parsed.profileIdc, 77);
+    assert.equal(parsed.levelIdc, 40);
   });
 
   test("empty buffer returns unknown", () => {

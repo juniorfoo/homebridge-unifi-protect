@@ -6,24 +6,23 @@
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import type { StartStreamRequest } from "homebridge";
-import type { FfmpegOptions } from "homebridge-plugin-utils";
+import type { FfmpegOptions, HomebridgePluginLogging } from "homebridge-plugin-utils";
 import { FfmpegOptions as FfmpegOptionsImpl, H264Level, H264Profile } from "homebridge-plugin-utils";
 /* eslint-disable camelcase -- HomeKit StartStreamRequest wire field names */
-import { makeTestCameraHost } from "../testing.helpers.ts";
-import type { TestCameraHost } from "../testing.helpers.ts";
-import { appendLiveVideoEncodeToFfmpegArgs, resolveStartStreamEncodePlan, resolveStartStreamForceTranscodeDueToUserOption } from "./stream-live-wiring.ts";
+import { makeTestCameraHost } from "./testing.helpers.ts";
+import type { TestCameraHost } from "./testing.helpers.ts";
+import { appendLiveVideoEncodeToFfmpegArgs, createCopyEscalationTsbResume, resolveStartStreamEncodePlan,
+  resolveStartStreamForceTranscodeDueToUserOption } from "./stream-live-wiring.ts";
 import type { ChannelProfile } from "./resolution.ts";
 import { setLiveVideoFfmpegSpawnerForTests, spawnLiveVideoFfmpegProcess } from "./stream-live-ffmpeg-spawn.ts";
 import { TestLiveStreamingFfmpegProcess } from "./test-live-ffmpeg-process.ts";
 import type { ProtectStreamingFfmpegProcess } from "./stream-ffmpeg-process.ts";
 import { replaceFailedCopyWithTranscode } from "./stream-copy-escalation.ts";
 import { createTsbSegmentWriterRail } from "./stream-live-feed.ts";
-import { createCopyEscalationTsbResume } from "./stream-live-wiring.ts";
-import type { HomebridgePluginLogging } from "homebridge-plugin-utils";
 
 const stubChannel: ChannelProfile = {
 
-  channel: { bitrate: 4_000_000, fps: 15, height: 720, id: 1, name: "medium", width: 1280 },
+  channel: { bitrate: 4000000, fps: 15, height: 720, id: 1, name: "medium", width: 1280 },
   name: "medium"
 } as ChannelProfile;
 
@@ -80,7 +79,7 @@ describe("startStream spawn hook", () => {
 
     const camera = testCameraHost();
 
-    camera.hasFeature = (option) => option === "Video.Transcode";
+    camera.hasFeature = (option: string): boolean => option === "Video.Transcode";
 
     const force = resolveStartStreamForceTranscodeDueToUserOption(camera, false);
     const plan = resolveStartStreamEncodePlan({ channelProfile: stubChannel, ffmpegOptions: stubFfmpegOptions(), fmp4InitSegmentData: null,
@@ -91,7 +90,7 @@ describe("startStream spawn hook", () => {
 
     const args = [ "-map", "0:v:0" ];
 
-    appendLiveVideoEncodeToFfmpegArgs(stubFfmpegOptions(), args, plan.encodeDecision, stubChannel, makeRequest(), plan.encoderBitrate, false, true);
+    appendLiveVideoEncodeToFfmpegArgs(stubFfmpegOptions(), args, plan.encodeDecision, stubChannel, makeRequest(), plan.encoderBitrate, false, true, camera);
 
     assert.ok(!args.includes("copy"), "transcode path must not use -codec:v copy");
     assert.ok((args.some((part) => part.includes("libx264"))) || (args.includes("-c:v")), "transcode encoder args must be present");
@@ -134,7 +133,7 @@ describe("startStream spawn hook", () => {
     const INIT = Buffer.from("fmp4-init");
     const MEDIA = Buffer.from("media-segment");
     const copy = new TestLiveStreamingFfmpegProcess("copy");
-    const sessionInfo = { abortController: new AbortController(), addressVersion: "ipv4" as const, hasAudioSupport: false, videoReturnPort: 60_000 };
+    const sessionInfo = { abortController: new AbortController(), addressVersion: "ipv4" as const, hasAudioSupport: false, videoReturnPort: 60000 };
     const spawned: TestLiveStreamingFfmpegProcess[] = [];
     let active: TestLiveStreamingFfmpegProcess = copy;
     const rail = createTsbSegmentWriterRail({ getStdin: () => copy.stdin, signal: sessionInfo.abortController.signal });
@@ -142,15 +141,15 @@ describe("startStream spawn hook", () => {
 
       disposeCalls: 0,
       initSegment: { data: INIT },
-      async *[Symbol.asyncIterator]() {
+      async *[Symbol.asyncIterator](): AsyncGenerator<{ data: Buffer; type: "media" }, void, undefined> {
 
         yield { data: MEDIA, type: "media" as const };
       },
-      async [Symbol.asyncDispose]() {
+      async [Symbol.asyncDispose](): Promise<void> {
 
         (subscription as { disposeCalls: number }).disposeCalls += 1;
       },
-      async whenEstablished() {
+      async whenEstablished(): Promise<boolean> {
 
         return true;
       }

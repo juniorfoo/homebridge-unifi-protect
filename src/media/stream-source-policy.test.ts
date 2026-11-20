@@ -1,22 +1,22 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * stream-source-policy.test.ts: Exhaustive red-green coverage of the pure session-source decision and the pure streaming-samplerate helper.
+ * stream-source-policy.test.ts: Exhaustive red-green coverage of the pure session-source decision.
  *
- * Both are pure functions - no `this`, no I/O - so every cell is provable against constructed inputs, the property that makes pure decision modules exhaustively testable
+ * It is a pure function - no `this`, no I/O - so every cell is provable against constructed inputs, the property that makes pure decision modules exhaustively testable
  * in a way `this`-bound logic is not. The session-source table walks the seed, the A/B test flip, the recording-demand overrides, and the buffer-liveness fallback across
- * the codec and package axes; the samplerate table walks the doorbell and capability axes.
+ * the codec and package axes.
  */
 import { describe, test } from "node:test";
-import { AudioStreamingSamplerate } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
 import { resolveSessionSource } from "./stream-source-policy.ts";
-import { streamingSamplerates } from "./stream-delegate.ts";
 
-// The neutral session-source input: buffer-backed livestreaming off, no recording, buffer down, a plain camera on H.264, no A/B flip. Each test overrides only the axes
-// it exercises, so the single variable per cell is the input under test.
+// The neutral session-source input: buffer-backed livestreaming off, no recording, buffer down, a plain camera on H.264 with an RTSP-enabled stream to dial, no A/B
+// flip. Each test overrides only the axes it exercises, so the single variable per cell is the input under test. The hasRtspStream default is true because that is the
+// ordinary camera every pre-existing cell below was written against, which is what makes those cells the parity floor.
 function input(overrides: Partial<Parameters<typeof resolveSessionSource>[0]> = {}): Parameters<typeof resolveSessionSource>[0] {
 
-  return { abTestFlip: false, bufferStarted: false, hasRecordingDemand: false, isPackageCamera: false, usesTimeshiftLivestream: false, videoCodec: "h264", ...overrides };
+  return { abTestFlip: false, bufferStarted: false, hasRecordingDemand: false, hasRtspStream: true, isPackageCamera: false, usesTimeshiftLivestream: false,
+    videoCodec: "h264", ...overrides };
 }
 
 describe("resolveSessionSource - the seed and the buffer-liveness fallback", () => {
@@ -86,31 +86,62 @@ describe("resolveSessionSource - the AV1 codec constraint", () => {
       { kick: false, source: "buffer" });
   });
 
-  test("AV1 with no buffer claim at all is unavailable - the hard-error cell", () => {
+  // The AV1 floor cell. An AV1 camera with the toggle off and nothing recording has no buffer CLAIM, yet it degrades to the buffer path rather than erroring, which is
+  // the whole point of treating the toggle as a transport preference. The kick is a deliberate no-op when no standing-buffer demand exists; the supervisor's own
+  // shouldRun still answers that question.
+  test("AV1 with the toggle off and no recording degrades to the buffer path", () => {
 
     assert.deepEqual(resolveSessionSource(input({ hasRecordingDemand: false, usesTimeshiftLivestream: false, videoCodec: "av1" })),
-      { kick: false, source: "unavailable" });
+      { kick: true, source: "bufferDegraded" });
   });
 });
 
-describe("streamingSamplerates - the doorbell and capability axes", () => {
+describe("resolveSessionSource - the no-RTSP-stream grid", () => {
 
-  test("a doorbell advertises both 16 and 24 kHz in every population", () => {
+  test("the toggle on with the buffer running adopts the buffer, RTSP state irrelevant", () => {
 
-    assert.deepEqual(streamingSamplerates({ isDoorbell: true, usesTimeshiftLivestream: true }),
-      [ AudioStreamingSamplerate.KHZ_16, AudioStreamingSamplerate.KHZ_24 ]);
-    assert.deepEqual(streamingSamplerates({ isDoorbell: true, usesTimeshiftLivestream: false }),
-      [ AudioStreamingSamplerate.KHZ_16, AudioStreamingSamplerate.KHZ_24 ]);
+    assert.deepEqual(resolveSessionSource(input({ bufferStarted: true, hasRtspStream: false, usesTimeshiftLivestream: true })), { kick: false, source: "buffer" });
   });
 
-  test("a buffer-backed non-doorbell advertises just 16 kHz", () => {
+  test("the toggle on with the buffer down rides a degraded transient session rather than falling back to RTSP it cannot dial", () => {
 
-    assert.equal(streamingSamplerates({ isDoorbell: false, usesTimeshiftLivestream: true }), AudioStreamingSamplerate.KHZ_16);
+    assert.deepEqual(resolveSessionSource(input({ hasRtspStream: false, usesTimeshiftLivestream: true })), { kick: true, source: "bufferDegraded" });
   });
 
-  test("a non-doorbell streamed directly over RTSP (toggle off or not capable) advertises both 16 and 24 kHz", () => {
+  test("the toggle on with the buffer down on AV1 rides a degraded transient session", () => {
 
-    assert.deepEqual(streamingSamplerates({ isDoorbell: false, usesTimeshiftLivestream: false }),
-      [ AudioStreamingSamplerate.KHZ_16, AudioStreamingSamplerate.KHZ_24 ]);
+    assert.deepEqual(resolveSessionSource(input({ hasRtspStream: false, usesTimeshiftLivestream: true, videoCodec: "av1" })),
+      { kick: true, source: "bufferDegraded" });
+  });
+
+  // The floor cell for the ordinary no-RTSP camera: the user asked for direct RTSP, nothing is recording, and there is no RTSP stream to dial. Its live views come from
+  // the buffer path rather than failing - the whole point of treating the toggle as a preference.
+  test("the toggle off with no RTSP stream degrades to the buffer path rather than failing", () => {
+
+    assert.deepEqual(resolveSessionSource(input({ hasRtspStream: false, usesTimeshiftLivestream: false })), { kick: true, source: "bufferDegraded" });
+  });
+
+  test("the toggle off while recording with the buffer down rides a degraded transient session", () => {
+
+    assert.deepEqual(resolveSessionSource(input({ hasRecordingDemand: true, hasRtspStream: false, usesTimeshiftLivestream: false })),
+      { kick: true, source: "bufferDegraded" });
+  });
+
+  test("the toggle off while recording with the buffer running adopts the buffer", () => {
+
+    assert.deepEqual(resolveSessionSource(input({ bufferStarted: true, hasRecordingDemand: true, hasRtspStream: false, usesTimeshiftLivestream: false })),
+      { kick: false, source: "buffer" });
+  });
+
+  test("a package camera recording with the buffer down and no RTSP stream rides a degraded transient session", () => {
+
+    assert.deepEqual(resolveSessionSource(input({ hasRecordingDemand: true, hasRtspStream: false, isPackageCamera: true, usesTimeshiftLivestream: false })),
+      { kick: true, source: "bufferDegraded" });
+  });
+
+  // The A/B flip swaps a buffer choice to RTSP, and the floor then catches it: a camera with no RTSP stream cannot honor the swap, so it comes back to the buffer path.
+  test("the A/B flip off the buffer comes back to the buffer path when there is no RTSP stream to swap to", () => {
+
+    assert.deepEqual(resolveSessionSource(input({ abTestFlip: true, hasRtspStream: false, usesTimeshiftLivestream: true })), { kick: true, source: "bufferDegraded" });
   });
 });

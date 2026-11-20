@@ -7,7 +7,7 @@ import type { HAP, Service } from "homebridge";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import { PROTECT_DOORBELL_AUTHSENSOR_DURATION, PROTECT_DOORBELL_TRIGGER_DURATION } from "../settings.ts";
 import { ProtectReservedNames, packageCameraId } from "../types.ts";
-import { guardedPublish, mqttTopic } from "../mqtt.ts";
+import { TimerRegistry, mqttTopic, resolveMqttTopic } from "homebridge-plugin-utils";
 import type { FirehoseDispatchPayload } from "../diagnostics.ts";
 import type { ProtectCamera } from "../devices/cameras/camera.ts";
 import type { ProtectDevice } from "../devices/device.ts";
@@ -15,6 +15,8 @@ import type { ProtectNvr } from "./nvr.ts";
 import { SMART_DETECT_ENRICHERS } from "./smart-detect-metadata.ts";
 import type { SmartDetectEventItem } from "./smart-detect-metadata.ts";
 import { channels } from "../diagnostics.ts";
+import { mqttTopics } from "../mqtt.ts";
+import { smartDetectLabel } from "../options.ts";
 
 // The subkey infix that namespaces a camera's per-smart-detection-type timers and high-water marks under its device id: a full key reads
 // "<id>.Motion.SmartDetect.ObjectSensors.<type>", and a per-plate window extends it with ".<plate>". Written once here so the key build, the plate derivation, and the
@@ -39,14 +41,14 @@ function matchesEventKeyBoundary(options: { boundary: string; candidate: string 
  * drives. Controller-state merge, packet re-emit, and per-id fan-out belong to the unifi-protect library's reducer and observe loops; what lives here is purely the
  * routing and delivery.
  *
- *   - `run()` is one controller-level consumer of `client.events()` - the typed, classified firehose. It switches on the discriminated `kind` and dispatches each
+ *   - `run()` is one controller-level consumer of `client.events()` - the typed, classified firehose. It switches on the event's `kind` and dispatches each
  *     activity occurrence (smart detection, doorbell ring, tamper, Access doorbell ring, doorbell auth) to the addressed accessory's delivery method. State transitions
  *     (deviceAdded/devicePatched/...) are the NVR observe loops' concern and are ignored here. Bare camera motion is NOT routed here: the controller signals it only as a
  *     `lastMotion` device-state advance with no occurrence packet, so the camera leaf observes that field directly, exactly as the sensor and light families do.
  *   - `publishTelemetry()` is the controller telemetry republisher: every raw frame off `client.rawPackets()` is mirrored to MQTT when the user opts in.
  *   - the delivery methods (`motionEventHandler`, `doorbellEventHandler`) own the HomeKit-facing behavior - the characteristic writes, the reset timers, and the MQTT
  *     side-channels - while `accessEventHandler` maps a UniFi Access intercom doorbell press onto that same doorbell ring delivery rather than owning a path of its own.
- *     Their *trigger* is the typed firehose: each delivery fires on a discriminated event kind.
+ *     Their *trigger* is the typed firehose: each delivery fires on its own event kind.
  *
  * A plain class, not an EventEmitter: nothing here emits. The accessory leaves call the delivery methods directly through `nvr.events`, and the router and telemetry
  * publisher are spawned as NVR observe loops, so no event bus survives. The controller's systemInfo is consumed the same way, through a narrow `client.state.observe`
@@ -57,7 +59,7 @@ export class ProtectEventDispatch {
   private hap: HAP;
   private log: HomebridgePluginLogging;
   private nvr: ProtectNvr;
-  private readonly eventTimers: Map<string, NodeJS.Timeout>;
+  private readonly eventTimers: TimerRegistry;
   private readonly smartDetectLoggedAttributes: Map<string, number>;
 
   // Initialize an instance of our Protect event dispatcher.
@@ -68,20 +70,24 @@ export class ProtectEventDispatch {
     // packet consumers both need a connected controller. That work lives in the NVR's loops - the typed firehose router (run) and the telemetry publisher
     // (publishTelemetry) below, both spawned post-connect and bound to the shutdown signal - so this stays a plain field-initializer and the controller-scoped work
     // happens when those loops start.
-    this.eventTimers = new Map();
     this.hap = nvr.platform.api.hap;
     this.log = nvr.log;
     this.nvr = nvr;
     this.smartDetectLoggedAttributes = new Map();
+
+    // Every event window's reset timer, keyed by the window it closes and armed on the platform's clock. A key holds one pending reset, so re-arming a window replaces
+    // its reset rather than stacking a second one. The registry is bound to no lifetime signal, so a reset still pending at shutdown is not cancelled and runs its
+    // callback at its deadline.
+    this.eventTimers = new TimerRegistry({ clock: nvr.platform.clock });
   }
 
   // The typed-firehose router. One controller-level consumer of the classified event stream: each event arrives already modeled (the unifi-protect library owns the
-  // decode and classification), so we switch on the discriminated kind and route each activity occurrence to the addressed accessory's HomeKit delivery method. The
+  // decode and classification), so we switch on the event's kind and route each activity occurrence to the addressed accessory's HomeKit delivery method. The
   // caller binds this to the NVR's terminal shutdown signal; the loop ends quietly when that signal aborts (the library smooths the caller's own abort into a clean
   // return).
   public async run(signal: AbortSignal): Promise<void> {
 
-    for await (const event of this.nvr.client.events({ signal })) {
+    for await(const event of this.nvr.client.events({ signal })) {
 
       switch(event.kind) {
 
@@ -210,22 +216,23 @@ export class ProtectEventDispatch {
     }
   }
 
-  // Resolve a firehose camera/device id to the addressed camera accessory, or null when it is absent or not a camera. Doorbells share the camera model key and extend
-  // ProtectCamera, so this narrows to both. Cameras are the only accessories the activity firehose addresses, so a non-camera match (or an unconfigured id) is a clean
-  // no-op at the call site.
+  // Resolve a firehose camera/device id to the addressed camera accessory, or null when it is absent or not a camera. A doorbell shares the camera model key and
+  // carries the doorbell capability, so this narrows to both. Cameras are the only accessories the activity firehose addresses, so a non-camera match (or an
+  // unconfigured id) is a clean no-op at the call site.
   private cameraFor(id: string): Nullable<ProtectCamera> {
 
     const device = this.nvr.getDeviceById(id);
 
     // Address the camera only when its controller record is still present and it is a camera. A device lingering in the removal grace (recordPresent false) routes no
     // delivery - the firehose would otherwise address a record on its way out - and a non-camera match (or an unconfigured id) stays a clean no-op, both read through the
-    // non-throwing identity accessors.
+    // non-throwing identity accessors. Each device class fixes modelKey to its own category literal, so the tag comparison narrows the device union to the camera family
+    // structurally and the return needs no assertion to say what the compiler already knows.
     if(!device || !device.recordPresent || (device.modelKey !== "camera")) {
 
       return null;
     }
 
-    return device as ProtectCamera;
+    return device;
   }
 
   // Publish a firehose-dispatch milestone on the forward-only diagnostics channel when a routed activity event reaches a delivery method. Zero-cost when no subscriber
@@ -264,12 +271,11 @@ export class ProtectEventDispatch {
 
     const hadInflightMotion = this.eventTimers.has(id);
 
-    for(const [ key, timer ] of this.eventTimers) {
+    for(const key of this.eventTimers.keys()) {
 
       if(matchesEventKeyBoundary({ boundary: id, candidate: key })) {
 
-        clearTimeout(timer);
-        this.eventTimers.delete(key);
+        this.eventTimers.clear(key);
       }
     }
 
@@ -322,20 +328,20 @@ export class ProtectEventDispatch {
 
       if((key === id) || (key === packageId)) {
 
-        owedTopics.add(mqttTopic(protectDevice.mac, "motion"));
+        owedTopics.add(mqttTopic(protectDevice.mac, mqttTopics.motion.topic));
       } else if(key.endsWith(OCCUPANCY_KEY_SUFFIX)) {
 
-        owedTopics.add(mqttTopic(protectDevice.mac, "occupancy"));
+        owedTopics.add(mqttTopic(protectDevice.mac, mqttTopics.occupancy.topic));
       } else if(key.startsWith(smartPrefix) && !key.slice(smartPrefix.length).includes(".")) {
 
-        owedTopics.add(mqttTopic(protectDevice.mac, "motion/smart/" + key.slice(smartPrefix.length)));
+        owedTopics.add(mqttTopic(protectDevice.mac, resolveMqttTopic(mqttTopics.smartMotion.topic, { object: key.slice(smartPrefix.length) })));
       }
     }
 
     // Publish each owed terminal "false" exactly once, then reclaim the timers and high-water marks under the same exact-boundary rule.
     for(const topic of owedTopics) {
 
-      guardedPublish(this.log, this.nvr.mqtt, topic, "false");
+      this.nvr.mqtt?.publishGuarded(topic, "false");
     }
 
     this.clearEventTimersForDevice(id);
@@ -372,21 +378,17 @@ export class ProtectEventDispatch {
       protectDevice.accessory.getServiceById(this.hap.Service.Switch, ProtectReservedNames.SWITCH_MOTION_TRIGGER)?.updateCharacteristic(this.hap.Characteristic.On, true);
 
       // Publish the motion event to MQTT, if the user has configured it.
-      guardedPublish(this.log, this.nvr.mqtt, mqttTopic(protectDevice.mac, "motion"), "true");
+      this.nvr.mqtt?.publishGuarded(mqttTopic(protectDevice.mac, mqttTopics.motion.topic), "true");
 
       // Log the event, if configured to do so.
       if(protectDevice.hints.logMotion) {
 
         protectDevice.log.info("Motion detected.");
       }
-    } else {
-
-      // Clear out the inflight motion event timer.
-      clearTimeout(this.eventTimers.get(protectDevice.id));
     }
 
-    // Reset our motion event after motionDuration.
-    this.eventTimers.set(protectDevice.id, setTimeout(() => {
+    // Reset our motion event after motionDuration. A motion event inside an inflight window re-arms its reset, which extends the window.
+    this.eventTimers.setTimeout(protectDevice.id, () => {
 
       motionService.updateCharacteristic(this.hap.Characteristic.MotionDetected, false);
 
@@ -399,18 +401,15 @@ export class ProtectEventDispatch {
       // The parent camera and its package camera publish motion on the same bare-MAC topic under independently-keyed windows, so whichever window ends LAST owns the
       // terminal reset - the same sibling-ownership rule the package detach applies in doorbell.ts. A real device's id is its mac exactly and the package camera's id
       // carries the ".PackageCamera" suffix (the identity contract in device.ts), so the sibling is the package id for a parent and the bare mac for the package; we hold
-      // the shared "false" while the sibling's own window is still inflight. The per-accessory HomeKit reset and the timer bookkeeping above stay unconditional - only
-      // this shared MQTT topic has the ownership question. With no package camera the sibling probe simply finds nothing, so a lone camera publishes exactly as before.
+      // the shared "false" while the sibling's own window is still inflight. The per-accessory HomeKit reset above stays unconditional - only this shared MQTT topic
+      // has the ownership question. With no package camera the sibling probe simply finds nothing, so a lone camera always publishes its reset.
       const siblingId = (protectDevice.id === protectDevice.mac) ? packageCameraId(protectDevice.mac) : protectDevice.mac;
 
       if(!this.hasInflightMotion(siblingId)) {
 
-        guardedPublish(this.log, this.nvr.mqtt, mqttTopic(protectDevice.mac, "motion"), "false");
+        this.nvr.mqtt?.publishGuarded(mqttTopic(protectDevice.mac, mqttTopics.motion.topic), "false");
       }
-
-      // Delete the timer from our motion event tracker.
-      this.eventTimers.delete(protectDevice.id);
-    }, protectDevice.hints.motionDuration * 1000));
+    }, protectDevice.hints.motionDuration * 1000);
 
     // We build a unified list of the object events we're interested in: legacy smart detections first, followed by thumbnail-based detections.
     const smartEvents: SmartDetectEventItem[] = [];
@@ -429,8 +428,8 @@ export class ProtectEventDispatch {
           confidence: detection.confidence,
           name: detection.name,
 
-          // The source and target types already match here. We keep this assertion as a visible, load-bearing marker that the raw thumbnail is intentionally carried
-          // through unmodified as the enricher payload, so a future change to either type is caught by the compiler rather than silently drifting apart.
+          // The source and target types already match here. We keep this assertion as a visible marker that the raw thumbnail is intentionally carried through
+          // unmodified as the enricher payload, so removing it would let a future change to either type silently drift apart instead of being caught by the compiler.
           payload: detection as ProtectEventMetadataDetectedThumbnail,
           type: detection.type ?? ""
         })));
@@ -469,29 +468,23 @@ export class ProtectEventDispatch {
           updateCharacteristic(this.hap.Characteristic.ContactSensorState, this.hap.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED);
 
         // Publish the smart detection event to MQTT, if the user has configured it.
-        guardedPublish(this.log, this.nvr.mqtt, mqttTopic(protectDevice.mac, "motion/smart/" + event.type), "true");
-      } else {
-
-        // Clear out the inflight motion event timer.
-        clearTimeout(this.eventTimers.get(key));
+        this.nvr.mqtt?.publishGuarded(mqttTopic(protectDevice.mac, resolveMqttTopic(mqttTopics.smartMotion.topic, { object: event.type })), "true");
       }
 
-      // Reset our smart detection contact sensors after motionDuration.
-      this.eventTimers.set(key, setTimeout(() => {
+      // Reset our smart detection contact sensors after motionDuration, replacing any reset already inflight for this type's window.
+      this.eventTimers.setTimeout(key, () => {
 
         // Reset our smart detection contact sensor.
         protectDevice.accessory.getServiceById(this.hap.Service.ContactSensor, ProtectReservedNames.CONTACT_MOTION_SMARTDETECT + "." + event.type)?.
           updateCharacteristic(this.hap.Characteristic.ContactSensorState, this.hap.Characteristic.ContactSensorState.CONTACT_DETECTED);
 
         // Publish the smart detection event to MQTT, if the user has configured it.
-        guardedPublish(this.log, this.nvr.mqtt, mqttTopic(protectDevice.mac, "motion/smart/" + event.type), "false");
+        this.nvr.mqtt?.publishGuarded(mqttTopic(protectDevice.mac, resolveMqttTopic(mqttTopics.smartMotion.topic, { object: event.type })), "false");
         protectDevice.log.debug("Resetting smart object motion event.");
 
-        // Delete the timer, then sweep every logged-attribute high-water mark under this type's window boundary - the bare type-level key and every identity-suffixed
-        // key beneath it - so the next motion window for this type starts fresh. Identity marks accumulate for the LIFE of the type window during sustained activity by
-        // design; the window's close here (or device removal) is their single reclaim boundary.
-        this.eventTimers.delete(key);
-
+        // Sweep every logged-attribute high-water mark under this type's window boundary - the bare type-level key and every identity-suffixed key beneath it - so the
+        // next motion window for this type starts fresh. Identity marks accumulate for the LIFE of the type window during sustained activity by design; the window's
+        // close here (or device removal) is their single reclaim boundary.
         for(const markKey of this.smartDetectLoggedAttributes.keys()) {
 
           if(matchesEventKeyBoundary({ boundary: key, candidate: markKey })) {
@@ -499,7 +492,7 @@ export class ProtectEventDispatch {
             this.smartDetectLoggedAttributes.delete(markKey);
           }
         }
-      }, protectDevice.hints.motionDuration * 1000));
+      }, protectDevice.hints.motionDuration * 1000);
 
       // Vehicles can carry a license plate. If the user has configured a contact sensor for a specific plate, trip the matching one. This per-plate contact-sensor
       // feature (the SmartDetect.ObjectSensors.LicensePlate option) is independent of the log and MQTT metadata rendering below, which the per-type enricher owns.
@@ -514,21 +507,15 @@ export class ProtectEventDispatch {
           protectDevice.accessory.getServiceById(this.hap.Service.ContactSensor,
             ProtectReservedNames.CONTACT_MOTION_SMARTDETECT_LICENSE + "." + plate)?.
             updateCharacteristic(this.hap.Characteristic.ContactSensorState, this.hap.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED);
-        } else {
-
-          clearTimeout(this.eventTimers.get(plateKey));
         }
 
-        // Reset our license plate smart detection contact sensor after motionDuration.
-        this.eventTimers.set(plateKey, setTimeout(() => {
+        // Reset our license plate smart detection contact sensor after motionDuration, replacing any reset already inflight for this plate.
+        this.eventTimers.setTimeout(plateKey, () => {
 
           protectDevice.accessory.getServiceById(this.hap.Service.ContactSensor,
             ProtectReservedNames.CONTACT_MOTION_SMARTDETECT_LICENSE + "." + plate)?.
             updateCharacteristic(this.hap.Characteristic.ContactSensorState, this.hap.Characteristic.ContactSensorState.CONTACT_DETECTED);
-
-          // Delete the timer from our motion event tracker.
-          this.eventTimers.delete(plateKey);
-        }, protectDevice.hints.motionDuration * 1000));
+        }, protectDevice.hints.motionDuration * 1000);
       }
 
       // Render this detection's rich metadata through its per-type enricher, if one exists. A type with no enricher - or an enricher that has produced nothing yet - is a
@@ -567,13 +554,14 @@ export class ProtectEventDispatch {
 
       if(mqttPayload) {
 
-        guardedPublish(this.log, this.nvr.mqtt, mqttTopic(protectDevice.mac, "motion/smart/" + event.type + "/metadata"), JSON.stringify(mqttPayload));
+        this.nvr.mqtt?.publishGuarded(mqttTopic(protectDevice.mac, resolveMqttTopic(mqttTopics.smartMotionMetadata.topic, { object: event.type })),
+          JSON.stringify(mqttPayload));
       }
 
       // Log the enriched line, if the user has opted into motion logging.
       if(protectDevice.hints.logMotion) {
 
-        protectDevice.log.info("Smart motion detected: %s (%s).", event.type, attributes.join(", "));
+        protectDevice.log.info("Smart motion detected: %s (%s).", smartDetectLabel(event.type), attributes.join(", "));
       }
     }
 
@@ -583,7 +571,7 @@ export class ProtectEventDispatch {
 
     if(coalescedLine.length && protectDevice.hints.logMotion) {
 
-      protectDevice.log.info("Smart motion detected: %s.", coalescedLine.join(", "));
+      protectDevice.log.info("Smart motion detected: %s.", coalescedLine.map((type) => smartDetectLabel(type)).join(", "));
     }
 
     // Occupancy considers every smart detection the sensors actually saw - the unified list of legacy object types AND thumbnail detections alike - so a thumbnail-only
@@ -595,12 +583,6 @@ export class ProtectEventDispatch {
 
       if(occupancyService) {
 
-        // Kill any inflight reset timer.
-        if(this.eventTimers.has(protectDevice.id + OCCUPANCY_KEY_SUFFIX)) {
-
-          clearTimeout(this.eventTimers.get(protectDevice.id + OCCUPANCY_KEY_SUFFIX));
-        }
-
         // If the occupancy sensor isn't already triggered, let's do so now.
         if(occupancyService.getCharacteristic(this.hap.Characteristic.OccupancyDetected).value !== true) {
 
@@ -608,34 +590,31 @@ export class ProtectEventDispatch {
           occupancyService.updateCharacteristic(this.hap.Characteristic.OccupancyDetected, true);
 
           // Publish the occupancy event to MQTT, if the user has configured it.
-          guardedPublish(this.log, this.nvr.mqtt, mqttTopic(protectDevice.mac, "occupancy"), "true");
+          this.nvr.mqtt?.publishGuarded(mqttTopic(protectDevice.mac, mqttTopics.occupancy.topic), "true");
 
           // Log the event, if configured to do so.
           if(protectDevice.hints.logMotion) {
 
-            protectDevice.log.info("Occupancy detected%s.",
-              protectDevice.hints.smartDetect ? ": " + protectDevice.hints.smartOccupancy.filter(x => smartEvents.some(event => event.type === x)).join(", ") : "");
+            protectDevice.log.info("Occupancy detected%s.", protectDevice.hints.smartDetect ? ": " +
+              protectDevice.hints.smartOccupancy.filter(x => smartEvents.some(event => event.type === x)).map((type) => smartDetectLabel(type)).join(", ") : "");
           }
         }
 
-        // Reset our occupancy state after occupancyDuration.
-        this.eventTimers.set(protectDevice.id + OCCUPANCY_KEY_SUFFIX, setTimeout(() => {
+        // Reset our occupancy state after occupancyDuration, replacing any reset already inflight, so each qualifying detection extends the window.
+        this.eventTimers.setTimeout(protectDevice.id + OCCUPANCY_KEY_SUFFIX, () => {
 
           // Reset the occupancy sensor.
           occupancyService.updateCharacteristic(this.hap.Characteristic.OccupancyDetected, false);
 
           // Publish to MQTT, if the user has configured it.
-          guardedPublish(this.log, this.nvr.mqtt, mqttTopic(protectDevice.mac, "occupancy"), "false");
+          this.nvr.mqtt?.publishGuarded(mqttTopic(protectDevice.mac, mqttTopics.occupancy.topic), "false");
 
           // Log the event, if configured to do so.
           if(protectDevice.hints.logMotion) {
 
             protectDevice.log.info("Occupancy no longer detected.");
           }
-
-          // Delete the timer from our occupancy event tracker.
-          this.eventTimers.delete(protectDevice.id + OCCUPANCY_KEY_SUFFIX);
-        }, protectDevice.hints.occupancyDuration * 1000));
+        }, protectDevice.hints.occupancyDuration * 1000);
       }
     }
   }
@@ -669,68 +648,49 @@ export class ProtectEventDispatch {
 
     if(triggerService) {
 
-      // Kill any inflight trigger reset.
-      if(this.eventTimers.has(protectDevice.id + ".Doorbell.Ring.Trigger")) {
-
-        clearTimeout(this.eventTimers.get(protectDevice.id + ".Doorbell.Ring.Trigger"));
-        this.eventTimers.delete(protectDevice.id + ".Doorbell.Ring.Trigger");
-      }
-
       // Flag that we're ringing.
       protectDevice.isRinging = true;
 
       // Update the trigger switch state.
       triggerService.updateCharacteristic(this.hap.Characteristic.On, true);
 
-      // Reset our doorbell trigger.
-      this.eventTimers.set(protectDevice.id + ".Doorbell.Ring.Trigger", setTimeout(() => {
+      // Reset our doorbell trigger, replacing any trigger reset already inflight.
+      this.eventTimers.setTimeout(protectDevice.id + ".Doorbell.Ring.Trigger", () => {
 
         protectDevice.isRinging = false;
 
         triggerService.updateCharacteristic(this.hap.Characteristic.On, false);
         this.log.debug("Resetting doorbell ring trigger.");
-
-        // Delete the timer from our motion event tracker.
-        this.eventTimers.delete(protectDevice.id + ".Doorbell.Ring.Trigger");
-      }, PROTECT_DOORBELL_TRIGGER_DURATION));
+      }, PROTECT_DOORBELL_TRIGGER_DURATION);
     }
 
     // Publish to MQTT, if the user has configured it.
-    guardedPublish(this.log, this.nvr.mqtt, mqttTopic(protectDevice.mac, "doorbell"), "true");
+    this.nvr.mqtt?.publishGuarded(mqttTopic(protectDevice.mac, mqttTopics.doorbell.topic), "true");
 
     if(protectDevice.hints.logDoorbell) {
 
       protectDevice.log.info("Doorbell ring detected.");
     }
 
-    // Kill any inflight MQTT reset.
-    if(this.eventTimers.has(protectDevice.id + ".Doorbell.Ring.MQTT")) {
+    // Reset our MQTT doorbell ring event, replacing any MQTT reset already inflight.
+    this.eventTimers.setTimeout(protectDevice.id + ".Doorbell.Ring.MQTT", () => {
 
-      clearTimeout(this.eventTimers.get(protectDevice.id + ".Doorbell.Ring.MQTT"));
-      this.eventTimers.delete(protectDevice.id + ".Doorbell.Ring.MQTT");
-    }
+      this.nvr.mqtt?.publishGuarded(mqttTopic(protectDevice.mac, mqttTopics.doorbell.topic), "false");
+    }, PROTECT_DOORBELL_TRIGGER_DURATION);
 
-    // Fire off our MQTT doorbell ring event.
-    this.eventTimers.set(protectDevice.id + ".Doorbell.Ring.MQTT", setTimeout(() => {
-
-      guardedPublish(this.log, this.nvr.mqtt, mqttTopic(protectDevice.mac, "doorbell"), "false");
-
-      // Delete the timer from our event tracker.
-      this.eventTimers.delete(protectDevice.id + ".Doorbell.Ring.MQTT");
-    }, PROTECT_DOORBELL_TRIGGER_DURATION));
+    // The ring-suppression window resolves at the doorbell's own scope, so one camera's delay can differ from its siblings'; platform.config.ringDelay is the
+    // top-level fallback consulted only when no per-device option is set, and today's no-delay default survives both being absent.
+    const ringDelay = this.nvr.platform.featureOptions.getInteger("Doorbell.Ring.Delay", protectDevice.mac, this.nvr.ufp.mac) ?? this.nvr.platform.config.ringDelay;
 
     // If we don't have a ring duration defined, we're done.
-    if(!this.nvr.platform.config.ringDelay) {
+    if(!ringDelay) {
 
       return;
     }
 
-    // Reset our ring threshold.
-    this.eventTimers.set(protectDevice.id + ".Doorbell.Ring", setTimeout(() => {
-
-      // Delete the timer from our event tracker.
-      this.eventTimers.delete(protectDevice.id + ".Doorbell.Ring");
-    }, this.nvr.platform.config.ringDelay * 1000));
+    // Hold the ring-suppression window open for ringDelay. The window's key is the whole of its state - the guard at the top of this handler reads it - and the
+    // registry removes the key when the timer fires, so the callback has nothing left to do.
+    this.eventTimers.setTimeout(protectDevice.id + ".Doorbell.Ring", (): void => { /* Firing removes the key, which closes the window. */ }, ringDelay * 1000);
   }
 
   // Deliver a UniFi Access occurrence to HomeKit. The only modeled Access occurrence today is a door_bell intercom press, which we surface as a doorbell ring through the
@@ -746,22 +706,18 @@ export class ProtectEventDispatch {
   // Doorbell authentication delivery. A fingerprint match or NFC card tap trips the doorbell's authentication contact sensor when the scan resolved a known identity,
   // then resets it to its detected (resting) state after a brief window. The unifi-protect library owns the classification - which method this scan used - so we consume
   // event.method rather than re-derive it, the single source for fingerprint-vs-NFC. The delivery policy stays ours: whether the scan resolved an identity is a
-  // metadata read here, and the "authenticate" MQTT publish fires regardless of whether the contact service is configured - the service is off by default, but the
-  // side-channel is not gated on it, so only the characteristic writes are service-gated.
+  // metadata read here. The "authenticate" MQTT topic is part of the authentication sensor's capability, so it publishes only while that sensor stands.
   public authEventHandler(protectDevice: ProtectCamera, method: AuthMethod, metadata?: ProtectEventMetadata): void {
 
-    // Resolve the authentication contact sensor, if the user configured it. The optional-chained characteristic writes below make a disabled sensor a clean no-op while
-    // the MQTT publish still fires.
+    // Resolve the authentication contact sensor, if the user configured it. The doorbell creates it only while Doorbell.AuthSensor is on and the doorbell reports NFC or
+    // a fingerprint sensor, so its presence is that condition, and the characteristic writes and the MQTT publish below all follow it.
     const authService = protectDevice.accessory.getServiceById(this.hap.Service.ContactSensor, ProtectReservedNames.CONTACT_AUTHSENSOR);
 
-    // A new scan supersedes any pending reset, so we clear the inflight timer before acting - the same debounce the access delivery uses.
+    // A new scan supersedes any pending reset, so we clear the inflight timer before acting - the same debounce the access delivery uses. The clear stands on its own
+    // rather than leaving the re-arm below to replace the timer, because a scan that resolves no identity returns before that re-arm.
     const key = protectDevice.id + ".Doorbell.Auth";
 
-    if(this.eventTimers.has(key)) {
-
-      clearTimeout(this.eventTimers.get(key));
-      this.eventTimers.delete(key);
-    }
+    this.eventTimers.clear(key);
 
     // A scan that resolved no known identity - neither a matched fingerprint nor a matched card - leaves the sensor in its detected (not-authenticated) resting state and
     // publishes nothing: it is an attempt, not an authentication.
@@ -775,27 +731,29 @@ export class ProtectEventDispatch {
     // A recognized identity: trip the sensor to its not-detected (authenticated) state.
     authService?.updateCharacteristic(this.hap.Characteristic.ContactSensorState, this.hap.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED);
 
-    // Publish the credential to MQTT regardless of the sensor's presence. The method is the classifier's; a card tap additionally carries its card id, read from the
-    // metadata here at delivery.
-    const authInfo = (method === "nfc") ? { id: metadata.nfc?.nfcId ?? "", type: "nfc" } : { type: "fingerprint" };
+    // Publish the credential to MQTT while the sensor stands, because a feature the user has not enabled in HomeKit has no MQTT topic. The method is the classifier's;
+    // a card tap additionally carries its card id, read from the metadata here at delivery.
+    if(authService) {
 
-    guardedPublish(this.log, this.nvr.mqtt, mqttTopic(protectDevice.mac, "authenticate"), JSON.stringify(authInfo));
+      const authInfo = (method === "nfc") ? { id: metadata.nfc?.nfcId ?? "", type: "nfc" } : { type: "fingerprint" };
+
+      this.nvr.mqtt?.publishGuarded(mqttTopic(protectDevice.mac, mqttTopics.authenticate.topic), JSON.stringify(authInfo));
+    }
 
     // Reset the sensor to its resting state after the auth window, so HomeKit shows a momentary authentication rather than a latched one.
-    this.eventTimers.set(key, setTimeout(() => {
+    this.eventTimers.setTimeout(key, () => {
 
       authService?.updateCharacteristic(this.hap.Characteristic.ContactSensorState, this.hap.Characteristic.ContactSensorState.CONTACT_DETECTED);
-      this.eventTimers.delete(key);
-    }, PROTECT_DOORBELL_AUTHSENSOR_DURATION));
+    }, PROTECT_DOORBELL_AUTHSENSOR_DURATION);
   }
 
   // Camera tamper delivery. A tamper occurrence latches the camera tampered and trips StatusTampered on its motion sensor. The latch is one-way - UniFi Protect emits no
   // paired "tamper cleared" occurrence and the camera config carries no tamper-state field, so the occurrence is its only source - and it clears only when the user
   // toggles tamper detection in Protect (which resets isTampered through configureTamperDetection) or restarts the plugin. We set a public flag on the camera, mirroring
-  // how the doorbell-ring delivery sets isRinging, so the camera's own tamper-detection onGet and availability projection read back a single source of truth.
+  // how the doorbell-ring delivery sets isRinging, so the camera's own tamper-detection onGet and state-change re-apply read back a single source of truth.
   public tamperEventHandler(protectDevice: ProtectCamera): void {
 
-    // Idempotent: once latched, a repeat tamper occurrence is a no-op until the state is cleared - we act only on the false-to-true edge.
+    // This handler is a no-op on repeat: once latched, a repeat tamper occurrence changes nothing until the state is cleared - we act only on the false-to-true edge.
     if(protectDevice.isTampered) {
 
       return;
@@ -805,7 +763,7 @@ export class ProtectEventDispatch {
 
     // Guard the StatusTampered push behind testCharacteristic: updateCharacteristic lazily materializes an absent optional characteristic, so an unguarded write on a
     // camera without tamper detection would sprout an always-false phantom. The isTampered latch above stays the single source of truth - the camera's tamper-detection
-    // onGet and its availability projection both read it back - so a camera with no StatusTampered characteristic still records the latch even though we skip the push.
+    // onGet and its state-change re-apply read it back - so a camera with no StatusTampered characteristic still records the latch even though we skip the push.
     const motionSensor = protectDevice.accessory.getService(this.hap.Service.MotionSensor);
 
     if(motionSensor?.testCharacteristic(this.hap.Characteristic.StatusTampered)) {
@@ -817,15 +775,20 @@ export class ProtectEventDispatch {
   }
 
   // Fob button-press delivery. A press fires the addressed button's programmable-switch event in HomeKit, mapping the wire gesture to a single/double/long press value.
-  // The MQTT publish comes FIRST and is faithful to the firehose: it fires for every delivered press, including a hidden or unrecognized button and an unmapped gesture,
-  // so an automation on the raw press is never gated on which HomeKit switches happen to exist. The button subtype is addressed by the LOWERCASE wire id - the identical
-  // convention the fob leaf creates its switches under - so a hidden or unknown button resolves no service and the optional-chained notification is a clean no-op. We use
-  // sendEventNotification, never updateCharacteristic: a stateless programmable switch carries no persistent value, so this pushes the notification without caching
-  // state, and identical rapid presses each notify.
+  // A button's MQTT topic is part of the button the user selected in Fob.Buttons, so a press publishes only when the button's switch stands. The button subtype is
+  // addressed by the LOWERCASE wire id - the identical convention the fob leaf creates its switches under - so a hidden or unknown button resolves no service, which
+  // makes its publish skip and its optional-chained notification a clean no-op. For a selected button the MQTT publish comes first and carries the raw press, an
+  // unmapped gesture included. We use sendEventNotification, never updateCharacteristic: a stateless programmable switch carries no persistent value, so this pushes
+  // the notification without caching state, and identical rapid presses each notify.
   public buttonEventHandler(protectDevice: ProtectDevice, button: string, pressType: string): void {
 
-    // Publish the raw press first, faithful to the firehose - hidden and unknown buttons and unmapped gestures all publish.
-    guardedPublish(this.log, this.nvr.mqtt, mqttTopic(protectDevice.mac, "button"), JSON.stringify({ button, pressType }));
+    const buttonService = protectDevice.accessory.getServiceById(this.hap.Service.StatelessProgrammableSwitch, ProtectReservedNames.SWITCH_FOB_BUTTON + "." + button);
+
+    // Publish the raw press first, an unmapped gesture included, while the button's switch stands. A hidden or unknown button has no switch and no MQTT topic.
+    if(buttonService) {
+
+      this.nvr.mqtt?.publishGuarded(mqttTopic(protectDevice.mac, mqttTopics.button.topic), JSON.stringify({ button, pressType }));
+    }
 
     // Map the wire gesture to a HomeKit press value. An unrecognized gesture is field-diagnosable, so we surface it at info (not debug) - a wrong wire assumption would
     // otherwise silently no-op the HomeKit half - and deliver nothing further.
@@ -839,13 +802,12 @@ export class ProtectEventDispatch {
     }
 
     // Fire the addressed button's programmable-switch event. An absent service (a hidden or unknown button) makes the optional chain a clean no-op.
-    protectDevice.accessory.getServiceById(this.hap.Service.StatelessProgrammableSwitch, ProtectReservedNames.SWITCH_FOB_BUTTON + "." + button)?.
-      getCharacteristic(this.hap.Characteristic.ProgrammableSwitchEvent).sendEventNotification(value);
+    buttonService?.getCharacteristic(this.hap.Characteristic.ProgrammableSwitchEvent).sendEventNotification(value);
   }
 
-  // Map a fob's wire press gesture to HomeKit's ProgrammableSwitchEvent value, or null for an unrecognized gesture. The null sentinel is load-bearing: SINGLE_PRESS is 0,
-  // which is falsy, so the caller MUST test the result against null rather than truthiness or every single press would be swallowed. The unifi-protect library owns the
-  // classification; this is the plugin's translation of that classification onto HomeKit's fixed press values.
+  // Map a fob's wire press gesture to HomeKit's ProgrammableSwitchEvent value, or null for an unrecognized gesture. Testing the result against null matters: SINGLE_PRESS
+  // is 0, which is falsy, so a truthiness check would swallow every single press rather than delivering it. The unifi-protect library owns the classification; this is
+  // the plugin's translation of that classification onto HomeKit's fixed press values.
   private pressValue(pressType: string): Nullable<number> {
 
     switch(pressType) {
@@ -879,17 +841,18 @@ export class ProtectEventDispatch {
   // the NVR's terminal shutdown signal; the loop ends quietly on abort.
   public async publishTelemetry(signal: AbortSignal): Promise<void> {
 
+    // Telemetry is off by default, so opting in is a user deviation worth surfacing once when the publisher starts.
+    this.nvr.platform.featureOptions.logFeature({ controller: { id: this.nvr.ufp.mac, log: this.log }, label: "Protect controller telemetry",
+      log: this.nvr.platform.pluginLog, option: "Nvr.Publish.Telemetry" });
+
     if(!this.nvr.hasFeature("Nvr.Publish.Telemetry")) {
 
       return;
     }
 
-    // Telemetry is off by default, so opting in is a user deviation worth surfacing once when the publisher starts.
-    this.log.info("Protect controller telemetry enabled.");
+    for await(const packet of this.nvr.client.rawPackets({ signal })) {
 
-    for await (const packet of this.nvr.client.rawPackets({ signal })) {
-
-      guardedPublish(this.log, this.nvr.mqtt, mqttTopic(this.nvr.ufp.mac, "telemetry"), JSON.stringify(packet));
+      this.nvr.mqtt?.publishGuarded(mqttTopic(this.nvr.ufp.mac, mqttTopics.telemetry.topic), JSON.stringify(packet));
     }
   }
 }

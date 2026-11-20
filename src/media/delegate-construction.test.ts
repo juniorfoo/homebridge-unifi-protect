@@ -2,7 +2,7 @@
  *
  * delegate-construction.test.ts: The first media-delegate construction tests - the proof the ProtectCameraHost interface segregation unlocks delegate testability.
  *
- * The ProtectCameraHost interface (the dependency-inversion seam on the camera side of the media stack) lets the recording, snapshot, and timeshift delegates type
+ * The ProtectCameraHost interface (the dependency-inversion boundary on the camera side of the media stack) lets the recording, snapshot, and timeshift delegates type
  * their camera handle as a narrow contract instead of the concrete ProtectCamera. The promised payoff is that a delegate can now
  * be unit-constructed against a small stub host instead of a full camera. This suite cashes that in for the Tier-1 (field-copy ctor) delegates: each
  * constructs against the reusable TestCameraHost double with no real camera and no FFmpeg.
@@ -10,23 +10,36 @@
  * The construction proof for a field-copy ctor is necessarily thin, so the real-behavior anchor is the snapshot delegate's reachability gate, tested TWO-SIDED: with
  * the host unreachable getSnapshot returns null (the gate, the first statement of getSnapshot), and with the host reachable it returns the stub's controller Buffer
  * (the non-package pipeline falls through the timeshift and RTSP sources - both early-return on the host's undefined stream - to the controller source, with no crop
- * because the host's hints.crop is false). Two-sided proves isReachable is actually READ and that a stubbed seam value flows THROUGH the delegate's logic - the
+ * because the host's hints.crop is false). Two-sided proves isReachable is actually READ and that a stubbed interface value flows THROUGH the delegate's logic - the
  * capability the interface unlocked - not a coincidental null.
  *
- * The streaming delegate is deferred: it builds a real FfmpegOptions and a real HAP CameraController the test HAP double does not provide, and its
- * construction is already exercised through the factory seam in camera-construction.test.ts.
+ * The streaming delegate constructs here too, and it is the one member of the group that composes rather than field-copies: it builds a real FfmpegOptions (inert
+ * under the harness's default hints, which turn every acceleration and crop knob off) and hands a fully-composed options object to HAP's own camera controller, whose
+ * construction-time options the root harness reads back. That makes its construction test the suite's second real-behavior anchor - the capability arms it decides,
+ * and the probesize self-tuning its shutdown ends.
  */
+import { AudioRecordingCodecType, AudioRecordingSamplerate } from "homebridge-plugin-utils";
+import { PROTECT_PROBESIZE_OVERRIDE_MAX, PROTECT_PROBESIZE_OVERRIDE_PERMANENT_THRESHOLD, PROTECT_PROBESIZE_OVERRIDE_RESET_MS,
+  PROTECT_SEGMENT_RESOLUTION } from "../settings.ts";
+import { RECORDING_AUDIO_STAND_IN, controllerIdentityOf } from "./stream-delegate.ts";
+import { Service, cameraControllerOptions, hap } from "../testing.helpers.ts";
 import { after, describe, test } from "node:test";
-import { PROTECT_SEGMENT_RESOLUTION } from "../settings.ts";
+import { formatLogEntry, logCount } from "homebridge-plugin-utils/testing";
+import { makeChannelProfile, makeControllableLivestreamDouble, makeTestCameraHost } from "./testing.helpers.ts";
+import type { ChannelProfile } from "./resolution.ts";
+import { G2_PRO_CHANNELS } from "../camera.fixtures.ts";
+import type { LivestreamAudioFormat } from "./stream-delegate.ts";
 import { ProtectRecordingDelegate } from "./record.ts";
 import { ProtectSnapshot } from "./snapshot.ts";
+import { ProtectStreamingDelegate } from "./stream.ts";
 import { ProtectTimeshiftBuffer } from "./timeshift.ts";
 import { ProtectTimeshiftSupervisor } from "./timeshift-supervisor.ts";
 import assert from "node:assert/strict";
-import { makeTestCameraHost } from "../testing.helpers.ts";
+import { makeCameraConfig } from "../devices/testing.helpers.ts";
 
 // Every host this suite builds shares the one makeTestNvr AbortController. Aborting it in teardown releases the harness signal so a leaked observer (none here, the
-// trio ctors spawn none) could never outlive the suite. The trio ctors are pure field-copies, so construction floats no async machinery and needs no settle().
+// field-copy ctors spawn none) could never outlive the suite. The field-copy ctors are pure field-copies, so construction floats no async machinery and needs no
+// settle().
 const controllers: AbortController[] = [];
 
 after(() => {
@@ -58,7 +71,7 @@ describe("media-delegate construction against the ProtectCameraHost stub", () =>
   });
 
   // The snapshot delegate: a field-copy ctor reading log only, then the suite's real-behavior anchor. The two-sided reachability gate proves the delegate actually
-  // READS host.isReachable and that a stubbed seam value flows through its source pipeline.
+  // READS host.isReachable and that a stubbed interface value flows through its source pipeline.
   test("ProtectSnapshot constructs and its reachability gate is two-sided", async () => {
 
     const { controller, host } = makeTestCameraHost();
@@ -73,11 +86,11 @@ describe("media-delegate construction against the ProtectCameraHost stub", () =>
 
     // Side two: a reachable host returns the stub's controller Buffer. With stream undefined the timeshift and RTSP sources early-return, and with no packageCamera
     // key on the accessory context the non-package branch falls through to the controller source, which resolves snapshotResult; hints.crop is false so no crop pass
-    // runs. The returned Buffer being exactly the stubbed value is the proof a seam value threads through the delegate's logic with no FFmpeg.
+    // runs. The returned Buffer being exactly the stubbed value is the proof an interface value threads through the delegate's logic with no FFmpeg.
     host.isReachable = true;
     assert.equal(await snapshot.getSnapshot(), host.snapshotResult);
 
-    // The controller source was actually the path taken - the seam was invoked exactly once on the reachable side (the unreachable side returned before any source).
+    // The controller source was actually the path taken - the interface was invoked exactly once on the reachable side (the unreachable side returned before any source).
     assert.equal(host.snapshotFromControllerCalls.length, 1);
   });
 
@@ -95,5 +108,339 @@ describe("media-delegate construction against the ProtectCameraHost stub", () =>
     assert.equal(timeshift.isStarted, false);
     assert.equal(timeshift.isTransmitting, false);
     assert.equal(timeshift.configuredDuration, PROTECT_SEGMENT_RESOLUTION);
+  });
+
+  // The streaming delegate: the one ctor here that composes rather than field-copies. It builds the real FfmpegOptions, decides its capability arms from the host's
+  // reads, and hands HAP a composed CameraControllerOptions. The arms are asserted separately because they answer different questions: the buffer-backed supervisor
+  // stands for every camera, while the stub host is not HKSV-capable, so no recording delegate does. The recorded options carrying the
+  // delegate itself is the proof the composed object reached the controller intact rather than a coincidental non-null.
+  test("ProtectStreamingDelegate constructs against the stub host with the real FfmpegOptions", () => {
+
+    const { controller, host, logEntries } = makeTestCameraHost();
+
+    controllers.push(controller);
+
+    const stream = new ProtectStreamingDelegate(host, [[ 1920, 1080, 30 ]]);
+    const cameraController = stream.controller;
+
+    assert.ok(cameraController instanceof hap.CameraController, "the delegate constructed HAP's camera controller");
+    assert.equal(cameraControllerOptions(cameraController).delegate, stream, "the composed controller options carry the delegate itself");
+    assert.notEqual(stream.timeshift, null, "the buffer-backed supervisor constructed, as it does for every camera");
+    assert.equal(stream.hksv, null, "no recording delegate constructed for a host that is not HKSV-capable");
+
+    // The macOS hardware-acceleration nudge is the only warn-level line construction can emit, and it requires a hostSystem beginning with "macOS." - the harness
+    // reports a bare "macOS", so it stays silent. A warn here would mean the real FfmpegOptions reached something the stub profile does not model.
+    assert.equal(logEntries.filter((entry) => entry.level === "warn").length, 0, "construction warned about nothing");
+  });
+
+  // The supervisor stands for every camera, a third-party camera that cannot back HKSV included, while the recording delegate stays the HKSV-capable camera's alone.
+  // The host's record agrees with its eligibility: Protect exposes no motion sensor for this camera.
+  test("ProtectStreamingDelegate against a third-party host that cannot back HKSV builds the timeshift supervisor and no recording delegate", () => {
+
+    const { controller, host } = makeTestCameraHost();
+
+    controllers.push(controller);
+    host.ufp = makeCameraConfig({ channels: G2_PRO_CHANNELS, featureFlags: { hasMotionDetection: false }, isThirdPartyCamera: true });
+
+    const stream = new ProtectStreamingDelegate(host, [[ 1920, 1080, 30 ]]);
+
+    assert.ok(stream.timeshift instanceof ProtectTimeshiftSupervisor, "the third-party camera's delegate stands its timeshift supervisor");
+    assert.equal(stream.hksv, null, "no recording delegate constructed for a host that is not HKSV-capable");
+  });
+
+  // The capable column of the same construction: a host that can back HKSV gets the recording delegate, the controller options carry the recording arm that delegate
+  // drives, and the controller's motion link is the accessory's own MotionSensor - the service the camera stands up before any controller that links it is built.
+  test("ProtectStreamingDelegate against an HKSV-capable host builds the recording arm and links the accessory's motion sensor", () => {
+
+    const { accessory, controller, host } = makeTestCameraHost();
+
+    controllers.push(controller);
+
+    const motionSensor = accessory.addService(Service.MotionSensor, "Test Camera");
+
+    host.isHksvCapable = true;
+
+    const stream = new ProtectStreamingDelegate(host, [[ 1920, 1080, 30 ]]);
+    const cameraController = stream.controller;
+
+    assert.ok(cameraController instanceof hap.CameraController, "the delegate constructed HAP's camera controller");
+    assert.ok(stream.hksv instanceof ProtectRecordingDelegate, "a recording delegate constructed for a host that can back HKSV");
+
+    const options = cameraControllerOptions(cameraController);
+
+    assert.equal(options.recording?.delegate, stream.hksv, "the controller's recording arm is driven by that recording delegate");
+    assert.ok(options.recording.options, "the controller's recording arm carries its recording options");
+    assert.equal(options.sensors?.motion, motionSensor, "the controller's motion link is the accessory's own motion sensor");
+    assert.equal(options.sensors.occupancy, undefined, "and with no occupancy sensor standing it is handed none");
+  });
+
+  test("ProtectStreamingDelegate hands HAP an occupancy sensor exactly where it gives it a recording arm", () => {
+
+    const { accessory, controller, host } = makeTestCameraHost();
+
+    controllers.push(controller);
+
+    const occupancySensor = accessory.addService(Service.OccupancySensor, "Test Camera");
+
+    host.isHksvCapable = true;
+
+    let options = cameraControllerOptions(new ProtectStreamingDelegate(host, [[ 1920, 1080, 30 ]]).controller);
+
+    assert.ok(options.recording, "a camera that can record gets the recording arm");
+    assert.equal(options.sensors?.occupancy, occupancySensor, "and HAP gets the accessory's own occupancy sensor");
+
+    host.isHksvCapable = false;
+    options = cameraControllerOptions(new ProtectStreamingDelegate(host, [[ 1920, 1080, 30 ]]).controller);
+
+    assert.equal(options.recording, undefined, "a camera that cannot record gets no recording arm");
+    assert.equal(options.sensors, undefined, "and hands HAP no sensor");
+  });
+
+  /* The advertised recording audio format is the camera's own, read from its livestream by the derivation, in one channel, or the whole stand-in when the stream was not
+   * read or its rate has no HomeKit recording member. The advertisement is frozen into the controller, so each row reads it straight off the recorded controller
+   * options. The controller identity carries no audio term, so the format moves no rebuild.
+   */
+  test("the recording codec advertises the derived audio format in one channel, or the stand-in, and the identity carries no audio term", () => {
+
+    const advertise = (options: { audioFormat: LivestreamAudioFormat | null; isDoorbell?: boolean }): unknown => {
+
+      const { accessory, controller, host } = makeTestCameraHost();
+
+      controllers.push(controller);
+      accessory.addService(Service.MotionSensor, "Test Camera");
+      host.isHksvCapable = true;
+      host.ufp = makeCameraConfig({ channels: G2_PRO_CHANNELS, featureFlags: { isDoorbell: options.isDoorbell ?? false } });
+
+      const stream = new ProtectStreamingDelegate(host, [[ 1920, 1080, 30 ]], { audioFormat: options.audioFormat, probe: null });
+      const codecs = cameraControllerOptions(stream.controller).recording?.options.audio.codecs;
+
+      assert.equal(stream.builtFor.hksvCapable, true, "the vacuity guard: the delegate built its recording arm");
+      assert.deepEqual(stream.builtFor, controllerIdentityOf(host), "the identity is the derivation over the host, whatever the audio format");
+      assert.deepEqual(Object.keys(stream.builtFor).toSorted(), [ "hksvCapable", "isDoorbell", "twoWayAudio" ],
+        "the identity carries the same terms, none of them audio");
+
+      return Array.isArray(codecs) ? codecs[0] : codecs;
+    };
+
+    const mono = (sampleRate: number): LivestreamAudioFormat => ({ channels: 1, codec: "aac", sampleRate });
+
+    assert.deepEqual(advertise({ audioFormat: mono(8000) }), { audioChannels: 1, samplerate: AudioRecordingSamplerate.KHZ_8, type: AudioRecordingCodecType.AAC_LC },
+      "an 8000 Hz mono stream advertises the 8 kHz recording rate");
+    assert.deepEqual(advertise({ audioFormat: mono(48000) }), { audioChannels: 1, samplerate: AudioRecordingSamplerate.KHZ_48,
+      type: AudioRecordingCodecType.AAC_LC }, "a 48000 Hz mono stream advertises the 48 kHz recording rate");
+
+    const stereo = advertise({ audioFormat: { channels: 2, codec: "aac", sampleRate: 16000 } });
+
+    assert.deepEqual(stereo, { audioChannels: 1, samplerate: AudioRecordingSamplerate.KHZ_16, type: AudioRecordingCodecType.AAC_LC },
+      "a stereo stream advertises its rate in one channel");
+
+    for(const isDoorbell of [ false, true ]) {
+
+      const unread = advertise({ audioFormat: null, isDoorbell });
+
+      assert.deepEqual(unread, { audioChannels: 1, samplerate: RECORDING_AUDIO_STAND_IN.samplerate, type: AudioRecordingCodecType.AAC_LC },
+        "a stream not read advertises the stand-in, " + (isDoorbell ? "doorbell" : "camera") + " alike");
+    }
+
+    const unmapped = advertise({ audioFormat: mono(22050) });
+
+    assert.deepEqual(unmapped, { audioChannels: 1, samplerate: RECORDING_AUDIO_STAND_IN.samplerate, type: AudioRecordingCodecType.AAC_LC },
+      "a 22050 Hz stream, a rate HomeKit has no recording member for, advertises the whole stand-in");
+  });
+
+  /* The streaming delegate hands its timeshift supervisor the advertisement its controller is built from. A supervisor built by hand holds an advertisement of the
+   * row's own choosing, so only a supervisor the delegate builds shows what the delegate hands over. Every case expecting no hint runs on a stream where a particular
+   * wrong hand-off would earn the hint and the computed advertisement earns none. Stereo AAC at 48 kHz tells a raw hand-off and the stand-in apart: its second channel
+   * makes the raw stream format differ from the one-channel advertisement, and its 48 kHz rate makes the 16 kHz stand-in differ from it. A 48 kHz Opus stream tells
+   * apart a hand-off that passes the stream's codec through, because every advertisement names AAC-LC whatever the stream carries. A 22050 Hz stream tells apart a
+   * hand-off that passes the stream's rate through, because HomeKit has no recording member for that rate and the stream advertises the whole stand-in. The Opus and
+   * 22050 Hz delegates run on the streams they were derived from, as a camera's own delegate does. A delegate whose stream could not be read runs on a stream at the
+   * stand-in's format, which tells apart a hand-off that treats the unread path differently from the computed advertisement, because an unread stream advertises the
+   * stand-in and a buffer at that format computes it. A delegate built from 8 kHz mono against the stereo stream earns the hint once, which proves the arrangement can
+   * see the hint at all, and the same delegate on an 8 kHz stream earns none, which tells apart a hand-off that is right only at 48 kHz and on the stand-in path.
+   */
+  test("the streaming delegate hands its timeshift supervisor the recording advertisement its controller is built from", async () => {
+
+    const stereo: LivestreamAudioFormat = { channels: 2, codec: "aac", sampleRate: 48000 };
+    const opus: LivestreamAudioFormat = { channels: 1, codec: "opus", sampleRate: 48000 };
+    const unmapped: LivestreamAudioFormat = { channels: 1, codec: "aac", sampleRate: 22050 };
+    const mono8k: LivestreamAudioFormat = { channels: 1, codec: "aac", sampleRate: 8000 };
+
+    // Build a delegate from the derived format on a host whose substrate stream carries the given stream format, the stereo one unless a case names another, run a
+    // buffer start through the delegate's own supervisor, and count the restart hints that start narrates. The delegate's shutdown ends its streams and tuning but not
+    // its supervisor, so each is shut down in turn.
+    const hintsFor = async ({ derived, stream = stereo }: { derived: LivestreamAudioFormat | null; stream?: LivestreamAudioFormat }): Promise<number> => {
+
+      const { accessory, controller, host, logEntries } = makeTestCameraHost();
+
+      controllers.push(controller);
+      accessory.addService(Service.MotionSensor, "Test Camera");
+      host.isHksvCapable = true;
+      host.selectSubstrateChannel = (): ChannelProfile => makeChannelProfile(host);
+      host.usesTimeshiftLivestream = true;
+      host.livestreamSubscriptions = [makeControllableLivestreamDouble({ description: { tracks: [{ ...stream, id: 2, kind: "audio" }] } })];
+
+      const delegate = new ProtectStreamingDelegate(host, [[ 1920, 1080, 30 ]], { audioFormat: derived, probe: null });
+
+      host.stream = delegate;
+
+      const supervisor = delegate.timeshift;
+
+      assert.ok(supervisor, "the delegate built its own timeshift supervisor");
+
+      await supervisor.reconcile();
+
+      assert.deepEqual(supervisor.buffer.audioFormat, stream, "the vacuity guard: the delegate's supervisor runs its buffer on the arranged stream");
+
+      const hints = logCount(logEntries, "info", "restart HBUP to let HomeKit learn the new format");
+
+      supervisor.shutdown();
+      delegate.shutdown();
+
+      return hints;
+    };
+
+    assert.equal(await hintsFor({ derived: stereo }), 0,
+      "a delegate built from the stereo 48 kHz stream advertises what that stream computes, so its start earns no hint");
+    assert.equal(await hintsFor({ derived: mono8k }), 1,
+      "a delegate built from 8 kHz mono advertises 8 kHz, so its start on the 48 kHz stream earns the hint once");
+    assert.equal(await hintsFor({ derived: mono8k, stream: mono8k }), 0,
+      "a delegate built from 8 kHz mono advertises 8 kHz, so its start on an 8 kHz stream earns no hint");
+    assert.equal(await hintsFor({ derived: opus, stream: opus }), 0,
+      "a delegate built from a 48 kHz Opus stream advertises 48 kHz AAC-LC, so its start on that stream earns no hint");
+    assert.equal(await hintsFor({ derived: unmapped, stream: unmapped }), 0,
+      "a delegate built from a 22050 Hz stream advertises the stand-in, so its start on that stream earns no hint");
+    assert.equal(await hintsFor({ derived: null, stream: RECORDING_AUDIO_STAND_IN.format }), 0,
+      "a delegate whose stream could not be read advertises the stand-in, so its start on a stream at the stand-in's format earns no hint");
+  });
+
+  // Shutdown ends this camera's probesize self-tuning along with its streams. The distinguishing assertion is the IMMEDIATE post-shutdown read: a shutdown that leaves
+  // the self-tune armed still reads the elevated override right after the call, and only drifts back to baseline when the auto-reset timer eventually fires - which is
+  // exactly the timer that would keep a retired delegate reachable. The advance-and-recheck afterward is post-reset stability hygiene, not what tells a shutdown that
+  // ends the tuning from one that leaves it armed. The auto-reset arms on the harness test clock, so a pending one never holds the test process open.
+  test("shutdown resets the probesize self-tuning and leaves no auto-reset pending", () => {
+
+    const { clock, controller, host, logEntries } = makeTestCameraHost();
+
+    controllers.push(controller);
+
+    // The harness host defaults to a zero probesize, which the self-tune would double to zero and the getter could not tell from the baseline. A nonzero baseline makes
+    // the override, the doubling, and the reset all separately observable through the public getter.
+    host.hints.probesize = 16384;
+
+    const stream = new ProtectStreamingDelegate(host, [[ 1920, 1080, 30 ]]);
+
+    stream.adjustProbeSize();
+
+    assert.equal(stream.probesize, 32768, "the self-tune doubled the camera's baseline probesize");
+    assert.equal(logEntries.filter((entry) => entry.level === "error").length, 1, "the self-tune reported the stream trouble it is adjusting for");
+
+    const logCountAfterAdjust = logEntries.length;
+
+    stream.shutdown();
+
+    assert.equal(stream.probesize, 16384, "shutdown wound the override back to the camera's baseline immediately");
+
+    clock.advance(PROTECT_PROBESIZE_OVERRIDE_RESET_MS + 1);
+
+    assert.equal(stream.probesize, 16384, "the baseline holds past the auto-reset delay");
+    assert.equal(logEntries.length, logCountAfterAdjust, "nothing was logged after the shutdown");
+  });
+
+  /* The streaming delegate's shutdown is safe to call more than once, and structurally so rather than through a latch: both session maps drain on the first call, and
+   * the reset assigns fixed values, so there is no state a second call could find in an unexpected shape. This test is a tripwire against a future edit that
+   * introduces state a second call could trip over.
+   */
+  test("a repeat delegate shutdown tears nothing down and reports nothing", () => {
+
+    const { controller, host, logEntries } = makeTestCameraHost();
+
+    controllers.push(controller);
+
+    host.hints.probesize = 16384;
+
+    const stream = new ProtectStreamingDelegate(host, [[ 1920, 1080, 30 ]]);
+
+    stream.shutdown();
+
+    const logCountAfterFirstShutdown = logEntries.length;
+
+    stream.shutdown();
+
+    assert.equal(stream.probesize, 16384, "the second shutdown left the probesize at the camera's baseline");
+    assert.equal(logEntries.length, logCountAfterFirstShutdown, "the second shutdown logged nothing");
+    assert.equal(logEntries.filter((entry) => formatLogEntry(entry).includes("Stopped video streaming session.")).length, 0,
+      "neither call reported a session teardown, because there was no session to tear down");
+  });
+
+  // The self-tuning's adjustment tally counts every adjustment over the delegate's life and deliberately outlives the auto-reset, so a camera that needs an adjustment
+  // every few minutes reaches the permanent elevation just as surely as one that needs them back to back. Each pass through the loop returns the camera to its baseline
+  // while the tally underneath keeps climbing - the state a tally that reset with the elevation could never reach. The threshold is pinned TWO-SIDED, because an
+  // adjustment word asserted on one side alone is equally happy with a threshold off by one: the adjustment just below reports a temporary elevation, and the one that
+  // reaches the threshold reports a permanent one. The closing advance is what proves the permanent adjustment armed no auto-reset at all.
+  test("the probesize adjustment tally outlives the auto-reset and crosses the permanent threshold", () => {
+
+    const { clock, controller, host, logEntries } = makeTestCameraHost();
+
+    controllers.push(controller);
+
+    host.hints.probesize = 16384;
+
+    const stream = new ProtectStreamingDelegate(host, [[ 1920, 1080, 30 ]]);
+    const lastAdjustmentLine = (): string => formatLogEntry(logEntries.filter((entry) => entry.level === "error").at(-1) ?? { level: "error", message: "", params: [] });
+
+    for(let adjustment = 1; adjustment < PROTECT_PROBESIZE_OVERRIDE_PERMANENT_THRESHOLD; adjustment++) {
+
+      stream.adjustProbeSize();
+
+      assert.equal(stream.probesize, 32768, "adjustment " + adjustment.toString() + " doubled the camera's baseline");
+      assert.ok(lastAdjustmentLine().includes("temporarily"), "adjustment " + adjustment.toString() + " reported a temporary elevation");
+
+      clock.advance(PROTECT_PROBESIZE_OVERRIDE_RESET_MS + 1);
+
+      assert.equal(stream.probesize, 16384, "the auto-reset after adjustment " + adjustment.toString() + " returned the camera to its baseline");
+    }
+
+    stream.adjustProbeSize();
+
+    assert.ok(lastAdjustmentLine().includes("permanently"), "the adjustment that reached the threshold reported a permanent elevation");
+    assert.ok(!lastAdjustmentLine().includes("temporarily"), "the permanent adjustment did not also report itself as temporary");
+
+    clock.advance(PROTECT_PROBESIZE_OVERRIDE_RESET_MS + 1);
+
+    assert.equal(stream.probesize, 32768, "no auto-reset was armed at the threshold, so the elevation stands");
+  });
+
+  // Each adjustment doubles the probesize ALREADY IN EFFECT rather than the camera's baseline, so back-to-back trouble compounds instead of arriving at the same
+  // elevation every time - and the compounding comes to rest on the ceiling rather than running away. The ceiling is pinned two-sided: the last adjustment below it
+  // lands on its exact doubled value, and the next lands on the ceiling instead of the value it would otherwise have reached.
+  test("each probesize adjustment doubles the elevation already in effect, up to the ceiling", () => {
+
+    const { controller, host } = makeTestCameraHost();
+
+    controllers.push(controller);
+
+    host.hints.probesize = 16384;
+
+    const stream = new ProtectStreamingDelegate(host, [[ 1920, 1080, 30 ]]);
+
+    // Three adjustments with no auto-reset between them: the baseline doubles three times over. A tuning that doubled the BASELINE each time would sit at 32768 here.
+    stream.adjustProbeSize();
+    stream.adjustProbeSize();
+    stream.adjustProbeSize();
+
+    assert.equal(stream.probesize, 131072, "the elevation compounded off itself rather than off the camera's baseline");
+
+    // Carry on to the eighth adjustment, the last one whose doubling still fits under the ceiling.
+    for(let adjustment = 4; adjustment <= 8; adjustment++) {
+
+      stream.adjustProbeSize();
+    }
+
+    assert.equal(stream.probesize, 4194304, "the eighth adjustment doubled cleanly, still below the ceiling");
+
+    stream.adjustProbeSize();
+
+    assert.equal(stream.probesize, PROTECT_PROBESIZE_OVERRIDE_MAX, "the adjustment that would have overshot the ceiling came to rest on it");
   });
 });

@@ -5,13 +5,12 @@
  * runtime by building a real device for every category off the harness doubles and asserting it is the expected class reporting its own category.
  */
 import type { Camera, Chime, DeviceCollectionKey, Fob, Light, Relay, Sensor, Viewer } from "unifi-protect";
-import { TestCameraProjection, TestChimeProjection, TestFobProjection, TestLightProjection, TestRelayProjection, TestSensorProjection, TestStateStore,
-  TestViewerProjection, makeCameraConfig, makeChimeConfig, makeFobConfig, makeLightConfig, makeProtectState, makeRelayConfig, makeSensorConfig, makeTestAccessory,
-  makeTestNvr, makeViewerConfig, settle } from "../testing.helpers.ts";
+import { TestCameraProjection, TestChimeProjection, TestFobProjection, TestLightProjection, TestRelayProjection, TestSensorProjection, TestViewerProjection,
+  makeCameraConfig, makeChimeConfig, makeFobConfig, makeLightConfig, makeRelayConfig, makeSensorConfig, makeViewerConfig } from "../devices/testing.helpers.ts";
+import { TestStateStore, makeProtectState, makeTestAccessory } from "../testing.helpers.ts";
 import { describe, test } from "node:test";
 import { DEVICE_COLLECTION_KEYS } from "unifi-protect";
 import { G2_PRO_CHANNELS } from "../camera.fixtures.ts";
-import type { ProtectAccessory } from "../types.ts";
 import { ProtectCamera } from "../devices/cameras/camera.ts";
 import { ProtectChime } from "../devices/chime.ts";
 import type { ProtectDevice } from "../devices/device.ts";
@@ -22,13 +21,24 @@ import { ProtectRelay } from "../devices/relay.ts";
 import { ProtectSensor } from "../devices/sensor.ts";
 import { ProtectViewer } from "../devices/viewer.ts";
 import assert from "node:assert/strict";
+import { configured } from "../devices/device-base.ts";
+import { makeTestNvr } from "./testing.helpers.ts";
+import { settle } from "homebridge-plugin-utils/testing";
+
+// A row's builder hands back the device it constructed and the abort controller behind the NVR double's signal. The controller comes with the device because the
+// observe loops the construction spawns end when that signal aborts, so aborting it is how the caller unwinds them once its assertions are done.
+interface BuiltDevice {
+
+  controller: AbortController;
+  device: ProtectDevice;
+}
 
 // One category's construction against the harness doubles: seed a store with the category's config, build the real ProtectDevice off its Test projection, and hand back
-// the constructed device plus the harness abort controller so the caller can unwind the observe loops the construction spawned. The construction-seam casts mirror every
-// device-family suite; the instance itself is the production class running its real configure and spawnObservers paths.
+// the constructed device plus the harness abort controller so the caller can unwind the observe loops the construction spawned. The construction-boundary casts mirror
+// every device-family suite; the instance itself is the production class running its real configure and spawnObservers paths.
 interface Row {
 
-  build: () => { controller: AbortController; device: ProtectDevice };
+  build: () => BuiltDevice;
   category: DeviceCollectionKey;
   expected: abstract new (...args: never[]) => ProtectDevice;
 }
@@ -36,105 +46,105 @@ interface Row {
 const rows: Row[] = [
   {
 
-    build: () => {
+    build: (): BuiltDevice => {
 
       const config = makeCameraConfig({ channels: G2_PRO_CHANNELS });
       const store = new TestStateStore(makeProtectState({ cameras: [config] }));
       const { controller, nvr } = makeTestNvr({ store });
-      const accessory = makeTestAccessory("Descriptor Camera", "uuid:descriptor-camera");
+      const accessory = makeTestAccessory("Descriptor Camera", config.mac);
       const projection = new TestCameraProjection(config.id, store);
 
-      return { controller, device: new ProtectCamera(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Camera) };
+      return { controller, device: configured(new ProtectCamera(nvr as unknown as ProtectNvr, accessory, projection as unknown as Camera)) };
     },
     category: "camera",
     expected: ProtectCamera
   },
   {
 
-    build: () => {
+    build: (): BuiltDevice => {
 
       const config = makeChimeConfig();
       const store = new TestStateStore(makeProtectState({ chimes: [config] }));
       const { controller, nvr } = makeTestNvr({ store });
-      const accessory = makeTestAccessory("Descriptor Chime", "uuid:descriptor-chime");
+      const accessory = makeTestAccessory("Descriptor Chime", config.mac);
       const projection = new TestChimeProjection(config.id, store);
 
-      return { controller, device: new ProtectChime(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Chime) };
+      return { controller, device: configured(new ProtectChime(nvr as unknown as ProtectNvr, accessory, projection as unknown as Chime)) };
     },
     category: "chime",
     expected: ProtectChime
   },
   {
 
-    build: () => {
+    build: (): BuiltDevice => {
 
       const config = makeFobConfig();
       const store = new TestStateStore(makeProtectState({ fobs: [config] }));
       const { controller, nvr } = makeTestNvr({ store });
-      const accessory = makeTestAccessory("Descriptor Fob", "uuid:descriptor-fob");
+      const accessory = makeTestAccessory("Descriptor Fob", config.mac);
       const projection = new TestFobProjection(config.id, store);
 
-      return { controller, device: new ProtectFob(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Fob) };
+      return { controller, device: configured(new ProtectFob(nvr as unknown as ProtectNvr, accessory, projection as unknown as Fob)) };
     },
     category: "fob",
     expected: ProtectFob
   },
   {
 
-    build: () => {
+    build: (): BuiltDevice => {
 
       const config = makeLightConfig();
       const store = new TestStateStore(makeProtectState({ lights: [config] }));
       const { controller, nvr } = makeTestNvr({ store });
-      const accessory = makeTestAccessory("Descriptor Light", "uuid:descriptor-light");
+      const accessory = makeTestAccessory("Descriptor Light", config.mac);
       const projection = new TestLightProjection(config.id, store);
 
-      return { controller, device: new ProtectLight(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Light) };
+      return { controller, device: configured(new ProtectLight(nvr as unknown as ProtectNvr, accessory, projection as unknown as Light)) };
     },
     category: "light",
     expected: ProtectLight
   },
   {
 
-    build: () => {
+    build: (): BuiltDevice => {
 
       const config = makeRelayConfig();
       const store = new TestStateStore(makeProtectState({ relays: [config] }));
       const { controller, nvr } = makeTestNvr({ store });
-      const accessory = makeTestAccessory("Descriptor Relay", "uuid:descriptor-relay");
+      const accessory = makeTestAccessory("Descriptor Relay", config.mac);
       const projection = new TestRelayProjection(config.id, store);
 
-      return { controller, device: new ProtectRelay(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Relay) };
+      return { controller, device: configured(new ProtectRelay(nvr as unknown as ProtectNvr, accessory, projection as unknown as Relay)) };
     },
     category: "relay",
     expected: ProtectRelay
   },
   {
 
-    build: () => {
+    build: (): BuiltDevice => {
 
       const config = makeSensorConfig();
       const store = new TestStateStore(makeProtectState({ sensors: [config] }));
       const { controller, nvr } = makeTestNvr({ store });
-      const accessory = makeTestAccessory("Descriptor Sensor", "uuid:descriptor-sensor");
+      const accessory = makeTestAccessory("Descriptor Sensor", config.mac);
       const projection = new TestSensorProjection(config.id, store);
 
-      return { controller, device: new ProtectSensor(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Sensor) };
+      return { controller, device: configured(new ProtectSensor(nvr as unknown as ProtectNvr, accessory, projection as unknown as Sensor)) };
     },
     category: "sensor",
     expected: ProtectSensor
   },
   {
 
-    build: () => {
+    build: (): BuiltDevice => {
 
       const config = makeViewerConfig();
       const store = new TestStateStore(makeProtectState({ viewers: [config] }));
       const { controller, nvr } = makeTestNvr({ store });
-      const accessory = makeTestAccessory("Descriptor Viewer", "uuid:descriptor-viewer");
+      const accessory = makeTestAccessory("Descriptor Viewer", config.mac);
       const projection = new TestViewerProjection(config.id, store);
 
-      return { controller, device: new ProtectViewer(nvr as unknown as ProtectNvr, accessory as unknown as ProtectAccessory, projection as unknown as Viewer) };
+      return { controller, device: configured(new ProtectViewer(nvr as unknown as ProtectNvr, accessory, projection as unknown as Viewer)) };
     },
     category: "viewer",
     expected: ProtectViewer

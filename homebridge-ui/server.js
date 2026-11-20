@@ -7,9 +7,12 @@
  */
 "use strict";
 
-import { ProtectClient, isDeviceAdopted, noopLog } from "unifi-protect";
+import { ProtectCertificateError, ProtectClient, isDeviceAdopted, noopLog } from "unifi-protect";
+import { UNREPORTED_CONTROLLER_RECORD, UNSUPPORTED_PROTECT_VERSION, isSupportedProtectVersion } from "../dist/nvr/nvr-policy.js";
 import { featureOptionCategories, featureOptions } from "../dist/options.js";
 import { HomebridgePluginUiServer } from "@homebridge/plugin-ui-utils";
+import { composeMigrationPatch } from "../dist/options-retired.js";
+import { deviceDisplayName } from "../dist/devices/device-descriptor.js";
 import util from "node:util";
 
 class PluginUiServer extends HomebridgePluginUiServer {
@@ -22,6 +25,8 @@ class PluginUiServer extends HomebridgePluginUiServer {
 
     this.#registerGetOptions();
 
+    this.#registerTranslateOptions();
+
     this.ready();
   }
 
@@ -30,8 +35,8 @@ class PluginUiServer extends HomebridgePluginUiServer {
     // Retrieve the list of devices from a Protect controller to populate the feature options device picker.
     this.onRequest("/getDevices", async (controller) => {
 
-      // The connection outcome is probe-local state that travels back with the device list: a failed probe fills this with a user-facing message and the response
-      // returns it alongside an empty device array, so the webUI reads the failure from the response it belongs to.
+      // The connection outcome is probe-local state that travels back in the answer: a failed probe fills this with a user-facing message, and the answer tagged
+      // as a failure carries it, so the webUI reads the failure from the answer it belongs to.
       let errorInfo = "";
 
       // A quiet logging shim for the short-lived client: debug/info/warn stay silent (noopLog), while error captures the message so the probe can return the most
@@ -40,33 +45,58 @@ class PluginUiServer extends HomebridgePluginUiServer {
 
         errorInfo = util.format(message, ...parameters);
 
-        // eslint-disable-next-line no-console
+        // eslint-disable-next-line no-console -- The settings server has no logger of its own, so it deliberately reports a controller error on the console.
         console.error(errorInfo);
       } };
 
       try {
+
+        /* The address is read trimmed, because the plugin reads a listed controller's address trimmed, so the connect below reaches the controller the plugin
+         * connects to. The request keeps the address as stored, the spelling every lookup on the page finds its controller by. A hand edit can leave the address
+         * something other than a string, which is passed on as it stands, so the connect refuses it inside this try as a configuration error, and the page shows
+         * that refusal's sentence as its answer.
+         */
+        const address = (typeof controller.address === "string") ? controller.address.trim() : controller.address;
 
         // Connect to the controller. unifi-protect's connect() performs login and the initial bootstrap atomically, throwing a typed error on failure. This file ships
         // as raw JavaScript executed directly by the host's Node runtime with no transpile step, so an `await using` declaration (explicit-resource-management syntax,
         // which the Node 24 runtime provides) cannot appear here while the package's engines floor is below Node 24. The inner try/finally is the equivalent: it
         // guarantees the client and its realtime connection are released on every exit path, success or throw. We disable the periodic refresh failsafe since this is a
         // one-shot discovery probe. When the engines floor reaches Node 24, an `await using` declaration is the preferred form.
-        const client = await ProtectClient.connect({ host: controller.address, log: log, password: controller.password, refreshIntervalMs: false,
-          username: controller.username });
+        const client = await ProtectClient.connect({ host: address, log: log, password: controller.password, refreshIntervalMs: false,
+          username: controller.username, verifyTls: controller.verifyTls === true });
 
         try {
 
-          // Sort adopted devices by display name, falling back to the market name when a device has no user-assigned name.
-          const byName = (a, b) => (a.name ?? a.marketName).localeCompare(b.name ?? b.marketName);
+          /* A controller the plugin cannot start on is refused here too, in the plugin's own sentences. A record with no version has a sentence of its own, because
+           * telling someone to upgrade a version nobody reported is false. The catch below says what is thrown and answers it as it does any failure of this probe, and
+           * the finally still releases the client.
+           */
+          const { version } = client.nvr.config;
 
-          // Project each live device collection to its raw config record, keep only the devices adopted by this controller, and sort. We read the config records rather
-          // than the command-bearing projections because the webUI consumes plain controller fields and serializes them across the request boundary.
-          const adopted = (devices) => devices.map(device => device.config).filter(isDeviceAdopted).sort(byName);
+          if(typeof version !== "string") {
 
-          // Return the controller first, then the adopted devices by category, paired with an empty error. The controller is element 0 - the controller-as-device
-          // entry the feature options webUI selects on initial load.
+            throw new Error(UNREPORTED_CONTROLLER_RECORD);
+          }
+
+          if(!isSupportedProtectVersion(version)) {
+
+            throw new Error(UNSUPPORTED_PROTECT_VERSION);
+          }
+
+          /* Project each live device collection to its raw config record, keep only the devices adopted by this controller, name each as HomeKit names its accessory
+           * with no custom name applied, and sort by that name. We read the config records rather than the command-bearing projections because the webUI consumes
+           * plain controller fields and serializes them across the request boundary. The name is the plugin's own rule, read from the compiled module the runtime
+           * names accessories with, and it travels in a field of its own beside the controller's name, so the page applies only the custom name being edited, which
+           * it reads from the configuration it already holds, and shows an edit before anything is saved.
+           */
+          const adopted = (devices) => devices.map(device => device.config).filter(isDeviceAdopted).map(config => ({ ...config, homeKitName: deviceDisplayName(config) }))
+            .sort((a, b) => a.homeKitName.localeCompare(b.homeKitName));
+
+          // Return the controller first, then the adopted devices by category, tagged as a connection. The controller is element 0 - the controller-as-device entry
+          // the feature options webUI selects on initial load.
           return { devices: [ client.nvr.config, ...adopted(client.cameras), ...adopted(client.chimes), ...adopted(client.fobs), ...adopted(client.lights),
-            ...adopted(client.relays), ...adopted(client.sensors), ...adopted(client.viewers) ], error: "" };
+            ...adopted(client.relays), ...adopted(client.sensors), ...adopted(client.viewers) ], kind: "connected" };
         } finally {
 
           // Release the client and its realtime connection on every exit path... the raw-JavaScript equivalent of an `await using` declaration's scope-bound disposal.
@@ -82,11 +112,13 @@ class PluginUiServer extends HomebridgePluginUiServer {
 
           errorInfo = (error instanceof Error) ? error.message : String(error);
 
-          // eslint-disable-next-line no-console
+          // eslint-disable-next-line no-console -- The settings server has no logger of its own, so it deliberately reports a controller error on the console.
           console.error(errorInfo);
         }
 
-        return { devices: [], error: errorInfo };
+        // A certificate that did not verify is tagged as its own kind of failure, so the page can say what to change rather than reading unifi-protect's sentence for
+        // it. The class is read off the thrown error, which the connect rethrows as it is, rather than off errorInfo, which is text.
+        return { kind: (error instanceof ProtectCertificateError) ? "certificate" : "error", message: errorInfo };
       }
     });
   }
@@ -95,6 +127,23 @@ class PluginUiServer extends HomebridgePluginUiServer {
 
     // Return the full feature-option category and option catalog the webUI renders; per-device filtering happens client-side.
     this.onRequest("/getOptions", () => ({ categories: featureOptionCategories, options: featureOptions }));
+  }
+
+  #registerTranslateOptions() {
+
+    /* Rewrite a configuration's retired feature option entries into the current grammar, permanently, and answer the single patch the page should commit. The whole of
+     * the decision lives in the composed leaf this calls, so it is exercised under node against the real catalog rather than only in the browser: which array the
+     * translation runs over, whether the result is worth writing, and how it composes with the property migration's own patch.
+     *
+     * A request carrying no topology is the cheap detector and the topology-free rewrite in one round trip. What it reports as remaining is what the caller widens its
+     * controller probes to resolve before asking again.
+     */
+    this.onRequest("/translateOptions", (request) => composeMigrationPatch({
+
+      controllers: Array.isArray(request?.topology) ? request.topology : undefined,
+      migratePatch: request?.migratePatch ?? null,
+      platformOptions: Array.isArray(request?.platformOptions) ? request.platformOptions : []
+    }));
   }
 }
 

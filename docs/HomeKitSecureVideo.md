@@ -36,9 +36,11 @@ HomeKit Secure Video has been a feature in HomeKit since the launch of iOS 13. I
   * It's important to note: **HomeKit decides how long each event will be, by default**. In practice, I've seen events as long 5 or 10 minutes in high-traffic areas. HomeKit continues to record an event for as long as it thinks there's some motion of interest to the user.
   * If you place a camera in a very high traffic area, say a kitchen or a family room, and enable HKSV, you're likely going to get long motion events captured in HomeKit. It's not a bug, it's the way HomeKit Secure Video is designed. 😄
 
-#### Third-Party Cameras and AI Port
+#### Third-Party Cameras and UniFi Access
 
-Third-party cameras connected to Protect via ONVIF do not have native motion detection exposed through the Protect API, which means HKSV is not available for them by default. However, if you pair a third-party camera with a UniFi AI Port, the AI Port provides the necessary motion detection and smart detection capabilities, enabling full HKSV support for that camera. If a camera is later unpaired from its AI Port, HKSV support will be automatically disabled.
+Third-party cameras connected to Protect via ONVIF get HKSV the same way every other camera does: HKSV follows whether Protect exposes a motion sensor for a camera, since HomeKit Secure Video records on that camera's motion events. Recent Protect releases expose one for third-party cameras whose ONVIF profile exposes motion detection, so those cameras get a motion sensor and full HKSV support, no AI Port required. Pairing a third-party camera with a UniFi AI Port adds smart motion detection on top of that. If Protect starts exposing a motion sensor for a camera while HBUP is running, the camera gains HKSV support without a restart. If Protect stops exposing it, HBUP logs a warning and the camera keeps its motion sensor and HKSV support until HBUP restarts.
+
+Protect does not currently expose a motion sensor for cameras managed by UniFi Access, so those cameras have no HKSV support until it does.
 
 #### Interactions With UniFi Protect Smart Motion Detection
 UniFi Protect has its own smart motion detection capabilities that [can be used](https://github.com/hjdhjd/homebridge-unifi-protect/blob/main/docs/BestPractices.md#motion-sensors-motion-switches-and-push-notifications) with `homebridge-unifi-protect`. When you have smart motion detection enabled and you have HomeKit Secure Video enabled **and** configured in the Home app to record events, `homebridge-unifi-protect` is faced with a dilemma: when do I notify a user of a motion detection event?
@@ -68,14 +70,14 @@ HKSV in `homebridge-unifi-protect` works well by default if you have a decently 
 
 If you're struggling to get HKSV working in HBUP, try the following and see if it helps:
 
-  * Force the timeshift buffer that feeds HKSV to use the lowest-quality stream as its starting point. You'll find this under the *Timeshift Buffer* section of the HBUP feature options webUI (`Video.Timeshift.Only.Low`). Because that buffer is shared, this also lowers the quality of your live views and snapshots, not just your HKSV recordings.
+  * Force the timeshift buffer that feeds HKSV to use the lowest-quality stream as its starting point. You'll find this under the *Timeshift Buffer* section of the HBUP webUI's Settings tab (`Video.Timeshift.Only.Low`). Because that buffer is shared, this also lowers the quality of your live views and snapshots, not just your HKSV recordings.
 
 The above recommendation should help you get up and running in most lower-powered environments.
 
 Even if things run well in your environment, I would **strongly encourage** you to ensure you're getting the best performance you can out of HKSV and HBUP more broadly by [running HBUP in a child bridge within Homebridge](https://github.com/hjdhjd/homebridge-unifi-protect/blob/main/docs/BestPractices.md#homebridge).
 
 #### Things To Be Aware Of
-  * It's strongly recommended that the local UniFi Protect account you use with `homebridge-unifi-protect` has the full management role. Without it, HBUP can't auto-enable RTSP streams for you, so you'll need to enable at least one RTSP stream on each camera yourself...HKSV depends on having a stream to record from.
+  * HKSV records through the UniFi Protect livestream API, so it needs no RTSP streams turned on and no particular account role. The full management role is still worth giving the local Protect account you use with `homebridge-unifi-protect`, for the conveniences it buys elsewhere...automatic RTSP enablement where your configuration does stream over RTSP among them.
   * HomeKit hubs are quite particular about the exact format of the video it receives. We use FFmpeg to transcode the video to the exact format HomeKit is requesting. In practice, even in large camera environments, this shouldn't result in a degradation in performance. We try to match the input stream to FFmpeg as closely as we can to what HomeKit is looking for, minimizing most of the computing overhead associated with transcoding.
   * Recordings are resilient to brief controller and livestream hiccups...a momentary stall won't end the event and cost you the clip.
   * Occasional errors will occur - HomeKit hubs can be finicky at times. It's not typically something to be concerned about, and please don't open issues for infrequent errors that will be logged. As both HKSV and `homebridge-unifi-protect` continue to evolve, these will become more and more rare instances.

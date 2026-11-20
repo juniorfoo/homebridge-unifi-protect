@@ -2,8 +2,9 @@
  *
  * snapshot.ts: UniFi Protect HomeKit snapshot class.
  */
-import { FfmpegExec, runWithAbort } from "homebridge-plugin-utils";
-import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
+import type { Clock, FfmpegOptions, HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
+import { FfmpegExec, composeSignals, runWithAbort } from "homebridge-plugin-utils";
+import { PROTECT_MAX_SOURCE_HEIGHT, PROTECT_MAX_SOURCE_WIDTH } from "../settings.ts";
 import type { ProtectCameraHost } from "./camera-host.ts";
 import type { SnapshotOptions } from "unifi-protect";
 import type { SnapshotRequest } from "homebridge";
@@ -16,15 +17,64 @@ const PROTECT_SNAPSHOT_CACHE_MAXAGE = 90;
 // reach HomeKit after our code produces the snapshot.
 const PROTECT_SNAPSHOT_TIMEOUT = 4990;
 
-// A snapshot-source FFmpeg pipeline whose non-zero exits are routine, not exceptional: each source (timeshift, RTSP) is attempted in turn and a miss simply falls through
-// to the next source, so a failed exit is expected. We override the base class's ERROR teardown dump - which would otherwise spam the log on every routine miss - with a
-// single debug line, deliberately suppressing the ERROR dump that routine misses do not warrant; the homebridge-plugin-utils base exposes logFailedTeardown as exactly
-// this hook for known-benign failure shapes. The separate crop pipeline keeps the default ERROR logging, since a crop failure is genuinely noteworthy.
-class SnapshotFfmpegExec extends FfmpegExec {
+// How long, in milliseconds from the start of an acquisition, an RTSP snapshot attempt runs alone before the controller-API attempt is started beside it. A healthy
+// RTSP attempt answers well inside this window, so the controller sees no API request on the healthy path, while a slow one still leaves the API attempt the rest of
+// the budget to answer in.
+const PROTECT_SNAPSHOT_HEDGE_DELAY = 2500;
+
+// The time, in milliseconds, always held back from the end of the acquisition budget for killing and reaping the losing RTSP attempt. The hedge's cleanup waits for
+// that attempt's FFmpeg to exit before the image it settled on leaves, so a cutoff on the budget's end itself would let the kill run past HomeKit's limit and lose an
+// image already in hand.
+const PROTECT_SNAPSHOT_REAPING_RESERVE = 250;
+
+// How long, in milliseconds, a controller-API image in hand waits for a still-running RTSP attempt's higher-quality image. The wait is short so snapshots stay
+// responsive, yet long enough for a nearly finished RTSP attempt to still answer, and the cutoff ends it sooner when the cutoff comes first.
+const PROTECT_SNAPSHOT_HELD_IMAGE_WAIT = 1000;
+
+// The time, in milliseconds, held back from the end of the acquisition budget for the crop pass a controller-API image needs, held back only when cropping is enabled
+// and on top of the reaping reserve, so the crop still finishes inside HomeKit's limit. With cropping off the image needs no crop pass, so only the reaping reserve is
+// held back.
+const PROTECT_SNAPSHOT_CROP_ALLOWANCE = 1000;
+
+// The tag for each source a snapshot can be answered from. The hedge reports its winner under the same tags, and the debug line names each source by its label.
+type SnapshotSourceTag = "api" | "cache" | "rtsp" | "timeshift";
+
+// The tags of the sources the hedge races, drawn from the tags above, so the hedge's attempts and its winner carry the tag every other answer does.
+type HedgedSourceTag = Extract<SnapshotSourceTag, "api" | "rtsp">;
+
+const SNAPSHOT_SOURCE_LABELS: Readonly<Record<SnapshotSourceTag, string>> = {
+
+  api: "Protect controller",
+  cache: "cached snapshot",
+  rtsp: "RTSP stream",
+  timeshift: "timeshift buffer"
+};
+
+// A snapshot image and the tag of the source that answered with it.
+interface SnapshotAnswer {
+
+  image: Buffer;
+  readonly source: SnapshotSourceTag;
+}
+
+// A source's image as an answer tagged with that source, or null when the source had no image to give.
+function answerFrom(source: SnapshotSourceTag, image: Nullable<Buffer>): Nullable<SnapshotAnswer> {
+
+  return image ? { image, source } : null;
+}
+
+/**
+ * A one-shot FFmpeg pipeline whose non-zero exit is routine rather than exceptional, so a failed teardown logs one debug line in place of the base class's ERROR dump
+ * of the command and its stderr, which would otherwise fill the log on every routine failure. The homebridge-plugin-utils base exposes logFailedTeardown as exactly
+ * this hook for known-benign failure shapes. A snapshot source is such a pipeline: the timeshift and RTSP sources are tried in turn, so a miss simply falls through
+ * to the next source. The timeshift supervisor's hardware decoder check is too: it reads only whether FFmpeg reports the decoder's refusal, which the base
+ * records whatever the exit. The separate crop pipeline keeps the default ERROR logging, since a crop failure is genuinely noteworthy.
+ */
+export class QuietFfmpegExec extends FfmpegExec {
 
   protected override logFailedTeardown(): void {
 
-    this.log.debug("A snapshot source FFmpeg pipeline exited without producing an image; falling through to the next source.");
+    this.log.debug("An FFmpeg pipeline whose failure is routine exited without completing, and its caller carries on without its output.");
   }
 }
 
@@ -33,12 +83,15 @@ export class ProtectSnapshot {
 
   private _cachedSnapshot: Nullable<{ image: Buffer; time: number }>;
   private _snapshotInFlight: Nullable<Promise<Nullable<Buffer>>>;
+  // The platform's clock, which stamps each cached snapshot and ages it against the cache's maximum age.
+  private readonly clock: Clock;
   public readonly log: HomebridgePluginLogging;
   public readonly protectCamera: ProtectCameraHost;
 
   // Create an instance of the Protect snapshot handler.
   constructor(protectCamera: ProtectCameraHost) {
 
+    this.clock = protectCamera.platform.clock;
     this.log = protectCamera.log;
     this.protectCamera = protectCamera;
     this._cachedSnapshot = null;
@@ -75,7 +128,8 @@ export class ProtectSnapshot {
     }
   }
 
-  // Acquire a snapshot by trying each source in priority order, applying crop if needed, and falling back to the cache on timeout.
+  // Acquire a snapshot from each source in priority order, hedging a slow RTSP attempt with the Protect API, applying crop if needed, and falling back to the cache on
+  // timeout.
   private async acquireSnapshot(request?: SnapshotRequest): Promise<Nullable<Buffer>> {
 
     // See if we have an image cached that we can use, if needed.
@@ -87,6 +141,9 @@ export class ProtectSnapshot {
     // - Timeshift buffer   eliminates querying the Protect controller and allows us to capture the highest quality image we can.
     // - RTSP stream        queries the Protect controller, but allows us to capture the highest quality image available.
     // - Protect API        requests a snapshot from the Protect controller. This is an error-prone task for the Protect controller and produces lower quality images.
+    //                      It starts the moment RTSP declines, or beside a still-running RTSP attempt once the hedge delay has passed since the acquisition began.
+    //                      While RTSP and the API run together, the first image wins, except that an API image waits briefly for RTSP's, never past the grace
+    //                      cutoff near the deadline.
     // - Cached snapshot    returns the last snapshot we have taken, assuming it isn't too old.
     //
     // The exception to this is package cameras - we try the Protect API before the RTSP stream there because the lower frame rate of the camera causes a lengthier
@@ -94,10 +151,14 @@ export class ProtectSnapshot {
     //
     // We run the whole acquisition under an abort signal so the timeout below actually cancels in-flight work - the controller snapshot request and every FFmpeg pipeline
     // receive the same signal and tear down the moment the deadline lapses, rather than leaking until they complete on their own.
-    const snapshot = await runWithAbort(async (signal): Promise<Nullable<Buffer>> => {
+    //
+    // The image travels with the tag of the source that answered, which decides whether it still needs the crop pass and is what the debug line below names.
+    const answer = await runWithAbort(async (signal): Promise<Nullable<SnapshotAnswer>> => {
 
-      let snapAttempt = await this.snapFromTimeshift(request, signal);
-      let needsExternalCrop = false;
+      // The budget's start, which the hedge delay and the grace cutoff are measured from, so the time the timeshift source spends counts against each.
+      const startedAt = this.clock.now();
+
+      let snapAttempt = answerFrom("timeshift", await this.snapFromTimeshift(request, signal));
 
       // No snapshot yet, let's try again.
       if(!snapAttempt) {
@@ -105,28 +166,19 @@ export class ProtectSnapshot {
         // We treat package cameras uniquely - the Protect API is tried before RTSP because the lower frame rate of package cameras causes a lengthier RTSP response.
         if(isPackageCameraContext(this.protectCamera.accessory.context)) {
 
-          snapAttempt = await this.snapFromController({ height: request?.height, packageCamera: true, signal, width: request?.width });
-
-          if(snapAttempt) {
-
-            needsExternalCrop = true;
-          } else {
-
-            snapAttempt = await this.snapFromRtsp(request, signal);
-          }
+          snapAttempt = answerFrom("api", await this.snapFromController({ height: request?.height, packageCamera: true, signal, width: request?.width }));
+          snapAttempt ??= answerFrom("rtsp", await this.snapFromRtsp(request, signal));
         } else {
 
-          snapAttempt = await this.snapFromRtsp(request, signal);
+          snapAttempt = await hedgeSnapshotAttempts({
 
-          if(!snapAttempt) {
-
-            snapAttempt = await this.snapFromController({ height: request?.height, signal, width: request?.width });
-
-            if(snapAttempt) {
-
-              needsExternalCrop = true;
-            }
-          }
+            api: (attemptSignal) => this.snapFromController({ height: request?.height, signal: attemptSignal, width: request?.width }),
+            clock: this.clock,
+            cutoffAt: snapshotCutoff({ cropping: this.protectCamera.hints.crop, startedAt }),
+            rtsp: (attemptSignal) => this.snapFromRtsp(request, attemptSignal),
+            signal,
+            startedAt
+          });
         }
       }
 
@@ -135,24 +187,25 @@ export class ProtectSnapshot {
         return null;
       }
 
-      // Snapshots from the Protect API need a standalone crop pass since they bypass the FFmpeg pipeline where crop is now integrated into the filter chain.
-      if(needsExternalCrop && this.protectCamera.hints.crop) {
+      // Snapshots from the Protect API need a standalone crop pass since they bypass the FFmpeg pipeline, where crop is applied as part of the filter chain.
+      if((snapAttempt.source === "api") && this.protectCamera.hints.crop) {
 
-        snapAttempt = await this.cropSnapshot(snapAttempt, signal) ?? snapAttempt;
+        snapAttempt.image = await this.cropSnapshot(snapAttempt.image, signal) ?? snapAttempt.image;
       }
 
       // Cache the image before returning it.
-      this._cachedSnapshot = { image: snapAttempt, time: Date.now() };
+      this._cachedSnapshot = { image: snapAttempt.image, time: this.clock.now() };
 
       return snapAttempt;
-    }, { timeout: PROTECT_SNAPSHOT_TIMEOUT });
+    }, { clock: this.clock, timeout: PROTECT_SNAPSHOT_TIMEOUT });
 
     // Occasional snapshot failures will happen. The controller isn't always able to generate them if one is already inflight or if it's too soon after the last one.
-    if(!snapshot) {
+    if(!answer) {
 
       if(cachedSnapshot) {
 
         this.log.warn("Unable to retrieve a snapshot: using the most recent cached snapshot instead.");
+        this.logAnswer(request, "cache");
 
         return cachedSnapshot;
       }
@@ -162,7 +215,16 @@ export class ProtectSnapshot {
       return null;
     }
 
-    return this._cachedSnapshot?.image ?? null;
+    this.logAnswer(request, answer.source);
+
+    return answer.image;
+  }
+
+  // Note at debug the size a snapshot request asked for, or that it named none, and the source that answered it.
+  private logAnswer(request: SnapshotRequest | undefined, source: SnapshotSourceTag): void {
+
+    this.log.debug("Snapshot request for %s answered from the %s.", request ? request.width.toString() + "x" + request.height.toString() : "any size",
+      SNAPSHOT_SOURCE_LABELS[source]);
   }
 
   // Snapshots using the timeshift buffer as the source.
@@ -217,7 +279,7 @@ export class ProtectSnapshot {
     }
 
     // Grab the highest quality stream we have available.
-    const channelProfile = this.protectCamera.selectChannel(3840, 2160, { biasHigher: true });
+    const channelProfile = this.protectCamera.selectChannel(PROTECT_MAX_SOURCE_WIDTH, PROTECT_MAX_SOURCE_HEIGHT, { bias: "higher" });
 
     if(!channelProfile) {
 
@@ -244,7 +306,7 @@ export class ProtectSnapshot {
   }
 
   // Snapshots using the Protect controller's snapshot command as the source. This is the unifi-protect library's camera projection snapshot, exposed through the
-  // camera's narrow public seam. Unlike the FFmpeg-based sources, the controller command throws on failure rather than returning null - a non-2xx response, or a
+  // camera's narrow public interface. Unlike the FFmpeg-based sources, the controller command throws on failure rather than returning null - a non-2xx response, or a
   // ProtectUnsupportedError when a package snapshot is requested on a camera without a package sensor. We translate that throw into a null so the multi-source
   // acquisition falls through to the next source exactly as it always has, and so a snapshot failure never escapes acquireSnapshot.
   private async snapFromController(opts: SnapshotOptions): Promise<Nullable<Buffer>> {
@@ -266,6 +328,9 @@ export class ProtectSnapshot {
       return null;
     }
 
+    // The JPEG encode runs on the CPU, so we describe a software-encoded pipeline and the decoder hands its frames over in system memory for the crop and scale filters.
+    const decoderOptions = this.protectCamera.stream.ffmpegOptions.videoDecoder({ hardwareTranscoding: false, inputCodec: this.protectCamera.ufp.videoCodec });
+
     // Options we use to generate an image based on our MP4 input are:
     //
     // -hide_banner         Suppress printing the startup banner in FFmpeg.
@@ -277,8 +342,6 @@ export class ProtectSnapshot {
     // -fps_mode vfr        Ensure we deal with any variable frame rates that might occur.
     // -frames:v 1          Extract a single video frame for the output.
     // -q:v 2               Set the quality output of the JPEG output.
-    const decoderOptions = this.protectCamera.stream.ffmpegOptions.videoDecoder(this.protectCamera.ufp.videoCodec);
-
     const commandLineOptions = [
 
       "-hide_banner",
@@ -294,36 +357,8 @@ export class ProtectSnapshot {
       "-q:v", "2"
     ];
 
-    // Build the video filter chain. We assemble it as an array of individual filters and join them with commas. When cropping is enabled, we apply it before scaling so
-    // the crop coordinates (which use relative iw/ih multipliers) operate on the source resolution, and the subsequent scale+pad fits the cropped region into HomeKit's
-    // requested dimensions.
-    const filters: string[] = [];
-
-    // If hardware decoding produces GPU-resident frames, we need to transfer them to system memory before any CPU-based filters can operate on them.
-    filters.push(...this.protectCamera.stream.ffmpegOptions.hardwareDownloadFilters);
-
-    // Apply the crop filter if configured. The crop coordinates use relative iw/ih multipliers, making them resolution-independent and safe to apply at any point in the
-    // filter chain. We place it before scale so the aspect ratio calculations in scale+pad reflect the cropped region rather than the full frame.
-    if(this.protectCamera.hints.crop) {
-
-      filters.push(this.protectCamera.stream.ffmpegOptions.cropFilter);
-    }
-
-    // Scale to the requested dimensions, preserving the aspect ratio and letterboxing where needed.
-    if(request) {
-
-      filters.push(
-
-        [ "scale=" + request.width.toString(), request.height.toString(), "force_original_aspect_ratio=decrease" ].join(":"),
-        [ "pad=" + request.width.toString(), request.height.toString(), "(ow-iw)/2", "(oh-ih)/2" ].join(":")
-      );
-    }
-
-    // Apply the filter chain if we have any filters.
-    if(filters.length) {
-
-      commandLineOptions.push("-filter:v", filters.join(","));
-    }
+    // Crop the frame as configured and fit it inside the requested size, each when it applies. snapshotFilterArgs states why the crop leads and the fit rule.
+    commandLineOptions.push(...snapshotFilterArgs({ cropping: this.protectCamera.hints.crop, ffmpegOptions: this.protectCamera.stream.ffmpegOptions, request }));
 
     // -f image2pipe        Specifies the output format to use a pipe, since we are outputting to stdout and want to consume the data directly.
     // -c:v mjpeg           Specify the MJPEG encoder to get a JPEG file.
@@ -343,7 +378,7 @@ export class ProtectSnapshot {
 
     // Instantiate and spawn FFmpeg. The composed signal ties this pipeline's lifetime to the acquisition deadline, so a timeout kills the child rather than leaving it
     // running. When we have a timeshift buffer it is fed as canned stdin; the RTSP source reads from its input URL and supplies no stdin.
-    const ffmpeg = new SnapshotFfmpegExec(this.protectCamera.stream.ffmpegOptions, { args: commandLineOptions, signal, stdin: buffer });
+    const ffmpeg = new QuietFfmpegExec(this.protectCamera.stream.ffmpegOptions, { args: commandLineOptions, signal, stdin: buffer });
 
     // Retrieve the snapshot. The result accessor rejects only when the child never spawned (e.g., a missing FFmpeg binary), which we treat as this source failing so the
     // acquisition falls through to the next source rather than letting the error escape.
@@ -425,7 +460,7 @@ export class ProtectSnapshot {
   private get cachedSnapshot(): Nullable<Buffer> {
 
     // If we have an image within the cache max-age (90 seconds, PROTECT_SNAPSHOT_CACHE_MAXAGE), we can use it. Otherwise, we're done.
-    if(!this._cachedSnapshot || ((Date.now() - this._cachedSnapshot.time) > (PROTECT_SNAPSHOT_CACHE_MAXAGE * 1000))) {
+    if(!this._cachedSnapshot || ((this.clock.now() - this._cachedSnapshot.time) > (PROTECT_SNAPSHOT_CACHE_MAXAGE * 1000))) {
 
       this._cachedSnapshot = null;
 
@@ -433,5 +468,182 @@ export class ProtectSnapshot {
     }
 
     return this._cachedSnapshot.image;
+  }
+}
+
+/**
+ * One snapshot source's attempt, run under the signal that ends it. It answers with an image, or with null when the source declines, fails, or its signal aborts.
+ */
+export type SnapshotAttempt = (signal: AbortSignal) => Promise<Nullable<Buffer>>;
+
+/**
+ * The image a hedged acquisition settled on and the source it came from. A controller-API image still needs its crop pass, which the FFmpeg-backed RTSP source
+ * applies in its own pipeline.
+ */
+export interface HedgedSnapshot {
+
+  image: Buffer;
+  readonly source: HedgedSourceTag;
+}
+
+// An attempt's answer, tagged by the source that gave it, which is what the hedge races against the instants it arms on the clock.
+interface AttemptAnswer {
+
+  readonly image: Nullable<Buffer>;
+  readonly kind: HedgedSourceTag;
+}
+
+/**
+ * The clock time past which the hedge hands back a held controller-API image without waiting further for RTSP: the acquisition budget less the reaping reserve, and
+ * less the crop allowance too when cropping is enabled, because a controller-API image then still has its crop pass to run. An image the hedge settles on by this
+ * time leaves inside HomeKit's limit, with the losing attempt reaped and any crop pass run.
+ *
+ * @param options           - Cutoff inputs.
+ * @param options.cropping  - Whether the camera's snapshots are cropped, so a controller-API image needs a crop pass after the hedge.
+ * @param options.startedAt - The clock time the acquisition's budget started.
+ *
+ * @returns The cutoff, on the same clock as the budget's start.
+ */
+export function snapshotCutoff({ cropping, startedAt }: { cropping: boolean; startedAt: number }): number {
+
+  return startedAt + PROTECT_SNAPSHOT_TIMEOUT - PROTECT_SNAPSHOT_REAPING_RESERVE - (cropping ? PROTECT_SNAPSHOT_CROP_ALLOWANCE : 0);
+}
+
+/**
+ * The video filter arguments an FFmpeg snapshot runs with: the configured crop when cropping is on, then the fit to the requested size when the request names one,
+ * joined into one -filter:v chain, or nothing when neither applies. The crop leads because its coordinates are relative to the frame's own width and height, so it
+ * cuts the configured region from the full source frame, and the fit after it sizes that region by its own shape. The fit is the rule a transcoded live view or
+ * recording scales by: the image keeps its aspect ratio, fits inside the requested width and height, and is never enlarged past its source, so a request of another
+ * shape is answered with an image smaller than the request on one side. Pure over its options, so the chain a snapshot spawns with is testable without spawning one.
+ *
+ * @param options               - Filter inputs.
+ * @param options.cropping      - Whether the camera's snapshots are cropped.
+ * @param options.ffmpegOptions - The camera's FFmpeg options, which build the crop and fit filters.
+ * @param options.request       - The size HomeKit requested, when it named one.
+ *
+ * @returns The -filter:v pair, or an empty list when no filter applies.
+ */
+export function snapshotFilterArgs({ cropping, ffmpegOptions, request }: { cropping: boolean; ffmpegOptions: Pick<FfmpegOptions, "cropFilter" | "fitFilter">;
+  request?: SnapshotRequest; }): string[] {
+
+  const filters = [ ...(cropping ? [ffmpegOptions.cropFilter] : []), ...(request ? [ffmpegOptions.fitFilter(request)] : []) ];
+
+  return filters.length ? [ "-filter:v", filters.join(",") ] : [];
+}
+
+/**
+ * Run an RTSP snapshot attempt with a delayed controller-API attempt hedged beside it, and answer with the best image the acquisition budget allows.
+ *
+ * RTSP starts at once and runs alone until the hedge delay has passed, measured from the acquisition's start rather than from RTSP's, so the time the timeshift source
+ * already spent counts. If RTSP is still running then, the controller-API attempt starts beside it, and RTSP declining before that point starts the API attempt at once
+ * instead. The first image to arrive wins, with one preference for RTSP's higher-quality image: an API image that arrives while RTSP is still running is held for at
+ * most the held-image wait, measured from the moment it arrived, and never past the cutoff the caller computes with snapshotCutoff. RTSP answering with an image
+ * while the API image is held replaces it, and RTSP failing hands it back at once.
+ *
+ * Each attempt runs under its own AbortController composed with the acquisition's signal, and every path out of this function aborts each attempt and waits for every
+ * one it started to settle, so the loser never outlives the call. That is required, not incidental: runWithAbort releases the acquisition's deadline the moment its
+ * function returns, so an attempt left running here would run on with nothing bounding it. The acquisition signal's own abort reaches each attempt through the
+ * composition. The hedge's state - each attempt's controller, the timers, which source won - lives in this call and ends with it.
+ *
+ * @param options           - Hedge inputs.
+ * @param options.api       - The controller-API attempt.
+ * @param options.clock     - The clock the hedge point, the held-image wait and the cutoff are armed on.
+ * @param options.cutoffAt  - The clock time past which a held controller-API image is handed back without waiting further for RTSP, as snapshotCutoff computes it.
+ * @param options.rtsp      - The RTSP attempt.
+ * @param options.signal    - The acquisition's signal, whose abort ends every attempt.
+ * @param options.startedAt - The clock time the acquisition's budget started, which the hedge delay is measured from.
+ *
+ * @returns The winning image and its source, or null when neither attempt produced one.
+ */
+export async function hedgeSnapshotAttempts(options: { api: SnapshotAttempt; clock: Clock; cutoffAt: number; rtsp: SnapshotAttempt; signal: AbortSignal;
+  startedAt: number; }): Promise<Nullable<HedgedSnapshot>> {
+
+  const { api, clock, cutoffAt, rtsp, signal, startedAt } = options;
+  const apiController = new AbortController();
+  const rtspController = new AbortController();
+  const timers: Disposable[] = [];
+
+  // Answer when the clock reaches an instant. An instant already behind us answers on the clock's next turn.
+  const reach = (instant: number): Promise<{ kind: "clock" }> => {
+
+    const { promise, resolve } = Promise.withResolvers<{ kind: "clock" }>();
+
+    timers.push(clock.schedule(() => resolve({ kind: "clock" }), Math.max(0, instant - clock.now())));
+
+    return promise;
+  };
+
+  // An attempt's answer as the hedge's result: the image with its source, or nothing.
+  const winner = (answer: AttemptAnswer): Nullable<HedgedSnapshot> => answer.image ? { image: answer.image, source: answer.kind } : null;
+
+  // Every attempt this call starts, which the cleanup waits on before the call returns.
+  const started: Promise<AttemptAnswer>[] = [];
+  const rtspAnswer = rtsp(composeSignals(signal, rtspController.signal)).then((image): AttemptAnswer => ({ image, kind: "rtsp" }));
+
+  started.push(rtspAnswer);
+
+  let apiAnswer: Nullable<Promise<AttemptAnswer>> = null;
+
+  // Start the controller-API attempt the first time any path reaches for it, and hand every later caller that same attempt, so it can never start twice.
+  const startApi = (): Promise<AttemptAnswer> => {
+
+    if(!apiAnswer) {
+
+      apiAnswer = api(composeSignals(signal, apiController.signal)).then((image): AttemptAnswer => ({ image, kind: "api" }));
+      started.push(apiAnswer);
+    }
+
+    return apiAnswer;
+  };
+
+  try {
+
+    // RTSP runs alone until the hedge point.
+    const early = await Promise.race([ rtspAnswer, reach(startedAt + PROTECT_SNAPSHOT_HEDGE_DELAY) ]);
+
+    if(early.kind === "rtsp") {
+
+      // RTSP answered before the hedge point. Its image wins outright, and its decline starts the controller-API attempt at once, unless the acquisition itself has
+      // already ended.
+      if(early.image || signal.aborted) {
+
+        return winner(early);
+      }
+
+      return winner(await startApi());
+    }
+
+    // The hedge point passed with RTSP still running, so the controller-API attempt starts beside it and the first answer decides what we wait for next.
+    const first = await Promise.race([ rtspAnswer, startApi() ]);
+
+    // RTSP answered first: its image wins, and its failure leaves the controller-API attempt to answer.
+    if(first.kind === "rtsp") {
+
+      return first.image ? winner(first) : winner(await startApi());
+    }
+
+    // The controller-API attempt answered first with nothing, so RTSP's answer is the only one left.
+    if(!first.image) {
+
+      return winner(await rtspAnswer);
+    }
+
+    // The controller-API attempt has just answered first with an image. We hold it for RTSP's until RTSP finishes, the held-image wait has passed since that answer,
+    // or the cutoff passes, whichever comes first.
+    const late = await Promise.race([ rtspAnswer, reach(Math.min(cutoffAt, clock.now() + PROTECT_SNAPSHOT_HELD_IMAGE_WAIT)) ]);
+
+    return ((late.kind === "rtsp") && late.image) ? winner(late) : winner(first);
+  } finally {
+
+    // Disarm whatever instant has not arrived, abort every attempt - a settled attempt ignores the abort - and wait for each attempt we started to settle.
+    for(const timer of timers) {
+
+      timer[Symbol.dispose]();
+    }
+
+    apiController.abort();
+    rtspController.abort();
+
+    await Promise.allSettled(started);
   }
 }

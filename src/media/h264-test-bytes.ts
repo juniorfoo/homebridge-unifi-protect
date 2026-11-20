@@ -13,4 +13,3 @@ export function testH264SpsForProfileLevel(profileIdc: number, levelIdc: number)
 
   return Buffer.from([ 0x67, profileIdc, 0, levelIdc, 0x96, 0x54, 0x05, 0x01, 0xED, 0x80 ]);
 }
-
