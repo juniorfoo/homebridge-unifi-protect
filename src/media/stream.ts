@@ -41,7 +41,8 @@ import { consumeLiveStreamSegments, createTsbSegmentWriterRail, primeLiveFfmpegS
 import { hasOutstandingLiveStreamReconfigureTarget, homeKitStreamVideoSnapshotFromRequest, homeKitStreamVideoSnapshotToRequestVideo, homeKitStreamVideoSnapshotsEqual,
   isMaterialLiveStreamReconfigure, resolveReconfigureMaterialityBaseline, unlinkOnFfmpegExitedSettled } from "./stream-reconfigure.ts";
 import type { HomeKitStreamVideoSnapshot } from "./stream-reconfigure.ts";
-import { appendLiveVideoEncodeToFfmpegArgs, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge, formatLiveEncodeDecisionLog,
+import { appendLiveVideoEncodeToFfmpegArgs, classifyLiveCopyEscalationEligible, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge,
+  formatLiveEncodeDecisionLog,
   resolveCopyEscalationKeyframePrimingBuffer, resolveFmp4InitForLiveDeclaredCheck, resolveStartStreamEncodePlan, resolveStartStreamForceTranscodeDueToUserOption,
   resolveLiveStreamTranscodePipelineOptions, resolveStreamEgressBitrateBps, resolveTimeshiftBufferLiveChannel,
   shouldSubstituteSelectChannelForSession } from "./stream-live-wiring.ts";
@@ -1836,10 +1837,13 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       }
     }
 
+    const owner = this.sessionDiagnosticsById.get(updatedRequest.sessionID);
+    const forceTranscodeDueToUserOption = rebuild.forceTranscodeDueToUserOption || Boolean(owner?.escalatedFromCopy);
+
     const encodePlan = resolveStartStreamEncodePlan({
 
       bufferForcedTranscodeReason: bufferForcedTranscodeReason, channelProfile: channelProfile, ffmpegOptions: this.ffmpegOptions,
-      fmp4InitSegmentData: rebuild.fmp4InitSegmentData, forceTranscodeDueToUserOption: rebuild.forceTranscodeDueToUserOption,
+      fmp4InitSegmentData: rebuild.fmp4InitSegmentData, forceTranscodeDueToUserOption: forceTranscodeDueToUserOption,
       homeKitBitrateKbps: updatedRequest.video.max_bit_rate, isHighLatency: rebuild.isHighLatency, preferCopyChannel: rebuild.preferCopyChannel,
       protectCamera: this.protectCamera, request: updatedRequest, sessionSource: rebuild.sessionSource, useTsb: rebuild.useTsb
     });
@@ -2065,10 +2069,25 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         this.log.error("Unable to replan the live view stream after HomeKit RECONFIGURE: %s.", formatErrorMessage(error));
       }
 
-      const copyReplacementFailedBeforeReady = Boolean(owner.reconfigureAwaitingEncoderReady) && owner.videoCopy;
+      let copyReplacementEscalationEligible = false;
+
+      if(owner.reconfigureAwaitingEncoderReady && owner.videoCopy) {
+
+        const failedEncoder = owner.activeVideoFfmpeg?.current;
+        const liveRebuild = owner.liveEncodeRebuild;
+
+        if(failedEncoder && liveRebuild) {
+
+          copyReplacementEscalationEligible = classifyLiveCopyEscalationEligible({
+
+            elapsedMs: Date.now() - owner.sessionStartedAt, escalatedFromCopy: owner.escalatedFromCopy, segmentsFed: owner.segmentsFed,
+            stderrLog: failedEncoder.stderrLog, useTimeshiftBuffer: liveRebuild.useTsb, videoCopy: owner.videoCopy
+          });
+        }
+      }
 
       if(!owner.pendingReconfigure && !sessionSignal.aborted && this.ongoingSessions.has(sessionId) &&
-        !owner.replanFailureEscalationInFlight && !copyReplacementFailedBeforeReady) {
+        !owner.replanFailureEscalationInFlight && !copyReplacementEscalationEligible) {
 
         this.logStreamSessionStopForOwner(sessionId, owner, "ffmpeg-exit", null);
         this.controller.forceStopStreamingSession(sessionId);

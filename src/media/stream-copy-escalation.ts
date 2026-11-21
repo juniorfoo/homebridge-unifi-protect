@@ -210,6 +210,7 @@ export async function replaceFailedCopyWithTranscode(input: CopyEscalationReplac
 
     ongoing.ffmpeg[0] = ffmpegStream;
     owner.escalatedFromCopy = true;
+    rebuild.forceTranscodeDueToUserOption = true;
     owner.transcode = true;
     owner.videoCopy = false;
     owner.hardwareTranscode = input.hardwareTranscodes;
