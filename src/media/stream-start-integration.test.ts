@@ -265,6 +265,11 @@ function assertSpawnedDecoderMatchesTranscodePipeline(delegate: ProtectStreaming
   assert.deepEqual(decoderPrefix, APPLE_TRANSCODE_DECODER_ARGS, "Apple interpolating transcode must use plain videotoolbox (CPU frames), not videotoolbox_vld");
 }
 
+function peekAppliedHomeKitFps(ctx: HarnessContext, sessionId: string): number | undefined {
+
+  return ctx.delegate.peekSessionDiagnosticsForHarness(sessionId)?.appliedHomeKitVideo?.fps;
+}
+
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 8000): Promise<void> {
 
   const started = Date.now();
@@ -2081,8 +2086,187 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     (replanSlow as TestLiveStreamingFfmpegProcess).releaseReady();
 
-    await waitFor(() => ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID)?.appliedHomeKitVideo?.fps === 30,
+    await waitFor(() => peekAppliedHomeKitFps(ctx, startRequest.sessionID) === 30,
       "applied HomeKit video must restore to 30fps after in-flight 15fps replan");
+
+    await stopActiveSession(ctx, startRequest.sessionID);
+  });
+
+  test("material RECONFIGURE while copy escalation awaits ready queues until escalation settles", async () => {
+
+    const ctx = createHarness({ appleSilicon: true, patchAppleDecoderProbe: true });
+    const bufferSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
+    const streamSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
+    const copyFailureLine = VIDEO_COPY_FAILURE_PATTERNS[1] ?? "Error initializing output stream";
+    let escalationSlow: TestLiveStreamingFfmpegProcess | null = null;
+    let spawnIndex = 0;
+
+    ctx.host.livestreamSubscriptions = [bufferSub];
+    await wireRealTimeshiftBuffer(ctx, bufferSub);
+    bufferSub.push({ ...MATCHING_INIT_LIVESTREAM, type: "init" });
+    const keyframe = makeKeyframeFragment();
+
+    bufferSub.push({ data: keyframe.data, mdat: keyframe.mdat, moof: keyframe.moof, type: "media" });
+    await settle();
+    ctx.host.livestreamSubscriptions = [streamSub];
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      spawnIndex += 1;
+
+      if(spawnIndex === 1) {
+
+        const copy = new TestLiveStreamingFfmpegProcess("copy-fail", {
+
+          blockStdin: true,
+          pipeBreakOnTeardown: true,
+          signal: init.signal,
+          stderrLog: [copyFailureLine]
+        });
+
+        setTimeout(() => copy.abort(), 200);
+        ctx.spawnedArgs.push(init.args ?? []);
+        ctx.spawnedProcesses.push(copy);
+
+        return copy as unknown as ProtectStreamingFfmpegProcess;
+      }
+
+      const deferReady = spawnIndex === 2;
+      const replacement = new TestLiveStreamingFfmpegProcess("escalation-" + String(spawnIndex), { deferReady: deferReady, signal: init.signal });
+
+      if(deferReady) {
+
+        escalationSlow = replacement;
+      }
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(replacement);
+
+      return replacement as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+    const liveLead = makeNonKeyframeFragment();
+
+    const startPromise = prepareAndStart(ctx, startRequest);
+
+    streamSub.push({ data: liveLead.data, mdat: liveLead.mdat, moof: liveLead.moof, type: "media" });
+    await startPromise;
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "copy escalation spawn");
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({
+
+        ...startRequest,
+        type: StreamRequestTypes.RECONFIGURE,
+        video: { ...startRequest.video, fps: 10 }
+      }, (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    assert.equal(ctx.spawnedProcesses.length, 2, "RECONFIGURE must not replace escalation replacement before ready");
+    assert.ok(ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID)?.pendingReconfigure);
+
+    assert.ok(escalationSlow);
+    (escalationSlow as TestLiveStreamingFfmpegProcess).releaseReady();
+    await waitFor(() => peekAppliedHomeKitFps(ctx, startRequest.sessionID) === 10,
+      "pending RECONFIGURE must drain after escalation ready");
+
+    const alive = ctx.spawnedProcesses.filter((proc) => !proc.signal.aborted);
+
+    assert.equal(alive.length, 1, "only the latest encoder must stay alive");
+    assert.equal(ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID)?.activeVideoFfmpegProcess, alive[0]);
+
+    await stopActiveSession(ctx, startRequest.sessionID);
+  });
+
+  test("RECONFIGURE during pending establishment keeps the latest video ffmpeg registered", async () => {
+
+    const ctx = createHarness();
+    const streamSub = makeControllableLivestreamDouble({ deferEstablishment: true, initSegment: MATCHING_INIT_LIVESTREAM });
+
+    ctx.host.livestreamSubscriptions = [streamSub];
+    ctx.timeshift.buffer.isStarted = true;
+    ctx.timeshift.buffer.channelProfile = stubChannel;
+    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      const deferReady = ctx.spawnedProcesses.length > 0;
+      const proc = new TestLiveStreamingFfmpegProcess("live-" + String(ctx.spawnedProcesses.length), { deferReady: deferReady, signal: init.signal });
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(proc);
+
+      return proc as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+
+    startRequest.video.fps = 30;
+
+    const liveLead = makeNonKeyframeFragment();
+    const startPromise = prepareAndStart(ctx, startRequest);
+
+    streamSub.push({ data: liveLead.data, mdat: liveLead.mdat, moof: liveLead.moof, type: "media" });
+    await startPromise;
+    assert.equal(ctx.spawnedProcesses.length, 1);
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({
+
+        ...startRequest,
+        type: StreamRequestTypes.RECONFIGURE,
+        video: { ...startRequest.video, fps: 15 }
+      }, (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "reconfigure replacement during establishment");
+    assert.ok(ctx.logEntries.some((entry) => entry.message.includes("Replanning live view")),
+      "material RECONFIGURE during establishment must replan the encoder");
+
+    const replacementEncoder = (): TestLiveStreamingFfmpegProcess => {
+
+      const proc = ctx.spawnedProcesses[1];
+
+      assert.ok(proc instanceof TestLiveStreamingFfmpegProcess);
+
+      return proc;
+    };
+
+    assert.ok(!replacementEncoder().signal.aborted,
+      "reconfigure replacement must stay registered while awaiting encoder ready");
+
+    for(const proc of ctx.spawnedProcesses) {
+
+      if(proc instanceof TestLiveStreamingFfmpegProcess) {
+
+        proc.releaseReady();
+      }
+    }
+
+    const latestEncoder = (): ProtectStreamingFfmpegProcess => replacementEncoder() as unknown as ProtectStreamingFfmpegProcess;
+
+    const harnessVideoProcess = (): ProtectStreamingFfmpegProcess | undefined => {
+
+      const peek = ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID);
+
+      return peek?.activeVideoFfmpegProcess ?? peek?.ongoingVideoFfmpegProcess;
+    };
+
+    await waitFor(() => harnessVideoProcess() === latestEncoder(),
+      "reconfigure replan must register the replacement before establishment completes");
+
+    streamSub.releaseEstablishment();
+    await waitFor(() => harnessVideoProcess() === latestEncoder(),
+      "establishment housekeeping must keep the reconfigure replacement registered");
+
+    const alive = ctx.spawnedProcesses.filter((proc) => !proc.signal.aborted);
+
+    assert.equal(alive.length, 1, "exactly one video ffmpeg must remain after pending establishment");
+    assert.equal(harnessVideoProcess(), latestEncoder());
+    assert.equal(alive[0], replacementEncoder(), "establishment housekeeping must keep the reconfigure replacement, not the pre-establishment ffmpeg");
 
     await stopActiveSession(ctx, startRequest.sessionID);
   });

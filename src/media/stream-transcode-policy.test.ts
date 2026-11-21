@@ -337,6 +337,12 @@ describe("establishment copy-failure wiring", () => {
     assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: false, eligibleForEscalation: true, exitIsReplaced: false,
       sessionStillOwned: false }), "ignore");
   });
+
+  test("ignores eligible copy failures while a live replacement is already in flight", () => {
+
+    assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: true, eligibleForEscalation: true, exitIsReplaced: false,
+      sessionStillOwned: true }), "ignore");
+  });
 });
 
 describe("session id reuse lifecycle guards", () => {

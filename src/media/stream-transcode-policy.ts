@@ -364,7 +364,12 @@ export function resolveVideoCopyExitBridgeAction(input: { copyEscalationInFlight
     return "ignore";
   }
 
-  if(input.eligibleForEscalation && !input.copyEscalationInFlight) {
+  if(input.copyEscalationInFlight) {
+
+    return "ignore";
+  }
+
+  if(input.eligibleForEscalation) {
 
     return "escalate";
   }

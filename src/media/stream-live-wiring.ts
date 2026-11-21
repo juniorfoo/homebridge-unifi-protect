@@ -365,6 +365,7 @@ export interface LiveFfmpegCopyExitBridgeInput {
   endFfmpegBridge: (exitedProcess: ProtectStreamingFfmpegProcess, ffmpegExitCode?: number | null) => void;
   escalateCopyFailure: (exitedProcess: ProtectStreamingFfmpegProcess, onRespawned: (respawned: ProtectStreamingFfmpegProcess) => void,
     tsbResume: CopyEscalationTsbResume | undefined) => Promise<ProtectStreamingFfmpegProcess | null>;
+  onEscalationSettled?: () => void;
   onRespawned: (respawned: ProtectStreamingFfmpegProcess) => void;
   sessionDiagnostics: { escalatedFromCopy: boolean; segmentsFed: number; videoCopy: boolean };
   sessionStartedAt: number;
@@ -408,10 +409,14 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
         wireFfmpegExitBridge(respawned);
       }, tsbResume).then((respawned) => {
 
+        input.copyEscalationInFlightRef.current = false;
+
         if(!respawned && input.sessionStillOwned()) {
 
-          input.copyEscalationInFlightRef.current = false;
           input.endFfmpegBridge(exitedProcess, ffmpegExitCode);
+        } else if(respawned && input.sessionStillOwned()) {
+
+          input.onEscalationSettled?.();
         }
       }, () => {
 
@@ -419,6 +424,7 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
 
           input.copyEscalationInFlightRef.current = false;
           input.endFfmpegBridge(exitedProcess, ffmpegExitCode);
+          input.onEscalationSettled?.();
         }
       });
 

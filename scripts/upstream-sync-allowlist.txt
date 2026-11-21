@@ -83,14 +83,14 @@ LOST:src/media/stream.ts:1516:upstream v8.2.2 comment not on fork head: @param o
 LOST:src/media/stream.ts:1517:upstream v8.2.2 comment not on fork head: @param options.established - The livestream's establishment answer.
 LOST:src/media/stream.ts:1518:upstream waitForLivestreamEstablishment JSDoc + deadline helper vs fork inlined waiter
 LOST:src/media/stream.ts:1520:upstream v8.2.2 comment not on fork head: @returns Whether the livestream established before the deadline.
-RESURRECTED:src/media/stream.ts:1015:fork reads HomeKit packet_time >= 60 locally instead of resolveTranscodeDecision output
-RESURRECTED:src/media/stream.ts:1022:fork seeds targetBitrate before channel/encode policy on copy-first path
-RESURRECTED:src/media/stream.ts:1126:fork transcode channel select caps at 3840x2160 when host hardware encoder available
+RESURRECTED:src/media/stream.ts:1016:fork reads HomeKit packet_time >= 60 locally instead of resolveTranscodeDecision output
+RESURRECTED:src/media/stream.ts:1023:fork seeds targetBitrate before channel/encode policy on copy-first path
 RESURRECTED:src/media/stream.ts:1127:fork transcode channel select caps at 3840x2160 when host hardware encoder available
-RESURRECTED:src/media/stream.ts:1218:fork line resurrected vs upstream removal: const useInterpolationFilter = useTsb && !isPackageCameraContext(this.protectCamera.a
-RESURRECTED:src/media/stream.ts:1219:fork line resurrected vs upstream removal: ((this.platform.codecSupport.hostSystem === "macOS.Apple") && (this.platform.codecSup
-RESURRECTED:src/media/stream.ts:1781:Theme 3 RTSP reconfigure channel reselect uses fork hardware-capped geometry
-RESURRECTED:src/media/stream.ts:1782:Theme 3 RTSP reconfigure channel reselect uses fork hardware-capped geometry
+RESURRECTED:src/media/stream.ts:1128:fork transcode channel select caps at 3840x2160 when host hardware encoder available
+RESURRECTED:src/media/stream.ts:1219:fork line resurrected vs upstream removal: const useInterpolationFilter = useTsb && !isPackageCameraContext(this.protectCamera.a
+RESURRECTED:src/media/stream.ts:1220:fork line resurrected vs upstream removal: ((this.platform.codecSupport.hostSystem === "macOS.Apple") && (this.platform.codecSup
+RESURRECTED:src/media/stream.ts:1800:Theme 3 RTSP reconfigure channel reselect uses fork hardware-capped geometry
+RESURRECTED:src/media/stream.ts:1801:Theme 3 RTSP reconfigure channel reselect uses fork hardware-capped geometry
 LOST:src/media/stream.ts:1341:Theme 3 replaces upstream v8.2.2 RECONFIGURE no-op comment with in-session replan
 LOST:src/media/stream.ts:1342:Theme 3 replaces upstream v8.2.2 RECONFIGURE no-op comment with in-session replan
 LOST:src/media/testing.helpers.ts:278:fork fragment builders for fanout/FO2 segment injection tests not in upstream harness

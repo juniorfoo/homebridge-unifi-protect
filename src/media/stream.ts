@@ -55,6 +55,7 @@ interface StreamReconfigureHandles {
 
   copyEscalationInFlightRef: { current: boolean };
   createTsbResume: () => CopyEscalationTsbResume | undefined;
+  syncRunningVideoFfmpeg: (process: ProtectStreamingFfmpegProcess) => void;
   wireFfmpegExitBridge: (process: ProtectStreamingFfmpegProcess) => void;
 }
 
@@ -1349,6 +1350,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       throw error;
     }
 
+    const currentVideoFfmpegForOngoing = (): ProtectStreamingFfmpegProcess => sessionDiagnostics.activeVideoFfmpeg?.current ?? activeFfmpeg;
+
     // Bridge FFmpeg's ready signal to HomeKit's StreamRequestCallback, exactly once, for all input sources. ready resolves on FFmpeg's first stderr byte regardless
     // of source and rejects on a spawn failure (-> callback(error)). We prefer the underlying cause on the reject path so an ENOENT surfaces usefully rather than the
     // bare abort-reason name. ready settles once, so this calls back exactly once; the whenEstablished await below gates only whether to keep or bail the session,
@@ -1377,6 +1380,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
       void subscription?.[Symbol.asyncDispose]();
       tsbWriterRail?.getSegmentWriter().abort();
+
+      if(sessionDiagnostics.activeVideoFfmpeg?.current !== exitedProcess) {
+
+        return;
+      }
 
       if(!isHbpuAbortReason(exitedProcess.signal.reason, "shutdown")) {
 
@@ -1423,6 +1431,13 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       endFfmpegBridge: endFfmpegBridge,
       escalateCopyFailure: (exitedProcess, onRespawned, tsbResume) => this.escalateCopyFailureToTranscode(request.sessionID, sessionDiagnostics, exitedProcess,
         "H.264 copy path failed at runtime", onRespawned, tsbResume),
+      onEscalationSettled: () => {
+
+        if(sessionStillOwned()) {
+
+          this.drainPendingHomeKitReconfigure(request.sessionID);
+        }
+      },
       onRespawned: (respawned) => {
 
         activeFfmpeg = respawned;
@@ -1460,6 +1475,10 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
           subscription: subscription
         });
       },
+      syncRunningVideoFfmpeg: (process: ProtectStreamingFfmpegProcess): void => {
+
+        activeFfmpeg = process;
+      },
       wireFfmpegExitBridge: wireFfmpegExitBridge
     };
 
@@ -1469,7 +1488,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       this.ongoingSessions.set(request.sessionID, {
 
         abortController: sessionInfo.abortController,
-        ffmpeg: [activeFfmpeg],
+        ffmpeg: [currentVideoFfmpegForOngoing()],
         rtpDemuxer: sessionInfo.rtpDemuxer,
         rtpPortReservations: sessionInfo.rtpPortReservations,
         toggleLight: sessionInfo.toggleLight
@@ -1559,13 +1578,13 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     if(ongoingEntry?.abortController === sessionInfo.abortController) {
 
-      ongoingEntry.ffmpeg[0] = activeFfmpeg;
+      ongoingEntry.ffmpeg[0] = currentVideoFfmpegForOngoing();
     } else if(shouldRegisterOngoingSessionEntry(ongoingEntry, sessionInfo)) {
 
       this.ongoingSessions.set(request.sessionID, {
 
         abortController: sessionInfo.abortController,
-        ffmpeg: [activeFfmpeg],
+        ffmpeg: [currentVideoFfmpegForOngoing()],
         rtpDemuxer: sessionInfo.rtpDemuxer,
         rtpPortReservations: sessionInfo.rtpPortReservations,
         toggleLight: sessionInfo.toggleLight
@@ -1818,22 +1837,102 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     return encodePlan;
   }
 
-  private async replanLiveStreamForHomeKitReconfigure(sessionId: string, updatedRequest: StartStreamRequest,
-    encodePlan: ReturnType<typeof resolveStartStreamEncodePlan>, reason: string): Promise<void> {
+  private drainPendingHomeKitReconfigure(sessionId: string): void {
 
     const owner = this.sessionDiagnosticsById.get(sessionId);
-    const ongoing = this.ongoingSessions.get(sessionId);
-    const rebuild = owner?.liveEncodeRebuild;
-    const handles = owner?.reconfigureHandles;
+    const pendingRebuild = owner?.liveEncodeRebuild;
 
-    if(!owner || !ongoing || !rebuild || !handles) {
+    if(!owner || !pendingRebuild) {
 
       return;
     }
 
-    const priorFfmpeg = ongoing.ffmpeg[0];
+    const pending = owner.pendingReconfigure;
+
+    if(!pending) {
+
+      return;
+    }
+
+    owner.pendingReconfigure = undefined;
+    pendingRebuild.request = pending;
+    const encodePlan = this.resolveEncodePlanAfterHomeKitReconfigure(pending, pendingRebuild);
+
+    if(!encodePlan) {
+
+      return;
+    }
+
+    const nextSnapshot = homeKitStreamVideoSnapshotFromRequest(pending.video);
+    const decision = isMaterialLiveStreamReconfigure({
+
+      next: nextSnapshot,
+      nextEncode: encodePlan.encodeDecision.mode,
+      previous: owner.appliedHomeKitVideo,
+      previousEncode: owner.videoCopy ? "copy" : "transcode"
+    });
+
+    if(decision.material) {
+
+      pendingRebuild.request = pending;
+      void this.replanLiveStreamForHomeKitReconfigure(sessionId, pending, encodePlan, decision.reason);
+    }
+  }
+
+  private async replanLiveStreamForHomeKitReconfigure(sessionId: string, updatedRequest: StartStreamRequest,
+    encodePlan: ReturnType<typeof resolveStartStreamEncodePlan>, reason: string): Promise<void> {
+
+    const owner = this.sessionDiagnosticsById.get(sessionId);
+    const rebuild = owner?.liveEncodeRebuild;
+    const handles = owner?.reconfigureHandles;
+
+    if(!owner || !rebuild || !handles) {
+
+      return;
+    }
+
+    let ongoing = this.ongoingSessions.get(sessionId);
+
+    if(!ongoing) {
+
+      const pending = this.pendingSessions.get(sessionId);
+      const current = owner.activeVideoFfmpeg?.current;
+
+      if(pending && (pending === rebuild.sessionInfo) && current) {
+
+        ongoing = {
+
+          abortController: pending.abortController,
+          ffmpeg: [current],
+          rtpDemuxer: pending.rtpDemuxer,
+          rtpPortReservations: pending.rtpPortReservations,
+          toggleLight: pending.toggleLight
+        };
+        this.ongoingSessions.set(sessionId, ongoing);
+      }
+
+      if(!ongoing) {
+
+        owner.reconfigureInFlight = false;
+        handles.copyEscalationInFlightRef.current = false;
+
+        return;
+      }
+    }
+
+    if(handles.copyEscalationInFlightRef.current && (owner.reconfigureInFlight !== true)) {
+
+      owner.pendingReconfigure = updatedRequest;
+
+      return;
+    }
+
+    const priorFfmpeg = owner.activeVideoFfmpeg?.current ?? ongoing.ffmpeg[0];
 
     if(!priorFfmpeg) {
+
+      owner.reconfigureInFlight = false;
+      handles.copyEscalationInFlightRef.current = false;
 
       return;
     }
@@ -1902,14 +2001,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       owner.profile = channelProfile.name;
       owner.homeKitVideo = nextSnapshot;
 
-      const tsbResume = handles.createTsbResume();
-
-      if(tsbResume) {
-
-        tsbResume.rotateSegmentWriter(respawned);
-        primeLiveFfmpegStdinAfterRespawn(tsbResume.feedState, tsbResume.subscription, respawned, tsbResume.keyframePrimingBuffer, this.log);
-      }
-
       if(owner.activeVideoFfmpeg) {
 
         owner.activeVideoFfmpeg.current = respawned;
@@ -1918,7 +2009,16 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         owner.activeVideoFfmpeg = { current: respawned };
       }
 
+      handles.syncRunningVideoFfmpeg(respawned);
       handles.wireFfmpegExitBridge(respawned);
+
+      const tsbResume = handles.createTsbResume();
+
+      if(tsbResume) {
+
+        tsbResume.rotateSegmentWriter(respawned);
+        primeLiveFfmpegStdinAfterRespawn(tsbResume.feedState, tsbResume.subscription, respawned, tsbResume.keyframePrimingBuffer, this.log);
+      }
 
       unlinkOnFfmpegExitedSettled(respawned.exited, unlinkSessionAbort);
 
@@ -1936,39 +2036,20 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       owner.reconfigureAwaitingEncoderReady = false;
       owner.reconfigureInFlight = false;
 
-      const pending = owner.pendingReconfigure;
-      const pendingRebuild = owner.liveEncodeRebuild;
-
-      if(pending && pendingRebuild) {
-
-        owner.pendingReconfigure = undefined;
-        pendingRebuild.request = pending;
-        const encodePlan = this.resolveEncodePlanAfterHomeKitReconfigure(pending, pendingRebuild);
-
-        if(encodePlan) {
-
-          const nextSnapshot = homeKitStreamVideoSnapshotFromRequest(pending.video);
-          const decision = isMaterialLiveStreamReconfigure({
-
-            next: nextSnapshot,
-            nextEncode: encodePlan.encodeDecision.mode,
-            previous: owner.appliedHomeKitVideo,
-            previousEncode: owner.videoCopy ? "copy" : "transcode"
-          });
-
-          if(decision.material) {
-
-            pendingRebuild.request = pending;
-            void this.replanLiveStreamForHomeKitReconfigure(sessionId, pending, encodePlan, decision.reason);
-          }
-        }
-      }
+      this.drainPendingHomeKitReconfigure(sessionId);
     }
   }
 
   /** Integration harness assertions only (not a supported production API). */
-  public peekSessionDiagnosticsForHarness(sessionId: string):
-    Pick<StreamSessionDiagnostics, "appliedHomeKitVideo" | "pendingReconfigure" | "reconfigureAwaitingEncoderReady" | "reconfigureInFlight"> | undefined {
+  public peekSessionDiagnosticsForHarness(sessionId: string): {
+    activeVideoFfmpegProcess: ProtectStreamingFfmpegProcess | undefined;
+    appliedHomeKitVideo: HomeKitStreamVideoSnapshot | undefined;
+    copyEscalationInFlight: boolean;
+    ongoingVideoFfmpegProcess: ProtectStreamingFfmpegProcess | undefined;
+    pendingReconfigure: StartStreamRequest | undefined;
+    reconfigureAwaitingEncoderReady: boolean | undefined;
+    reconfigureInFlight: boolean | undefined;
+  } | undefined {
 
     const owner = this.sessionDiagnosticsById.get(sessionId);
 
@@ -1977,9 +2058,14 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       return undefined;
     }
 
+    const ongoing = this.ongoingSessions.get(sessionId);
+
     return {
 
+      activeVideoFfmpegProcess: owner.activeVideoFfmpeg?.current,
       appliedHomeKitVideo: owner.appliedHomeKitVideo,
+      copyEscalationInFlight: Boolean(owner.reconfigureHandles?.copyEscalationInFlightRef.current),
+      ongoingVideoFfmpegProcess: ongoing?.ffmpeg[0],
       pendingReconfigure: owner.pendingReconfigure,
       reconfigureAwaitingEncoderReady: owner.reconfigureAwaitingEncoderReady,
       reconfigureInFlight: owner.reconfigureInFlight
@@ -2048,8 +2134,12 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
                   rebuildRequestVideo: rebuild.request.video,
                   reconfigureInFlight: Boolean(owner.reconfigureInFlight)
                 });
-                const queueForInFlightReplan = encodedTargetOutstanding &&
-                  (Boolean(owner.reconfigureInFlight) || Boolean(owner.reconfigureAwaitingEncoderReady));
+                const handles = owner.reconfigureHandles;
+                const copyReplacementMutexHeld = Boolean(handles?.copyEscalationInFlightRef.current) &&
+                  !owner.reconfigureInFlight;
+                const queueForInFlightReplan = copyReplacementMutexHeld || (encodedTargetOutstanding &&
+                  (Boolean(owner.reconfigureInFlight) || Boolean(owner.reconfigureAwaitingEncoderReady) ||
+                  Boolean(handles?.copyEscalationInFlightRef.current)));
 
                 rebuild.request = updatedRequest;
 
@@ -2059,6 +2149,12 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
                 } else {
 
                   owner.reconfigureInFlight = true;
+
+                  if(handles) {
+
+                    handles.copyEscalationInFlightRef.current = true;
+                  }
+
                   void this.replanLiveStreamForHomeKitReconfigure(request.sessionID, updatedRequest, encodePlan, decision.reason);
                 }
               } else if(!owner.reconfigureInFlight) {
