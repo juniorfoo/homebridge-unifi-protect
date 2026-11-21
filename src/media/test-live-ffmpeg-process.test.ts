@@ -42,6 +42,18 @@ describe("TestLiveStreamingFfmpegProcess", () => {
     await proc.exited;
   });
 
+  test("deferReady rejects when the parent signal is already aborted at construction", async () => {
+
+    const parent = new AbortController();
+
+    parent.abort(new HbpuAbortError("shutdown"));
+
+    const proc = new TestLiveStreamingFfmpegProcess("pre-aborted-defer", { deferReady: true, signal: parent.signal });
+
+    await assert.rejects(proc.ready, (error: unknown) => error instanceof HbpuAbortError);
+    await proc.exited;
+  });
+
   test("exited settles when the parent signal is already aborted at construction", async () => {
 
     const parent = new AbortController();

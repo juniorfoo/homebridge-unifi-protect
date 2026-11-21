@@ -97,6 +97,18 @@ export class TestLiveStreamingFfmpegProcess {
       this.#controller.signal.addEventListener("abort", settleExited, { once: true });
     }
 
+    if(this.#deferReady) {
+
+      this.ready = new Promise<void>((resolve, reject) => {
+
+        this.#resolveReady = resolve;
+        this.#rejectReady = reject;
+      });
+    } else {
+
+      this.ready = Promise.resolve();
+    }
+
     if(init?.signal) {
 
       const onParentAbort = (): void => {
@@ -117,16 +129,9 @@ export class TestLiveStreamingFfmpegProcess {
       }
     }
 
-    if(this.#deferReady) {
+    if(this.#deferReady && this.#controller.signal.aborted && this.#rejectReady) {
 
-      this.ready = new Promise<void>((resolve, reject) => {
-
-        this.#resolveReady = resolve;
-        this.#rejectReady = reject;
-      });
-    } else {
-
-      this.ready = Promise.resolve();
+      this.#rejectDeferredReady(this.#controller.signal.reason ?? new HbpuAbortError("shutdown"));
     }
   }
 

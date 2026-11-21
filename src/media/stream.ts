@@ -83,6 +83,8 @@ interface StreamSessionDiagnostics {
   reconfigureInFlight?: boolean;
   /** Set when a replan copy replacement exits into transcode escalation before `ready`. */
   replanFailureEscalationInFlight?: boolean;
+  /** Bridges HomeKit START to the current encoder `ready` until the callback settles once. */
+  startStreamReadyBridge?: { accessoryName: string; callback: StreamRequestCallback; settled: boolean };
   segmentsFed: number;
   sessionStartedAt: number;
   stopLogged: boolean;
@@ -993,6 +995,48 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
   }
 
   // Launch the Protect video (and audio) stream.
+  private formatStartStreamReadyError(accessoryName: string, reason: unknown): Error {
+
+    return new Error(accessoryName + ": " + (((reason instanceof HbpuAbortError) && (reason.cause instanceof Error)) ? reason.cause.message : String(reason)));
+  }
+
+  private attachStartStreamReadyBridge(owner: StreamSessionDiagnostics, process: ProtectStreamingFfmpegProcess): void {
+
+    const bridge = owner.startStreamReadyBridge;
+
+    if(!bridge || bridge.settled) {
+
+      return;
+    }
+
+    void process.ready.then(() => {
+
+      if(bridge.settled) {
+
+        return;
+      }
+
+      bridge.settled = true;
+      delete owner.startStreamReadyBridge;
+      bridge.callback(undefined);
+    }, (reason: unknown) => {
+
+      if(bridge.settled) {
+
+        return;
+      }
+
+      if(isHbpuAbortReason(reason, "replaced")) {
+
+        return;
+      }
+
+      bridge.settled = true;
+      delete owner.startStreamReadyBridge;
+      bridge.callback(this.formatStartStreamReadyError(bridge.accessoryName, reason));
+    });
+  }
+
   private async startStream(request: StartStreamRequest, callback: StreamRequestCallback): Promise<void> {
 
     const requestedAt = this.platform.clock.monotonic();
@@ -1360,12 +1404,16 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     const currentVideoFfmpegForOngoing = (): ProtectStreamingFfmpegProcess => activeFfmpeg;
 
-    // Bridge FFmpeg's ready signal to HomeKit's StreamRequestCallback, exactly once, for all input sources. ready resolves on FFmpeg's first stderr byte regardless
-    // of source and rejects on a spawn failure (-> callback(error)). We prefer the underlying cause on the reject path so an ENOENT surfaces usefully rather than the
-    // bare abort-reason name. ready settles once, so this calls back exactly once; the whenEstablished await below gates only whether to keep or bail the session,
-    // never the callback.
-    void activeFfmpeg.ready.then(() => callback(undefined), (reason: unknown) => callback(new Error(this.protectCamera.accessoryName + ": " +
-      (((reason instanceof HbpuAbortError) && (reason.cause instanceof Error)) ? reason.cause.message : String(reason)))));
+    // Bridge FFmpeg's ready signal to HomeKit's StreamRequestCallback, exactly once, for all input sources. Rebinds to a replacement encoder when a material replan or
+    // copy escalation swaps the process before the initial `ready` settles. ready resolves on FFmpeg's first stderr byte regardless of source and rejects on a spawn
+    // failure (-> callback(error)). We prefer the underlying cause on the reject path so an ENOENT surfaces usefully rather than the bare abort-reason name.
+    sessionDiagnostics.startStreamReadyBridge = {
+
+      accessoryName: this.protectCamera.accessoryName,
+      callback: callback,
+      settled: false
+    };
+    this.attachStartStreamReadyBridge(sessionDiagnostics, activeFfmpeg);
 
     let subscription: Nullable<LivestreamSubscription> = null;
     let tsbWriterRail: ReturnType<typeof createTsbSegmentWriterRail> | null = null;
@@ -1460,6 +1508,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         activeFfmpeg = respawned;
         sessionDiagnostics.activeVideoFfmpeg = { current: respawned };
+        this.attachStartStreamReadyBridge(sessionDiagnostics, respawned);
       },
       reconfigureAwaitingEncoderReady: () => Boolean(sessionDiagnostics.reconfigureAwaitingEncoderReady),
       sessionDiagnostics: sessionDiagnostics,
@@ -2045,6 +2094,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
       handles.syncRunningVideoFfmpeg(respawned);
       handles.wireFfmpegExitBridge(respawned);
+      this.attachStartStreamReadyBridge(owner, respawned);
 
       const tsbResume = handles.createTsbResume();
 
