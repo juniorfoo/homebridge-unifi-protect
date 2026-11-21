@@ -1009,9 +1009,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       return;
     }
 
+    const encoderStillOwnsStartBridge = (): boolean => owner.activeVideoFfmpeg?.current === process;
+
     void process.ready.then(() => {
 
-      if(bridge.settled) {
+      if(bridge.settled || !encoderStillOwnsStartBridge()) {
 
         return;
       }
@@ -1021,7 +1023,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       bridge.callback(undefined);
     }, (reason: unknown) => {
 
-      if(bridge.settled) {
+      if(bridge.settled || !encoderStillOwnsStartBridge()) {
 
         return;
       }

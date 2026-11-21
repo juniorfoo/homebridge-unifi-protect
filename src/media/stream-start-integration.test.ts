@@ -2221,6 +2221,90 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     await stopActiveSession(ctx, startRequest.sessionID);
   });
 
+  test("copy failure escalation before initial encoder ready answers START once from transcode replacement", async () => {
+
+    const ctx = createHarness({ appleSilicon: true, patchAppleDecoderProbe: true });
+    const streamSub = makeControllableLivestreamDouble({ deferEstablishment: true, initSegment: MATCHING_INIT_LIVESTREAM });
+    const copyFailureLine = VIDEO_COPY_FAILURE_PATTERNS[1] ?? "Error initializing output stream";
+    let spawnIndex = 0;
+    let escalationReplacement: TestLiveStreamingFfmpegProcess | null = null;
+
+    ctx.host.livestreamSubscriptions = [streamSub];
+    enableReplaTimeshiftBufferDefaults(ctx);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      spawnIndex += 1;
+
+      if(spawnIndex === 1) {
+
+        const copy = new TestLiveStreamingFfmpegProcess("copy-defer", {
+
+          deferReady: true,
+          signal: init.signal,
+          stderrLog: [copyFailureLine]
+        });
+
+        ctx.spawnedArgs.push(init.args ?? []);
+        ctx.spawnedProcesses.push(copy);
+
+        return copy as unknown as ProtectStreamingFfmpegProcess;
+      }
+
+      const replacement = new TestLiveStreamingFfmpegProcess("escalation-defer-" + String(spawnIndex), { deferReady: true, signal: init.signal });
+
+      escalationReplacement = replacement;
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(replacement);
+
+      return replacement as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+    const liveLead = makeNonKeyframeFragment();
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.prepareStream(makePrepareRequest(), (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    let startCallbacks = 0;
+    const startSettled = new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({ ...startRequest, type: StreamRequestTypes.START }, (error) => {
+
+        startCallbacks += 1;
+
+        if(error instanceof Error) {
+
+          reject(error);
+
+          return;
+        }
+
+        resolve();
+      });
+    });
+
+    streamSub.push({ data: liveLead.data, mdat: liveLead.mdat, moof: liveLead.moof, type: "media" });
+    await waitFor(() => ctx.spawnedProcesses.length >= 1, "initial copy spawn");
+
+    const copyProc = ctx.spawnedProcesses[0];
+
+    assert.ok(copyProc instanceof TestLiveStreamingFfmpegProcess);
+    copyProc.crash();
+    await waitFor(() => ctx.spawnedProcesses.length >= 2, "transcode escalation spawn before START ready", 25000);
+    assert.ok(escalationReplacement);
+
+    (escalationReplacement as TestLiveStreamingFfmpegProcess).releaseReady();
+    await startSettled;
+    assert.equal(startCallbacks, 1, "HomeKit START must settle once via transcode replacement after copy failure");
+    assert.equal(argsUseVideoCopy(ctx.spawnedArgs[1] ?? []), false);
+
+    streamSub.releaseEstablishment();
+    await stopActiveSession(ctx, startRequest.sessionID);
+  });
+
   test("material RECONFIGURE replacement failure before ready answers START once with error", async () => {
 
     const ctx = createHarness();
