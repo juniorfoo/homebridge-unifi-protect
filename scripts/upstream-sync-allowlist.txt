@@ -1,5 +1,18 @@
 # path:line:reason — deliberate fork deltas vs upstream v8.3.0
 LOST:src/media/stream-ffmpeg-process.ts:5:fork typed live spawn wrapper vs upstream inline factory exports
+LOST:src/media/stream-start.test.ts:22:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
+LOST:src/media/stream-start.test.ts:28:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
+LOST:src/media/stream-start.test.ts:317:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
+LOST:src/media/stream-start.test.ts:341:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
+LOST:src/media/stream-start.test.ts:342:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
+LOST:src/media/stream-start.test.ts:343:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
+LOST:src/media/stream-start.test.ts:362:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
+LOST:src/media/stream-start.test.ts:365:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
+LOST:src/media/stream-start.test.ts:484:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
+LOST:src/media/stream-start.test.ts:978:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
+LOST:src/media/stream-start.test.ts:984:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
+LOST:src/media/stream-start.test.ts:1002:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
+LOST:src/media/stream-start.test.ts:1257:fork copy-first stream-start.test alignment vs upstream transcode-default harness rows
 LOST:src/media/stream.ts:8:upstream v8.3.0 Mp4FrameFeed in delegate; fork routes via stream-live-feed
 LOST:src/media/stream.ts:12:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
 LOST:src/media/stream.ts:31:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
@@ -17,7 +30,7 @@ LOST:src/media/stream.ts:585:deliberate fork delta vs upstream v8.3.0 (src/media
 LOST:src/media/stream.ts:587:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
 LOST:src/media/stream.ts:592:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
 LOST:src/media/stream.ts:593:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
-LOST:src/media/stream.ts:598:upstream v8.3.0 comment not on fork head after stream-live extraction
+LOST:src/media/stream.ts:598:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
 LOST:src/media/stream.ts:599:upstream v8.3.0 comment not on fork head after stream-live extraction
 LOST:src/media/stream.ts:600:upstream v8.3.0 comment not on fork head after stream-live extraction
 LOST:src/media/stream.ts:601:upstream v8.3.0 comment not on fork head after stream-live extraction
@@ -41,7 +54,7 @@ LOST:src/media/stream.ts:741:upstream v8.3.0 comment not on fork head after stre
 RESURRECTED:src/media/stream.ts:846:upstream v8.3.0 comment not on fork head after stream-live extraction
 RESURRECTED:src/media/stream.ts:847:upstream v8.3.0 comment not on fork head after stream-live extraction
 RESURRECTED:src/media/stream.ts:848:upstream v8.3.0 comment not on fork head after stream-live extraction
-LOST:src/media/stream.ts:849:fork livePreload wiring comment vs upstream inline preload block
+LOST:src/media/stream.ts:849:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
 RESURRECTED:src/media/stream.ts:849:fork spawnLiveVideoFfmpegProcess + logFailedTeardown vs upstream streamingProcessFactory inline
 LOST:src/media/stream.ts:853:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
 RESURRECTED:src/media/stream.ts:853:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
@@ -61,17 +74,17 @@ LOST:src/media/stream.ts:1078:deliberate fork delta vs upstream v8.3.0 (src/medi
 LOST:src/media/stream.ts:1081:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
 LOST:src/media/stream.ts:1116:upstream v8.3.0 comment not on fork head after stream-live extraction
 LOST:src/media/stream.ts:1117:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
-LOST:src/media/stream.ts:1132:upstream v8.3.0 Mp4FrameFeed in delegate; fork routes via stream-live-feed
+LOST:src/media/stream.ts:1132:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
 LOST:src/media/stream.ts:1305:upstream v8.3.0 comment not on fork head after stream-live extraction
 LOST:src/media/stream.ts:1306:upstream v8.3.0 comment not on fork head after stream-live extraction
 LOST:src/media/stream.ts:1307:upstream v8.3.0 comment not on fork head after stream-live extraction
 LOST:src/media/stream.ts:1308:upstream v8.3.0 comment not on fork head after stream-live extraction
-RESURRECTED:src/media/stream.ts:1673:upstream v8.3.0 comment not on fork head after stream-live extraction
-RESURRECTED:src/media/stream.ts:1674:upstream v8.3.0 comment not on fork head after stream-live extraction
 RESURRECTED:src/media/stream.ts:1675:upstream v8.3.0 comment not on fork head after stream-live extraction
 RESURRECTED:src/media/stream.ts:1676:upstream v8.3.0 comment not on fork head after stream-live extraction
-RESURRECTED:src/media/stream.ts:1682:upstream v8.3.0 comment not on fork head after stream-live extraction
-RESURRECTED:src/media/stream.ts:1683:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
+RESURRECTED:src/media/stream.ts:1677:upstream v8.3.0 comment not on fork head after stream-live extraction
+RESURRECTED:src/media/stream.ts:1678:upstream v8.3.0 comment not on fork head after stream-live extraction
+RESURRECTED:src/media/stream.ts:1684:upstream v8.3.0 comment not on fork head after stream-live extraction
+RESURRECTED:src/media/stream.ts:1685:fork tracks return-audio ffmpeg in ongoingSessions array vs upstream omission
 LOST:src/media/testing.helpers.ts:6:fork fanout/FO2 harness vs upstream v8.3.0 slim helpers
 RESURRECTED:src/media/testing.helpers.ts:6:fork fanout/FO2 harness vs upstream v8.3.0 slim helpers
 LOST:src/media/testing.helpers.ts:7:fork fanout/FO2 harness vs upstream v8.3.0 slim helpers
@@ -113,17 +126,4 @@ RESURRECTED:src/media/testing.helpers.ts:697:fork fanout/FO2 harness vs upstream
 RESURRECTED:src/media/testing.helpers.ts:698:fork fanout/FO2 harness vs upstream v8.3.0 slim helpers
 RESURRECTED:src/media/testing.helpers.ts:699:fork fanout/FO2 harness vs upstream v8.3.0 slim helpers
 LOST:src/media/timeshift.ts:74:upstream v8.3.0 comment not on fork head after stream-live extraction
-RESURRECTED:src/media/timeshift.ts:74:fork retained getLast comment wording vs upstream livePreload snapshot docs
-LOST:src/media/stream-start.test.ts:22:import split; LivestreamInit moved with fork import block
-LOST:src/media/stream-start.test.ts:28:fork test imports add makeBox and endPendingProcesses teardown helpers
-LOST:src/media/stream-start.test.ts:317:fork copy-first live view feature flags via hasFeature not spread options.features
-LOST:src/media/stream-start.test.ts:341:fork arrangeLiveView uses matching channel geometry for copy-default rows
-LOST:src/media/stream-start.test.ts:342:fork align channel bitrate with stub for encode-policy copy path
-LOST:src/media/stream-start.test.ts:343:fork delegate advertised resolutions match 1280x720 copy fixtures
-LOST:src/media/stream-start.test.ts:362:fork livePreload buffer double preserves ufp.channels from host
-LOST:src/media/stream-start.test.ts:365:fork view livestream double wired via harness options
-LOST:src/media/stream-start.test.ts:484:fork ffmpegExpectsVideoCopy vs upstream transcode toggle in expected argv
-LOST:src/media/stream-start.test.ts:978:fork two-way rows use startTwoWayView harness wrapper
-LOST:src/media/stream-start.test.ts:984:fork session signal asserted on video child abort not return-audio init
-LOST:src/media/stream-start.test.ts:1002:fork two-way signal assertions split session vs talkback connect
-LOST:src/media/stream-start.test.ts:1257:fork hardware-decode buffer row uses parseable init and matching geometry
+RESURRECTED:src/media/timeshift.ts:74:upstream v8.3.0 comment not on fork head after stream-live extraction
