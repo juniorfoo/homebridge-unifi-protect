@@ -7,9 +7,9 @@
 /* eslint-disable sort-imports -- production import block; order mirrors teardown coupling, not strict alphabetical sort. */
 import type { ControllerIdentity, StreamingDelegate, StreamingDelegateFactory } from "./stream-delegate.ts";
 import { AudioRecordingCodecType, AudioStreamingCodecType, AudioStreamingSamplerate, FfmpegOptions,
-  FfmpegStreamingProcess, H264Level, H264Profile, HKSV_FRAGMENT_LENGTH, HbpuAbortError, MediaContainerType, RtpDemuxer, SRTPCryptoSuites,
+  H264Level, H264Profile, HKSV_FRAGMENT_LENGTH, HbpuAbortError, MediaContainerType, Mp4FrameFeed, SRTPCryptoSuites,
   StreamRequestTypes, VideoCodecType, formatBps, formatErrorMessage, formatUrlHost, guardedDispatch, isHbpuAbortReason, mqttTopic } from "homebridge-plugin-utils";
-import type { BackpressureWriter, Clock, HomebridgePluginLogging, IpFamily, Nullable, PortReservation } from "homebridge-plugin-utils";
+import type { BackpressureWriter, Clock, HomebridgePluginLogging, IpFamily, Nullable, PortReservation, RtpDemuxerHandle, StreamingProcess } from "homebridge-plugin-utils";
 import type { CameraController, CameraControllerOptions, CameraStreamingDelegate, HAP, PrepareStreamCallback, PrepareStreamRequest, PrepareStreamResponse, Resolution,
   SnapshotRequest, SnapshotRequestCallback, StartStreamRequest, StreamRequestCallback, StreamingRequest } from "homebridge";
 import { HARDWARE_TRANSCODE_MARKER, PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_MS, PROTECT_LIVESTREAM_API_IDR_INTERVAL, PROTECT_LIVE_VIEW_START_DEADLINE_MS,
@@ -37,7 +37,7 @@ import { resolveLiveTranscodeBitrate, shouldRegisterOngoingSessionEntry, shouldR
 import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, establishmentFailureStopReason, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart,
   formatStreamSessionStop, recordStreamMediaActivityIfOwner } from "./stream-telemetry.ts";
 import type { LiveTsbFeedState } from "./stream-live-feed.ts";
-import { consumeLiveStreamSegments, createTsbSegmentWriterRail } from "./stream-live-feed.ts";
+import { consumeLiveStreamSegments, createLiveFrameFeed, createTsbSegmentWriterRail } from "./stream-live-feed.ts";
 import { appendLiveVideoEncodeToFfmpegArgs, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge, formatLiveEncodeDecisionLog,
   resolveCopyEscalationKeyframePrimingBuffer, resolveFmp4InitForLiveDeclaredCheck, resolveStartStreamEncodePlan, resolveStartStreamForceTranscodeDueToUserOption,
   resolveLiveStreamTranscodePipelineOptions, resolveStreamEgressBitrateBps, resolveTimeshiftBufferLiveChannel,
@@ -69,8 +69,8 @@ interface OngoingSessionEntry {
   // The per-session AbortController. Aborting it is the single teardown convergence point: it fans out to the demuxer, every FFmpeg, the backpressure writer, the
   // talkback session, and (via its signal) the livestream subscription.
   abortController: AbortController;
-  ffmpeg: FfmpegStreamingProcess[];
-  rtpDemuxer: Nullable<RtpDemuxer>;
+  ffmpeg: ProtectStreamingFfmpegProcess[];
+  rtpDemuxer: Nullable<RtpDemuxerHandle>;
   rtpPortReservations: PortReservation[];
   talkback?: TalkbackSession;
   toggleLight?: boolean;
@@ -98,7 +98,7 @@ interface SessionInfo {
   hasAudioSupport: boolean;
 
   // RTP demuxer needed for two-way audio.
-  rtpDemuxer: Nullable<RtpDemuxer>;
+  rtpDemuxer: Nullable<RtpDemuxerHandle>;
 
   // RTP port reservations.
   rtpPortReservations: PortReservation[];
@@ -120,11 +120,20 @@ interface SessionInfo {
   videoSSRC: number;
 }
 
-// Classify a talkback teardown as a clean stop rather than a fault: either the session's own AbortController fired (our own teardown), or the shipped typed caller-abort
-// surfaced. Three talkback-adjacent failure sites in startStream - the RTP-demuxer mediaReady wait, the open-call catch, and the in-flight send catch - consume this one
-// definition, so the clean-versus-fault decision lives in a single place. The signal.aborted arm is required, not the error type alone: a clean send-stop rejects with
-// ProtectNetworkError rather than ProtectAbortedError, because the shared signal's abort listener races ahead of send's own onAbort.
-function isCleanTalkbackStop(error: unknown, signal: AbortSignal): boolean {
+/**
+ * Classify a talkback teardown as a clean stop rather than a fault: either the session's own AbortController fired (our own teardown), or unifi-protect's typed
+ * abort surfaced. Each talkback-adjacent failure site in startStream - the RTP demuxer's mediaReady wait, the open-call catch, and the in-flight send catch -
+ * consumes this one definition, so the clean-versus-fault decision lives in a single place. unifi-protect raises ProtectAbortedError for a talkback session our
+ * signal stops, on its connect or its send, and for a controller connection disposed while a talkback is still connecting, which is a stop too and not a fault of
+ * the return audio. The signal.aborted arm is required, not the error type alone: the demuxer's mediaReady rejects with the session signal's own reason, which is
+ * HBPU's abort error rather than any unifi-protect error, so the error type alone would read our own teardown as a fault.
+ *
+ * @param error  - What the talkback's wait, open or send rejected with.
+ * @param signal - The session's own signal, aborted by the session's teardown.
+ *
+ * @returns `true` for a clean stop, which is noted quietly, and `false` for a fault, which is logged as an error.
+ */
+export function isCleanTalkbackStop(error: unknown, signal: AbortSignal): boolean {
 
   return signal.aborted || (error instanceof ProtectAbortedError);
 }
@@ -137,7 +146,7 @@ export interface ProtectStreamingDelegateTestOptions {
   recordDisposePreparedSession?: () => void;
   recordReturnAudioFfmpegArgs?: (args: string[]) => void;
   /** Replace the live RTP demuxer with a harness double (start-path integration tests only). */
-  substituteRtpDemuxer?: (init: { signal: AbortSignal }) => RtpDemuxer;
+  substituteRtpDemuxer?: (init: { signal: AbortSignal }) => RtpDemuxerHandle;
 }
 
 function isProtectStreamingDelegateTestOptions(value: Pick<AdvertisedStreams, "audioFormat" | "probe"> | ProtectStreamingDelegateTestOptions):
@@ -527,7 +536,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       this.log.info("Audio support disabled.%s", isAudioEnabled ? " A version of FFmpeg that is compiled with fdk_aac support is required to support audio." : "");
     }
 
-    let rtpDemuxer: Nullable<RtpDemuxer> = null;
+    let rtpDemuxer: Nullable<RtpDemuxerHandle> = null;
     let audioIncomingPort = -1;
     let audioIncomingRtcpPort: number;
     let audioIncomingRtpPort = -1;
@@ -547,7 +556,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         // Setup the RTP demuxer for two-way audio scenarios. The talkback URL is negotiated separately: camera.talkback() resolves it in startStream.
         rtpDemuxer = this.streamTestOptions?.substituteRtpDemuxer?.({ signal: abortController.signal }) ??
-          new RtpDemuxer({ clock: this.platform.clock, inputPort: audioIncomingPort, ipFamily: request.addressVersion, log: this.log,
+          this.platform.rtpDemuxerFactory.create({ clock: this.platform.clock, inputPort: audioIncomingPort, ipFamily: request.addressVersion, log: this.log,
             rtcpPort: audioIncomingRtcpPort, rtpPort: audioIncomingRtpPort, signal: abortController.signal });
       }
 
@@ -684,11 +693,19 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     owner.outputWatchdog.activity();
   }
 
-  // Segment consumption and fMP4 header priming live in stream-live-feed.ts (upstream comments restored there).
-  private async consumeStreamSegments(getFfmpeg: () => ProtectStreamingFfmpegProcess, feedState: LiveTsbFeedState, subscription: LivestreamSubscription,
-    getSegmentWriter: () => BackpressureWriter, tsBuffer: Nullable<Buffer>, onMediaSegment?: () => void): Promise<void> {
+  // Build the frame feed a buffer-backed live view writes FFmpeg's input through (stream-live-feed.ts owns the shared implementation).
+  private createFrameFeed(writer: BackpressureWriter): Mp4FrameFeed {
 
-    await consumeLiveStreamSegments(getFfmpeg, feedState, subscription, getSegmentWriter, tsBuffer, this.log, onMediaSegment);
+    return createLiveFrameFeed(writer, this.platform.clock, this.log);
+  }
+
+  /* Consume Segments from a livestream subscription and feed them to FFmpeg through the supplied frame feed (upstream-shaped entry for stream-consume.test). */
+  private async consumeStreamSegments(ffmpegStream: StreamingProcess | { stdin: import("node:stream").Writable }, subscription: LivestreamSubscription,
+    feed: Mp4FrameFeed, tsBuffer: Nullable<Buffer>): Promise<void> {
+
+    const feedState: LiveTsbFeedState = { allowTimeshiftPrefix: true, headerWritten: false, primeMediaFloor: null };
+
+    await consumeLiveStreamSegments(() => ffmpegStream as ProtectStreamingFfmpegProcess, feedState, subscription, feed, tsBuffer, this.log);
   }
 
   // FFmpeg argv through -map (before video encode / copy, metadata, and tee sinks).
@@ -828,7 +845,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     // session demuxes its packet flow externally, so arming the internal 5-second inbound-silence watchdog there would risk a false force-stop on every two-way live
     // view. The homebridge-plugin-utils process spawns the child synchronously on construction. The subclass implements failed-teardown logging (benign-API
     // suppression gated on useTsb, plus probesize self-tuning) through the logFailedTeardown hook.
-    return spawnLiveVideoFfmpegProcess(this.ffmpegOptions, {
+    return spawnLiveVideoFfmpegProcess(this.ffmpegOptions, this.platform.streamingProcessFactory, this.log, {
 
       args: ffmpegArgs,
       onProbesizeError: (): void => this.adjustProbeSize(),
@@ -1088,7 +1105,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       }
     }
 
-    const timeshiftPrefixBuffer = useTsb ? (this.timeshift?.buffer.getLast(PROTECT_LIVESTREAM_API_IDR_INTERVAL * 1000) ?? null) : null;
+    const timeshiftPrefixBuffer = useTsb ? (this.timeshift?.buffer.livePreload(this.probesize, { wholeWindow: isHighLatency }) ?? null) : null;
     const standingTimeshiftPrefix = useTsb && Boolean(timeshiftPrefixBuffer);
 
     // Find the best RTSP stream based on what we're looking for. TSB-backed sessions keep the buffer's channel for the livestream subscription and prefix; never
@@ -1189,12 +1206,21 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       }
     }
 
+    // Note what this live view starts from: the preload's size beside the probe size FFmpeg is given below, the floor the buffer holds a preload to unless the view
+    // takes its whole window.
+    if(timeshiftPrefixBuffer) {
+
+      this.log.debug("Live view preload.", { bytes: timeshiftPrefixBuffer.length, probesize: this.probesize });
+    }
+
     // If we have the timeshift buffer enabled, and we've selected the same quality for the livestream as our timeshift buffer, we use the timeshift buffer to
     // significantly accelerate our livestream startup. Using the timeshift buffer provides advantages:
     //
-    // - Since we typically have several seconds of video already queued up in the timeshift buffer, FFmpeg will get a significant speed up in startup performance.
-    //   FFmpeg takes time at the beginning of each session to analyze the input before allowing you to perform any action. By using the timeshift buffer, we're able to
-    //   give FFmpeg all that data right at the beginning, effectively reducing that startup time to the point of being imperceptible.
+    // - FFmpeg analyzes the start of each session's input, up to its probe size, before allowing you to perform any action, and the live fragments arrive a frame at a
+    //   time. The buffer's preload hands FFmpeg the init segment and the recent fragments from the latest keyframe that leaves it at least a probe size of video, all at
+    //   once, so the analysis finishes without waiting on the camera and FFmpeg has as little older video as possible to work through before it shows the present. A
+    //   high latency session takes the buffer's whole window instead, the init segment and the last PROTECT_LIVESTREAM_API_IDR_INTERVAL seconds of fragments wherever
+    //   their keyframes sit. The buffer's livePreload states what each start is for.
     //
     // - Since we are using an already existing connection to the Protect controller, we don't need to create another connection which incurs an additional delay, as well
     //   as a resource hit on the Protect controller.
@@ -1422,8 +1448,9 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
     if(useTsb) {
 
-      // Feed segments to FFmpeg with backpressure handling...if FFmpeg can't keep up, segments are queued and written when it's ready.
-      tsbWriterRail = createTsbSegmentWriterRail({ feedState: tsbFeedState, getStdin: () => activeFfmpeg.stdin,
+      // Write FFmpeg's input with backpressure handling...if FFmpeg can't keep up, writes are queued and go out when it's ready. The writer holds each fragment's frames
+      // on the platform's clock until they are due.
+      tsbWriterRail = createTsbSegmentWriterRail({ clock: this.platform.clock, feedState: tsbFeedState, getStdin: () => activeFfmpeg.stdin, log: this.log,
         onRotateSegmentWriter: this.streamTestOptions?.onRotateSegmentWriter, signal: sessionInfo.abortController.signal });
 
       // Subscribe to the pooled livestream via the camera interface. This call is synchronous and returns the subscription handle immediately; the underlying connection
@@ -1441,16 +1468,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       subscription = this.protectCamera.livestream(livestreamChannelProfile, { signal: sessionInfo.abortController.signal,
         urgency: () => PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_MS });
 
-      // Drive the segment iterator in the background.
-      void this.consumeStreamSegments(() => activeFfmpeg, tsbFeedState, subscription, (): BackpressureWriter => {
-
-        if(!tsbWriterRail) {
-
-          throw new Error("TSB segment writer is missing.");
-        }
-
-        return tsbWriterRail.getSegmentWriter();
-      }, tsBuffer, (): void => {
+      // Drive the segment iterator in the background, feeding FFmpeg through a frame feed over the writer.
+      void consumeLiveStreamSegments(() => activeFfmpeg, tsbFeedState, subscription, tsbWriterRail.getFrameFeed(), tsBuffer, this.log, (): void => {
 
         this.recordTsbMediaSegmentForOwner(request.sessionID, sessionDiagnostics);
       });
@@ -1564,13 +1583,15 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     // -f sdp                 Specify that our input will be an SDP file.
     // -codec:a               Decode AAC input using the specified decoder.
     // -i pipe:0              Read input from standard input.
-    // -codec:a               Encode to AAC. This format is set by Protect.
+    // -codec:a               Encode to AAC-LC, the format Protect sets, at the encoder's variable bitrate.
     // -flags +global_header  Sets the global header in the bitstream.
     // -ar                    Sets the audio rate to what Protect is expecting.
-    // -b:a                   Bitrate to use for this audio stream based on what HomeKit is providing us.
     // -ac                    Sets the channel layout of the audio stream based on what Protect is expecting.
     // -f adts                Transmit an ADTS stream.
     // pipe:1                 Output the ADTS stream to standard output.
+    //
+    // We leave the bitrate to the encoder rather than handing it HomeKit's maximum. That figure describes the low-delay audio HomeKit sends us...holding AAC-LC to it at
+    // the speaker's rate strips the upper frequencies from the voice, and it plays muffled at the camera.
     const ffmpegReturnAudioCmd = [
 
       "-hide_banner",
@@ -1580,10 +1601,9 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       "-codec:a", this.ffmpegOptions.audioDecoder,
       "-i", "pipe:0",
       "-map", "0:a:0",
-      ...this.ffmpegOptions.audioEncoder(),
+      ...this.ffmpegOptions.audioEncoder({ codec: AudioRecordingCodecType.AAC_LC }),
       "-flags", "+global_header",
       "-ar", this.protectCamera.ufp.talkbackSettings.samplingRate.toString(),
-      "-b:a", request.audio.max_bit_rate.toString() + "k",
       "-ac", this.protectCamera.ufp.talkbackSettings.channels.toString(),
       "-f", "adts"
     ];
@@ -1654,7 +1674,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     // on construction, so stdin is available immediately for the SDP.
     this.streamTestOptions?.recordReturnAudioFfmpegArgs?.(ffmpegReturnAudioCmd);
 
-    const ffmpegReturnAudio = new FfmpegStreamingProcess(this.ffmpegOptions, { args: ffmpegReturnAudioCmd, signal: sessionInfo.abortController.signal });
+    const ffmpegReturnAudio = this.platform.streamingProcessFactory.create(this.ffmpegOptions,
+      { args: ffmpegReturnAudioCmd, signal: sessionInfo.abortController.signal });
 
     // Setup housekeeping for the twoway FFmpeg session.
     this.ongoingSessions.get(request.sessionID)?.ffmpeg.push(ffmpegReturnAudio);

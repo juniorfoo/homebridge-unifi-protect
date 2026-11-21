@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import type { StartStreamRequest } from "homebridge";
 import type { FfmpegOptions, HomebridgePluginLogging } from "homebridge-plugin-utils";
 import { FfmpegOptions as FfmpegOptionsImpl, H264Level, H264Profile } from "homebridge-plugin-utils";
+import { TestStreamingProcessFactory } from "homebridge-plugin-utils/testing";
 /* eslint-disable camelcase -- HomeKit StartStreamRequest wire field names */
 import { makeTestCameraHost } from "./testing.helpers.ts";
 import type { TestCameraHost } from "./testing.helpers.ts";
@@ -104,7 +105,7 @@ describe("startStream spawn hook", () => {
       return new TestLiveStreamingFfmpegProcess("transcode-spawn") as unknown as ProtectStreamingFfmpegProcess;
     });
 
-    spawnLiveVideoFfmpegProcess(stubFfmpegOptions(), {
+    spawnLiveVideoFfmpegProcess(stubFfmpegOptions(), new TestStreamingProcessFactory(), stubLog, {
 
       args: args,
       onProbesizeError: () => undefined,
@@ -136,7 +137,8 @@ describe("startStream spawn hook", () => {
     const sessionInfo = { abortController: new AbortController(), addressVersion: "ipv4" as const, hasAudioSupport: false, videoReturnPort: 60000 };
     const spawned: TestLiveStreamingFfmpegProcess[] = [];
     let active: TestLiveStreamingFfmpegProcess = copy;
-    const rail = createTsbSegmentWriterRail({ getStdin: () => copy.stdin, signal: sessionInfo.abortController.signal });
+    const { clock } = makeTestCameraHost();
+    const rail = createTsbSegmentWriterRail({ clock: clock, getStdin: () => copy.stdin, log: stubLog, signal: sessionInfo.abortController.signal });
     const subscription = {
 
       disposeCalls: 0,
@@ -198,7 +200,7 @@ describe("startStream spawn hook", () => {
       prior: copy as unknown as ProtectStreamingFfmpegProcess,
       sessionDiagnosticsById: new Map([[ "sess-1", owner ]]),
       sessionId: "sess-1",
-      spawnLiveVideo: (ctx, ffmpegAbort) => spawnLiveVideoFfmpegProcess(stubFfmpegOptions(), {
+      spawnLiveVideo: (ctx, ffmpegAbort) => spawnLiveVideoFfmpegProcess(stubFfmpegOptions(), new TestStreamingProcessFactory(), stubLog, {
 
         args: [ ...ctx.ffmpegArgsThroughVideoMap, "-codec:v", "libx264" ],
         onProbesizeError: () => undefined,

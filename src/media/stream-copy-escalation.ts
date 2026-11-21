@@ -3,7 +3,8 @@
  * stream-copy-escalation.ts: In-session copy-to-transcode replacement (spawn-injectable for effect tests).
  */
 /* eslint-disable sort-imports -- type and value imports from the same package stay paired */
-import type { BackpressureWriter, FfmpegStreamingProcess, HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
+import type { BackpressureWriter, HomebridgePluginLogging, Nullable, StreamingProcess } from "homebridge-plugin-utils";
+import type { ProtectStreamingFfmpegProcess } from "./stream-ffmpeg-process.ts";
 import { HbpuAbortError } from "homebridge-plugin-utils";
 import type { StartStreamRequest } from "homebridge";
 import type { ChannelProfile } from "./resolution.ts";
@@ -38,7 +39,7 @@ export interface CopyEscalationSessionDiagnostics {
 export interface CopyEscalationOngoingEntry {
 
   abortController: AbortController;
-  ffmpeg: FfmpegStreamingProcess[];
+  ffmpeg: ProtectStreamingFfmpegProcess[];
 }
 
 export interface CopyEscalationPendingSession {
@@ -52,7 +53,7 @@ export interface CopyEscalationTsbResume {
   /** Init plus standing buffer from the last keyframe (when available) for decoder priming after copy exit. */
   keyframePrimingBuffer: Nullable<Buffer>;
   /** Spawn a new writer for the replacement stdin and abandon the prior writer (which may already be failed after copy exit). */
-  rotateSegmentWriter: (replacement: FfmpegStreamingProcess) => BackpressureWriter;
+  rotateSegmentWriter: (replacement: StreamingProcess) => BackpressureWriter;
   subscription: LivestreamSubscription;
 }
 
@@ -60,14 +61,14 @@ export interface CopyEscalationReplaceInput {
 
   hardwareTranscodes: boolean;
   log: HomebridgePluginLogging;
-  onRespawned: (process: FfmpegStreamingProcess) => void;
+  onRespawned: (process: ProtectStreamingFfmpegProcess) => void;
   ongoingSessions: Map<string, CopyEscalationOngoingEntry>;
   owner: CopyEscalationSessionDiagnostics;
   pendingSessions: Map<string, CopyEscalationPendingSession>;
-  prior: FfmpegStreamingProcess;
+  prior: ProtectStreamingFfmpegProcess;
   sessionDiagnosticsById: Map<string, CopyEscalationSessionDiagnostics>;
   sessionId: string;
-  spawnLiveVideo: (ctx: LiveVideoFfmpegSpawnContext, ffmpegAbort: AbortController) => FfmpegStreamingProcess;
+  spawnLiveVideo: (ctx: LiveVideoFfmpegSpawnContext, ffmpegAbort: AbortController) => ProtectStreamingFfmpegProcess;
   transcodeTargetBitrate: number;
   transcodeReason: string;
   tsbResume?: CopyEscalationTsbResume;
@@ -79,7 +80,7 @@ export interface CopyEscalationReplaceInput {
 }
 
 /** Replace a failed H.264 copy FFmpeg with a transcode instance without tearing down the HomeKit session. */
-export async function replaceFailedCopyWithTranscode(input: CopyEscalationReplaceInput): Promise<FfmpegStreamingProcess | null> {
+export async function replaceFailedCopyWithTranscode(input: CopyEscalationReplaceInput): Promise<ProtectStreamingFfmpegProcess | null> {
 
   const { owner, sessionId } = input;
 
@@ -151,7 +152,7 @@ export async function replaceFailedCopyWithTranscode(input: CopyEscalationReplac
 
   try {
 
-    input.prior.abort(new HbpuAbortError("replaced"));
+    input.prior.abort?.(new HbpuAbortError("replaced"));
 
     input.log.warn("H.264 copy path failed; escalating to transcode: %s.", input.transcodeReason);
 
@@ -194,7 +195,7 @@ export async function replaceFailedCopyWithTranscode(input: CopyEscalationReplac
 
     if(input.sessionDiagnosticsById.get(sessionId) !== owner) {
 
-      ffmpegStream.abort(new HbpuAbortError("replaced"));
+      ffmpegStream.abort?.(new HbpuAbortError("replaced"));
       unlinkSessionAbort();
 
       return null;
@@ -219,7 +220,7 @@ export async function replaceFailedCopyWithTranscode(input: CopyEscalationReplac
 
     if(input.sessionDiagnosticsById.get(sessionId) !== owner) {
 
-      ffmpegStream.abort(new HbpuAbortError("replaced"));
+      ffmpegStream.abort?.(new HbpuAbortError("replaced"));
       unlinkSessionAbort();
 
       return null;

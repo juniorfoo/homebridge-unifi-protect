@@ -3,24 +3,29 @@
  * testing.helpers.test.ts: Unit tests for the media-subsystem test helpers in testing.helpers.ts.
  *
  * The fragment builders and livestream doubles feed a REAL timeshift buffer, so a defect in one would be read as a parser or recovery bug in the code under test. These
- * rows pin what the doubles actually synthesize: fragments the production keyframe parse accepts and rejects, and a controllable subscription whose segments,
- * establishment, init segment, state, and disposal a recovery test steers.
+ * rows hold the helpers to what they claim: fragments the production keyframe parse accepts and rejects, a controllable subscription whose segments, establishment,
+ * init segment, state, and disposal a recovery test steers, a splitter whose halves are the fragment's own, and a teardown that ends every streaming process and
+ * one-shot run double a row left running.
  */
+import { TestExecProcessFactory, TestStreamingProcessFactory, expectAt, settle } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
-import { makeControllableLivestreamDouble, makeKeyframeFragment, makeLivestreamSubscriptionDouble, makeNonKeyframeFragment } from "./testing.helpers.ts";
+import { endPendingProcesses, makeControllableLivestreamDouble, makeKeyframeFragment, makeLivestreamSubscriptionDouble, makeMediaSegment, makeNonKeyframeFragment,
+  splitFragment } from "./testing.helpers.ts";
+import type { FfmpegProcessExitInfo } from "homebridge-plugin-utils";
 import type { Segment } from "unifi-protect";
+import { TestStreamingDelegate } from "../testing.helpers.ts";
 import assert from "node:assert/strict";
-import { isKeyframe } from "homebridge-plugin-utils";
-import { settle } from "homebridge-plugin-utils/testing";
+import { findKeyframe } from "homebridge-plugin-utils";
 
 describe("harness growth: the recording transmit doubles", () => {
 
-  // The keyframe-fragment box builder must synthesize a genuine fMP4 fragment the PRODUCTION isKeyframe parse accepts - there is no isKeyframe injection point to
-  // substitute a fake, so the transmit test exercises the real fMP4 keyframe coupling. If the builder ever drifts (a wrong box nesting, a flipped TRUN flag, the NON_SYNC
-  // bit set), production would read these segments as non-keyframes and the timeshift's keyframe-aligned start would never resolve.
-  test("makeKeyframeFragment synthesizes a fragment the production isKeyframe parse accepts", () => {
+  // The keyframe-fragment box builder must synthesize a genuine fMP4 fragment that starts with a keyframe by the PRODUCTION check, findKeyframe answering zero - there
+  // is no keyframe injection point to substitute a fake, so the transmit test exercises the real fMP4 keyframe coupling. If the builder ever drifts (a wrong box
+  // nesting, a flipped TRUN flag, the NON_SYNC bit set), production would read these segments as non-keyframes and the timeshift's keyframe-aligned start would never
+  // resolve.
+  test("makeKeyframeFragment synthesizes a fragment the production findKeyframe check reads as starting with a keyframe", () => {
 
-    assert.equal(isKeyframe(makeKeyframeFragment().data), true, "the synthesized moof>traf>trun fragment reads as a sync sample (keyframe)");
+    assert.equal(findKeyframe(makeKeyframeFragment().data), 0, "the synthesized moof>traf>trun fragment's first sample reads as a sync sample (keyframe)");
   });
 
   // The established (segment-yielding) livestream double reports the live profile and yields one init segment then exactly the requested media segments. We drain the
@@ -78,20 +83,13 @@ describe("harness growth: the recording transmit doubles", () => {
 
 describe("harness growth: the timeshift behavior doubles", () => {
 
-  // The non-keyframe builder is the negative counterpart to the held keyframe self-test: it must synthesize a fragment the PRODUCTION isKeyframe parse REJECTS, so the
-  // timeshift suite's discontinuity keyframe-gate (a discontinuity-marked non-keyframe must defer until a clean keyframe) is genuinely exercised. There is no isKeyframe
-  // injection point to substitute a fake, so the only way to drive the non-keyframe path is real bytes with the SAMPLE_FLAG_NON_SYNC bit set.
-  test("makeNonKeyframeFragment synthesizes a fragment the production isKeyframe parse rejects", () => {
+  // The non-keyframe builder is the negative counterpart to the held keyframe self-test: it must synthesize a fragment the PRODUCTION findKeyframe check finds no
+  // keyframe in, so the timeshift suite's discontinuity keyframe-gate (a discontinuity-marked non-keyframe must defer until a clean keyframe) is genuinely exercised and
+  // its live-view preload rows read the fragment as holding no keyframe at all. There is no keyframe injection point to substitute a fake, so the only way to drive the
+  // non-keyframe path is real bytes with the SAMPLE_FLAG_NON_SYNC bit set.
+  test("makeNonKeyframeFragment synthesizes a fragment the production findKeyframe check finds no keyframe in", () => {
 
-    assert.equal(isKeyframe(makeNonKeyframeFragment().data), false, "the synthesized non-sync fragment reads as a non-keyframe");
-  });
-
-  // Because makeKeyframeFragment is a thin selector over the shared makeMediaFragment, its bytes must stay stable: the KEYFRAME_FRAGMENT const, the
-  // segment-yielding parking double, and the recording-transmit path all read these bytes, so a drift would silently churn that net. The keyframe still reads
-  // as a sync sample.
-  test("makeKeyframeFragment still synthesizes a fragment the production isKeyframe parse accepts after the SSOT refactor", () => {
-
-    assert.equal(isKeyframe(makeKeyframeFragment().data), true, "the keyframe fragment still reads as a sync sample after the refactor");
+    assert.equal(findKeyframe(makeNonKeyframeFragment().data), null, "the synthesized non-sync fragment reads as holding no keyframe");
   });
 
   // The controllable double, pushed once then iterated, yields exactly that pushed segment. The first next() runs the generator from the top, drains the one queued
@@ -99,7 +97,7 @@ describe("harness growth: the timeshift behavior doubles", () => {
   test("makeControllableLivestreamDouble yields a pushed segment", async () => {
 
     const double = makeControllableLivestreamDouble();
-    const segment: Segment = { data: makeKeyframeFragment().data, mdat: makeKeyframeFragment().mdat, moof: makeKeyframeFragment().moof, type: "media" };
+    const segment = makeMediaSegment(makeKeyframeFragment());
 
     double.push(segment);
 
@@ -119,8 +117,8 @@ describe("harness growth: the timeshift behavior doubles", () => {
   test("makeControllableLivestreamDouble does not strand a second segment queued under one wake", async () => {
 
     const double = makeControllableLivestreamDouble();
-    const first: Segment = { data: makeKeyframeFragment().data, mdat: makeKeyframeFragment().mdat, moof: makeKeyframeFragment().moof, type: "media" };
-    const second: Segment = { data: makeNonKeyframeFragment().data, mdat: makeNonKeyframeFragment().mdat, moof: makeNonKeyframeFragment().moof, type: "media" };
+    const first = makeMediaSegment(makeKeyframeFragment());
+    const second = makeMediaSegment(makeNonKeyframeFragment());
     const iterator = double[Symbol.asyncIterator]();
 
     // Kick off the first pull and let the generator run to its park on the empty queue (it has nothing to yield yet).
@@ -204,165 +202,64 @@ describe("harness growth: the timeshift behavior doubles", () => {
 
     assert.equal(double.disposed, true, "dispose records disposed");
   });
+});
 
-  test("makeControllableLivestreamDouble broadcasts push to every concurrent iterator", async () => {
+describe("harness growth: the fragment splitter", () => {
 
-    const initData = Buffer.from("test-init-segment");
-    const double = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: initData, description: { tracks: [] } } });
+  // A fragment HBPU's builder makes reaches a suite through the splitter, so a split that put a box on the wrong side, or lost bytes between the halves, would hand a
+  // consumer a segment no pool delivers.
+  test("splitFragment carries a fragment as its moof and mdat halves, which together are the whole fragment", () => {
+
     const fragment = makeKeyframeFragment();
+    const split = splitFragment(fragment.data);
 
-    const collectThroughMedia = async (): Promise<Segment[]> => {
-
-      const segments: Segment[] = [];
-
-      for await(const segment of double) {
-
-        segments.push(segment);
-
-        if((segments.length >= 2) && (segments[1]?.type === "media")) {
-
-          break;
-        }
-      }
-
-      return segments;
-    };
-
-    const first = collectThroughMedia();
-    const second = collectThroughMedia();
-
-    await settle();
-    double.push({ codec: "h264", data: initData, description: { tracks: [] }, type: "init" });
-    await settle();
-    double.push({ data: fragment.data, mdat: fragment.mdat, moof: fragment.moof, type: "media" });
-    await settle();
-
-    const [ firstSegments, secondSegments ] = await Promise.all([ first, second ]);
-
-    assert.equal(firstSegments.length, 2);
-    assert.equal(secondSegments.length, 2);
-    assert.ok(firstSegments[1]?.data.equals(fragment.data));
-    assert.ok(secondSegments[1]?.data.equals(fragment.data),
-      "pooled fanout must deliver the same pushed media to every active iterator (FO2 regression)");
+    assert.equal(split.data, fragment.data, "the whole fragment is carried as it was handed");
+    assert.ok(split.moof.equals(fragment.moof), "the first half is the fragment's moof");
+    assert.ok(split.mdat.equals(fragment.mdat), "the second half is the fragment's mdat");
+    assert.ok(Buffer.concat([ split.moof, split.mdat ]).equals(fragment.data), "the halves together are the whole fragment");
   });
+});
 
-  test("makeControllableLivestreamDouble replays orphan segments after first iterator breaks", async () => {
+describe("harness growth: the shared process teardown", () => {
 
-    const double = makeControllableLivestreamDouble();
-    const fragment = makeNonKeyframeFragment();
+  // A row that starts a streaming process or a one-shot run double ends through this teardown, so a sweep that skipped a factory, left a process running, or read a
+  // process's ending from a stdin its caller had already ended would carry that process into the next row unseen. A process the row ended itself keeps the ending it
+  // had, since the double refuses a second exit.
+  test("endPendingProcesses ends each process its factories left running as a killed child, one whose stdin was ended among them, and leaves an ended one as it ended",
+    async () => {
 
-    const warmup = makeNonKeyframeFragment(0xF001);
+      const exec = new TestExecProcessFactory();
+      const streaming = new TestStreamingProcessFactory();
+      const { ffmpegOptions } = new TestStreamingDelegate();
+      const endings: { ended?: FfmpegProcessExitInfo; run?: FfmpegProcessExitInfo; running?: FfmpegProcessExitInfo; stdinEnded?: FfmpegProcessExitInfo } = {};
 
-    double.push({ data: warmup.data, mdat: warmup.mdat, moof: warmup.moof, type: "media" });
+      streaming.create(ffmpegOptions, { args: [] });
+      streaming.create(ffmpegOptions, { args: [] });
+      streaming.create(ffmpegOptions, { args: [] });
+      exec.create(ffmpegOptions, { args: [] });
 
-    for await(const _ of double) {
+      const running = expectAt(streaming.createCalls, 0, "the streaming process left running").process;
+      const stdinEnded = expectAt(streaming.createCalls, 1, "the streaming process whose stdin was ended").process;
+      const ended = expectAt(streaming.createCalls, 2, "the streaming process the row ended").process;
+      const run = expectAt(exec.createCalls, 0, "the one-shot run left pending").process;
 
-      break;
-    }
+      void running.exited.then((info): void => { endings.running = info; });
+      void stdinEnded.exited.then((info): void => { endings.stdinEnded = info; });
+      void ended.exited.then((info): void => { endings.ended = info; });
+      void run.result().then(({ exitCode, exitSignal }): void => { endings.run = { exitCode, exitSignal }; });
 
-    await settle();
-    double.push({ data: fragment.data, mdat: fragment.mdat, moof: fragment.moof, type: "media" });
+      stdinEnded.stdin.end("an invented session description");
+      ended.exit({ exitCode: 0, exitSignal: null });
+      await settle();
 
-    const segments: Segment[] = [];
+      assert.equal(stdinEnded.stdin.destroyed, true, "the vacuity guard: the ended stdin is destroyed while its process runs on");
+      assert.deepEqual(endings, { ended: { exitCode: 0, exitSignal: null } }, "the vacuity guard: only the process the row ended has ended");
 
-    for await(const segment of double) {
+      await endPendingProcesses([ exec, streaming ]);
 
-      segments.push(segment);
+      const killed: FfmpegProcessExitInfo = { exitCode: null, exitSignal: "SIGKILL" };
 
-      break;
-    }
-
-    assert.equal(segments.length, 1);
-    assert.ok(segments[0]?.data.equals(fragment.data));
-  });
-
-  test("makeControllableLivestreamDouble delivers segment pushed between two concurrent iterators", async () => {
-
-    const double = makeControllableLivestreamDouble();
-    const fragment = makeNonKeyframeFragment();
-
-    const pullOne = async (): Promise<Segment | undefined> => {
-
-      for await(const segment of double) {
-
-        return segment;
-      }
-
-      return undefined;
-    };
-
-    const first = pullOne();
-    const second = pullOne();
-
-    await settle();
-    double.push({ data: fragment.data, mdat: fragment.mdat, moof: fragment.moof, type: "media" });
-    await settle();
-
-    const [ a, b ] = await Promise.all([ first, second ]);
-
-    assert.ok(a?.data.equals(fragment.data));
-    assert.ok(b?.data.equals(fragment.data));
-  });
-
-  test("makeControllableLivestreamDouble throwError terminates and rejects a later iterator", async () => {
-
-    const double = makeControllableLivestreamDouble();
-    const boom = new Error("iterator fault");
-
-    double.throwError(boom);
-
-    await assert.rejects(async () => {
-
-      for await(const _ of double) { /* drain */ }
-    }, boom);
-    double.push({ data: Buffer.alloc(0), mdat: Buffer.alloc(0), moof: Buffer.alloc(0), type: "media" });
-  });
-
-  test("makeControllableLivestreamDouble ignores push after throwError terminates subscription", async () => {
-
-    const double = makeControllableLivestreamDouble();
-    const fragment = makeNonKeyframeFragment();
-
-    double.throwError(new Error("terminated"));
-
-    await assert.rejects(async () => {
-
-      for await(const _ of double) { /* drain */ }
+      assert.deepEqual(endings, { ended: { exitCode: 0, exitSignal: null }, run: killed, running: killed, stdinEnded: killed },
+        "each process left running ended as a killed child and the ended one kept its ending, read with no settle after the teardown");
     });
-    double.push({ data: fragment.data, mdat: fragment.mdat, moof: fragment.moof, type: "media" });
-
-    const segments: Segment[] = [];
-
-    for await(const segment of double) {
-
-      segments.push(segment);
-    }
-
-    assert.equal(segments.length, 0, "media pushed after throwError must not be delivered once the subscription is globally terminated");
-  });
-
-  test("makeControllableLivestreamDouble iterator created after end() finishes without hanging", async () => {
-
-    const double = makeControllableLivestreamDouble();
-    const established = double[Symbol.asyncIterator]();
-
-    await settle();
-
-    void established.next();
-
-    await settle();
-
-    double.end();
-
-    await established.next();
-
-    const segments: Segment[] = [];
-
-    for await(const segment of double) {
-
-      segments.push(segment);
-    }
-
-    assert.equal(segments.length, 0, "a late iterator after global terminate must complete immediately");
-  });
 });

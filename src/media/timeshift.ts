@@ -6,7 +6,7 @@ import type { Clock, HomebridgePluginLogging, Nullable } from "homebridge-plugin
 import type { LivestreamAudioFormat, LivestreamVideoFormat } from "./stream-delegate.ts";
 import { PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_MS, PROTECT_LIVESTREAM_API_IDR_INTERVAL, PROTECT_LIVESTREAM_IDLE_TOLERANCE_MS, PROTECT_SEGMENT_RESOLUTION }
   from "../settings.ts";
-import { formatErrorMessage, isKeyframe } from "homebridge-plugin-utils";
+import { findKeyframe, formatErrorMessage, startsWithKeyframe } from "homebridge-plugin-utils";
 import { livestreamAudioFormat, livestreamVideoFormat } from "./stream-delegate.ts";
 import type { ChannelProfile } from "./resolution.ts";
 import { EventEmitter } from "node:events";
@@ -58,13 +58,17 @@ interface KeyframeAlignedStart {
   startIndex: number;
 }
 
-// A single buffered timeshift entry. The fMP4 fragment and its keyframe classification are bound together in one struct so the segment and its keyframe flag are
-// stored, trimmed, and cleared as an indivisible unit. This makes a desync between a fragment and its keyframe flag structurally unrepresentable rather than a
-// rule a caller must uphold by convention.
+// A single buffered timeshift entry: the fMP4 fragment and the two things the buffer asks about its keyframe, each answered once at arrival. holdsKeyframe says the
+// fragment carries a keyframe somewhere, which is enough for a start where FFmpeg drops the samples ahead of the keyframe. startsWithKeyframe says a decoder handed
+// the fragment as its first shows a keyframe first, which the snapshot and the recording start need. The second is HBPU's own answer rather than a test of where
+// the keyframe sits, because a packager may put a sample that takes no time ahead of each keyframe, and such a fragment still starts with its keyframe. The fragment
+// and its answers are bound together in one struct so they are stored, trimmed, and cleared as an indivisible unit. This makes a desync between a fragment and its
+// answers structurally unrepresentable rather than a rule a caller must uphold by convention.
 interface TimeshiftSegment {
 
   data: Buffer;
-  isKeyframe: boolean;
+  holdsKeyframe: boolean;
+  startsWithKeyframe: boolean;
 }
 
 // The freshness-aware snapshot source answer. The snapshot path reads this single three-state value instead of composing getLast/getLastKeyframe of its own: "fresh"
@@ -353,15 +357,20 @@ export class ProtectTimeshiftBuffer extends EventEmitter<TimeshiftBufferEvents> 
       this.clearBuffer();
     }
 
-    // Parse the fMP4 TRUN sample flags to classify this fragment as a keyframe (sync sample) rather than relying on timing heuristics, giving a definitive answer on
-    // every segment.
-    const isKeyframeSegment = isKeyframe(segment.data);
+    // Parse the fMP4 TRUN sample flags to learn whether this fragment holds a keyframe (sync sample) rather than relying on timing heuristics, giving a definitive
+    // answer on every segment, which the buffer stores with the fragment for every later read. A fragment that holds one is then put to HBPU's startsWithKeyframe, which
+    // says whether a decoder handed the fragment as its first shows that keyframe first: it does when the keyframe is the first sample, and when every sample ahead of
+    // it takes no time, the layout a packager writes when it carries the parameter sets in a sample of their own. Only a fragment that holds a keyframe is asked the
+    // second question, so every other fragment costs the one parse. The decisions made here count a fragment only when it starts with a keyframe, because they serve
+    // the snapshot and the recording start, each of which hands FFmpeg the fragment as its first. A live view's preload alone reads holdsKeyframe.
+    const holdsKeyframe = findKeyframe(segment.data) !== null;
+    const entry: TimeshiftSegment = { data: segment.data, holdsKeyframe, startsWithKeyframe: holdsKeyframe && startsWithKeyframe(segment.data) };
 
     // Track when we last saw a keyframe for staleness detection, and disarm the discontinuity suppression on the recovery keyframe. This disarm runs BEFORE the
     // admission-suppression check below, so the recovery keyframe itself both ends suppression AND is admitted; gating admission before the disarm would skip the very
     // keyframe the buffer is waiting to resume on. The discontinuity-marked segment is NOT guaranteed to be a keyframe (the unifi-protect library stamps it on the first
     // media after a reconnect without a keyframe check), so this keyframe gate is required, not incidental - it is what defers the resume until a clean keyframe arrives.
-    if(isKeyframeSegment) {
+    if(entry.startsWithKeyframe) {
 
       this._lastKeyframeTime = this.clock.now();
 
@@ -385,9 +394,9 @@ export class ProtectTimeshiftBuffer extends EventEmitter<TimeshiftBufferEvents> 
       return;
     }
 
-    // Admit the segment: append it with its keyframe flag as one struct (so the fragment and its flag never drift), then trim the front to the configured window. A
-    // single shift removes a fragment and its keyframe flag together.
-    this._segments.push({ data: segment.data, isKeyframe: isKeyframeSegment });
+    // Admit the segment: append it with its keyframe answers as one struct (so the fragment and its answers never drift), then trim the front to the configured window.
+    // A single shift removes a fragment and its keyframe answers together.
+    this._segments.push(entry);
 
     if(this._segments.length > this.segmentCount) {
 
@@ -403,7 +412,7 @@ export class ProtectTimeshiftBuffer extends EventEmitter<TimeshiftBufferEvents> 
 
     // Announce the first keyframe this start admits. This runs last, after the admission, the trim and the forward above, so the buffer has finished with the segment
     // before any listener runs, and a listener reading snapshotSource() finds the keyframe in the buffer.
-    if(isKeyframeSegment && this._pendingFirstKeyframe) {
+    if(entry.startsWithKeyframe && this._pendingFirstKeyframe) {
 
       this._pendingFirstKeyframe = false;
       this.emit("firstKeyframe");
@@ -499,7 +508,7 @@ export class ProtectTimeshiftBuffer extends EventEmitter<TimeshiftBufferEvents> 
 
       const seg = this._segments[i];
 
-      if(seg?.isKeyframe) {
+      if(seg?.holdsKeyframe) {
 
         return Buffer.concat([ this.subscription.initSegment.data, ...this._segments.slice(i).map((entry) => entry.data) ]);
       }
@@ -508,34 +517,75 @@ export class ProtectTimeshiftBuffer extends EventEmitter<TimeshiftBufferEvents> 
     return null;
   }
 
-  // Return the last duration milliseconds of the buffer, with an initialization segment.
-  public getLast(duration: number): Nullable<Buffer> {
+  /* Return the preload a buffer-backed live view hands FFmpeg ahead of the live fragments: the init segment and every buffered fragment from the start chosen here, or
+   * null when the buffer holds no init segment or no fragments. FFmpeg works through the whole preload before it shows the present, so the start is the latest fragment
+   * holding a keyframe. The keyframe need not be the fragment's first sample...FFmpeg drops the samples ahead of it on its way in, which is why the start may sit
+   * mid-fragment. Starting exactly at the keyframe would mean cutting the fragment, and starting at an older fragment that opens on a keyframe would leave FFmpeg more
+   * to work through.
+   *
+   * FFmpeg also reads up to minimumBytes, the probe size the caller passes, before it shows anything, and the live fragments behind the preload arrive a frame at a
+   * time, so a preload under that size would leave FFmpeg waiting on the livestream's own pace for the rest and hold the first picture back. When the fragments from
+   * the latest keyframe to the buffer's end carry less than that, the start backs up a fragment at a time until they carry it. FFmpeg drops the frames ahead of the
+   * keyframe, as it drops the samples ahead of it inside its own fragment, and reads them toward its probe all the same, so the keyframe is still the first picture it
+   * shows. Starting at the keyframe before it instead would open on a picture a whole keyframe interval older. The floor counts the fragments' bytes alone, never the
+   * init segment's, which carries no frames.
+   *
+   * The start never backs up past the last PROTECT_LIVESTREAM_API_IDR_INTERVAL seconds of fragments, the whole buffer when it is shorter, and with no keyframe
+   * buffered that window is the preload. What FFmpeg works through then stays bounded to one keyframe interval of the livestream rather than the whole buffer.
+   *
+   * A caller that sets wholeWindow is handed that window whatever it holds: the init segment and every fragment from the window's start, wherever their keyframes
+   * sit, with minimumBytes playing no part. A view whose client is slow to show a first picture until it holds enough video is served better by more video up front
+   * than by a start close to the present, and the window hands it a keyframe interval of the livestream at once where a start at a fresh keyframe carries little.
+   */
+  public livePreload(minimumBytes: number, { wholeWindow = false }: { wholeWindow?: boolean } = {}): Nullable<Buffer> {
 
-    // No duration, return nothing.
-    if(!duration) {
+    if(!this.subscription?.initSegment || !this._segments.length) {
 
       return null;
     }
 
-    // Translate the requested duration into an integer segment count. Math.ceil ensures we cover at least `duration` milliseconds...a non-multiple request
-    // rounds up rather than under-delivering.
-    const segmentsRequested = Math.ceil(duration / this._segmentLength);
+    const windowStart = Math.max(this._segments.length - Math.ceil((PROTECT_LIVESTREAM_API_IDR_INTERVAL * 1000) / this._segmentLength), 0);
 
-    // If the request covers more than we have, just hand back the whole buffer.
-    if(segmentsRequested >= this._segments.length) {
+    if(wholeWindow) {
 
-      return this.buffer;
+      return Buffer.concat([ this.subscription.initSegment.data, ...this._segments.slice(windowStart).map((s) => s.data) ]);
     }
 
-    // If we don't have our fMP4 initialization segment, we're done. Otherwise, return the duration requested, starting from the end.
-    return (this.subscription?.initSegment && this._segments.length) ?
-      Buffer.concat([ this.subscription.initSegment.data, ...this._segments.slice(-segmentsRequested).map((s) => s.data) ]) : null;
+    let bytes = 0;
+    let keyframeSeen = false;
+    let start = windowStart;
+
+    // Walk backwards from the newest fragment, totaling the bytes from each fragment to the buffer's end. Once the walk has reached the latest fragment holding a
+    // keyframe, the start is the first fragment from which that total meets the floor, or the one at which backing up further would pass the window. A keyframe that
+    // sits older than the window is itself that fragment. The local read satisfies noUncheckedIndexedAccess...every index the walk visits is in range, so its guard
+    // never ends the walk early.
+    for(let i = this._segments.length - 1; i >= 0; i--) {
+
+      const segment = this._segments[i];
+
+      if(!segment) {
+
+        break;
+      }
+
+      bytes += segment.data.length;
+      keyframeSeen ||= segment.holdsKeyframe;
+
+      if(keyframeSeen && ((bytes >= minimumBytes) || (i <= windowStart))) {
+
+        start = i;
+
+        break;
+      }
+    }
+
+    return Buffer.concat([ this.subscription.initSegment.data, ...this._segments.slice(start).map((s) => s.data) ]);
   }
 
   // The freshness-aware snapshot source: the single owner of the "is the buffer fresh enough to snapshot from?" decision. Returns fresh content (the minimal init +
   // most-recent-keyframe buffer and the capture fps), a stale decline (a keyframe was seen but is older than 2x the IDR interval, so the livestream has likely stalled
-  // and a served image would be frozen), or an empty decline (no fresh keyframe buffered yet, no staleness to claim). This folds the retired getLastKeyframe's staleness
-  // compare and keyframe walk, so the snapshot path composes no fallback of its own and never serves the staleness-blind getLast window.
+  // and a served image would be frozen), or an empty decline (no fresh keyframe buffered yet, no staleness to claim). The staleness compare and the keyframe walk live
+  // here together, so the snapshot path composes no fallback of its own and never serves a buffer window that ignores staleness.
   public snapshotSource(): SnapshotSource {
 
     // No init segment, or no keyframe seen yet: nothing to give and no staleness to claim.
@@ -550,14 +600,14 @@ export class ProtectTimeshiftBuffer extends EventEmitter<TimeshiftBufferEvents> 
       return { kind: "stale" };
     }
 
-    // Walk backwards to the most recent keyframe fragment and hand back the minimal init + keyframe buffer plus the capture fps. Each entry binds its fragment to its
-    // keyframe flag in one struct, so a keyframe entry always carries its matching fragment; the local read satisfies noUncheckedIndexedAccess and degrades to the empty
-    // answer when no keyframe fragment remains (the only keyframe was trimmed out of the window even though the staleness clock still reads fresh).
+    // Walk backwards to the most recent fragment that starts with a keyframe and hand back the minimal init + keyframe buffer plus the capture fps. Each entry binds its
+    // fragment to its keyframe answers in one struct, so a keyframe entry always carries its matching fragment; the local read satisfies noUncheckedIndexedAccess and
+    // degrades to the empty answer when no such fragment remains (the only keyframe was trimmed out of the window even though the staleness clock still reads fresh).
     for(let i = this._segments.length - 1; i >= 0; i--) {
 
       const seg = this._segments[i];
 
-      if(seg?.isKeyframe) {
+      if(seg?.startsWithKeyframe) {
 
         return { data: Buffer.concat([ this.subscription.initSegment.data, seg.data ]), fps: this._channelProfile?.channel.fps ?? 30, kind: "fresh" };
       }
@@ -576,10 +626,11 @@ export class ProtectTimeshiftBuffer extends EventEmitter<TimeshiftBufferEvents> 
     // zero to handle the case where the buffer is shorter than the requested prebuffer duration.
     const prebufferStartIndex = Math.max(this._segments.length - Math.ceil(prebufferMs / this._segmentLength), 0);
 
-    // Walk backwards from the prebuffer start to find the nearest keyframe. Starting from a keyframe gives FFmpeg a clean decoder state from the very first frame.
+    // Walk backwards from the prebuffer start to find the nearest fragment that starts with a keyframe. Starting from a keyframe gives FFmpeg a clean decoder state from
+    // the very first frame.
     for(let i = prebufferStartIndex; i >= 0; i--) {
 
-      if(this._segments[i]?.isKeyframe) {
+      if(this._segments[i]?.startsWithKeyframe) {
 
         return { seekOffsetMs: (prebufferStartIndex - i) * this._segmentLength, startIndex: i };
       }

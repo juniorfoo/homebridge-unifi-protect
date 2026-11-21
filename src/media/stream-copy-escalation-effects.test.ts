@@ -10,14 +10,17 @@ import { BackpressureWriter, H264Level, H264Profile, HbpuAbortError, isHbpuAbort
 import type { CopyEscalationSessionDiagnostics, StreamLiveEncodeRebuild } from "./stream-copy-escalation.ts";
 import { replaceFailedCopyWithTranscode } from "./stream-copy-escalation.ts";
 import type { LiveTsbFeedState } from "./stream-live-feed.ts";
-import { consumeLiveStreamSegments, createTsbSegmentWriterRail } from "./stream-live-feed.ts";
+import { consumeLiveStreamSegments, createLiveFrameFeed, createTsbSegmentWriterRail } from "./stream-live-feed.ts";
 import type { LiveVideoFfmpegSpawnContext, LiveVideoFfmpegSpawner } from "./stream-live-ffmpeg-spawn.ts";
 import { setLiveVideoFfmpegSpawnerForTests } from "./stream-live-ffmpeg-spawn.ts";
 import type { ProtectStreamingFfmpegProcess } from "./stream-ffmpeg-process.ts";
 import type { ChannelProfile } from "./resolution.ts";
 import { shouldRemoveOngoingSessionEntry, shouldRemovePendingSessionEntry } from "./stream-transcode-policy.ts";
 import type { LivestreamSubscription } from "./livestream.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import { TestLiveStreamingFfmpegProcess } from "./test-live-ffmpeg-process.ts";
+
+const testClock = new TestClock(0);
 
 async function drainBackpressureWrites(): Promise<void> {
 
@@ -134,13 +137,16 @@ function makeWriterRail(sessionInfo: SessionInfoStub, getActive: () => TestLiveS
   init?: ConstructorParameters<typeof BackpressureWriter>[1]): {
 
   current: BackpressureWriter;
+  getFrameFeed: () => ReturnType<typeof createTsbSegmentWriterRail>["getFrameFeed"] extends () => infer R ? R : never;
   getSegmentWriter: () => BackpressureWriter;
   rotateSegmentWriter: (replacement: FfmpegStreamingProcess) => BackpressureWriter;
 } {
 
   const rail = createTsbSegmentWriterRail({
 
+    clock: testClock,
     getStdin: () => castProtect(getActive()).stdin,
+    log: stubLog,
     signal: sessionInfo.abortController.signal,
     writerInit: init
   });
@@ -151,6 +157,8 @@ function makeWriterRail(sessionInfo: SessionInfoStub, getActive: () => TestLiveS
 
       return rail.getSegmentWriter();
     },
+
+    getFrameFeed: () => rail.getFrameFeed(),
 
     getSegmentWriter: (): BackpressureWriter => rail.getSegmentWriter(),
 
@@ -230,7 +238,7 @@ describe("copy-to-transcode replacement effects", () => {
 
     assert.ok(active !== copy);
 
-    await consumeLiveStreamSegments(() => castProtect(active), feedState, subscription, writerRail.getSegmentWriter, null, stubLog);
+    await consumeLiveStreamSegments(() => castProtect(active), feedState, subscription, writerRail.getFrameFeed(), null, stubLog);
     await drainBackpressureWrites();
 
     assert.equal(copy.abortCalls.length, 1);
@@ -287,7 +295,7 @@ describe("copy-to-transcode replacement effects", () => {
     feedState.headerWritten = false;
     const replacement = spawnedAt(spawned, 0);
 
-    await consumeLiveStreamSegments(() => castProtect(replacement), feedState, subscription, writerRail.getSegmentWriter, null, stubLog);
+    await consumeLiveStreamSegments(() => castProtect(replacement), feedState, subscription, writerRail.getFrameFeed(), null, stubLog);
     await drainBackpressureWrites();
 
     assert.ok(replacement.stdinWrites[0]);
@@ -539,7 +547,7 @@ describe("copy-to-transcode replacement effects", () => {
     assert.ok(!replacement.stdinWrites.some((buf) => buf.compare(MEDIA_B) === 0));
 
     await consumeLiveStreamSegments(() => castProtect(replacement), feedState, makeSubscription([{ data: MEDIA_C, type: "media" }]),
-      () => liveWriter, null, stubLog);
+      createLiveFrameFeed(liveWriter, testClock, stubLog), null, stubLog);
     await drainBackpressureWrites();
 
     assert.ok(replacement.stdinWrites.some((buf) => buf.compare(MEDIA_C) === 0));

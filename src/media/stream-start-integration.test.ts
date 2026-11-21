@@ -499,7 +499,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx, makeStartRequest(), makePrepareRequest({ addressVersion: "ipv6", targetAddress: "fd00::1:2" }));
 
@@ -517,7 +517,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => prefix;
+    ctx.timeshift.buffer.livePreload = (): Buffer => prefix;
 
     await prepareAndStart(ctx);
 
@@ -537,8 +537,8 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     assert.ok(firstWrite);
     assert.equal(firstWrite.length, prefix.length,
-      "copy-path stdin assertion must compare the full getLast() prefix length, not a truncated prefix");
-    assert.ok(prefix.equals(firstWrite), "first FFmpeg stdin write must match the full timeshift getLast() prefix bytes");
+      "copy-path stdin assertion must compare the full livePreload() prefix length, not a truncated prefix");
+    assert.ok(prefix.equals(firstWrite), "first FFmpeg stdin write must match the full timeshift livePreload() prefix bytes");
   });
 
   test("packet_time 60 transcodes by default (high latency)", async () => {
@@ -548,7 +548,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.hasFeature = (option: string): boolean => option === "Video.Transcode.HighLatency";
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx, makeStartRequest({ packetTime: 60 }));
 
@@ -565,7 +565,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.hasFeature = (option: string): boolean => (option === "Video.Transcode.HighLatency") ? false : defaultHasFeature(option);
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx, makeStartRequest({ packetTime: 60 }));
 
@@ -579,7 +579,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.hasFeature = (option: string): boolean => option === "Video.Transcode";
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx);
 
@@ -594,7 +594,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = (): null => null;
+    ctx.timeshift.buffer.livePreload = (): null => null;
 
     await prepareAndStart(ctx);
 
@@ -612,7 +612,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.selectChannel = (): ChannelProfile => ({ ...stubChannel, channel: wrongChannel, name: "wrong" });
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx);
 
@@ -635,7 +635,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.timeshift.buffer.isStarted = false;
     ctx.timeshift.buffer.channelProfile = null;
     ctx.host.selectSubstrateChannel = (): ChannelProfile => buffer30;
-    ctx.timeshift.buffer.getLast = (): null => null;
+    ctx.timeshift.buffer.livePreload = (): null => null;
 
     const request = makeStartRequest();
 
@@ -665,7 +665,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.ufp = { ...ctx.host.ufp, channels: [live15] };
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = buffer30;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx);
 
@@ -685,7 +685,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.ufp = { ...ctx.host.ufp, channels: [liveChannel] };
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = bufferWide;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx);
 
@@ -704,7 +704,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.ufp = { ...ctx.host.ufp, channels: [liveChannel] };
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent-media") ]);
 
     await prepareAndStart(ctx);
 
@@ -720,7 +720,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.ufp = { ...ctx.host.ufp, videoCodec: "av1" };
     ctx.timeshift.buffer.isStarted = false;
     ctx.timeshift.buffer.channelProfile = null;
-    ctx.timeshift.buffer.getLast = (): null => null;
+    ctx.timeshift.buffer.livePreload = (): null => null;
     ctx.host.selectSubstrateChannel = (): null => null;
     ctx.host.selectChannel = (width: number, height: number, options: SelectChannelOptions): ChannelProfile => {
 
@@ -745,7 +745,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.ufp = { ...ctx.host.ufp, videoCodec: "av1" };
     ctx.timeshift.buffer.isStarted = false;
     ctx.timeshift.buffer.channelProfile = null;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("standing-prefix") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("standing-prefix") ]);
     ctx.host.selectSubstrateChannel = (): null => null;
     ctx.host.selectChannel = (): ChannelProfile => {
 
@@ -1764,7 +1764,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     ctx.timeshift.buffer.isStarted = false;
     ctx.timeshift.buffer.channelProfile = null;
-    ctx.timeshift.buffer.getLast = (): null => null;
+    ctx.timeshift.buffer.livePreload = (): null => null;
     ctx.host.selectSubstrateChannel = (): null => null;
     ctx.host.selectChannel = (width: number, height: number, options: SelectChannelOptions): ChannelProfile => {
 
@@ -1805,7 +1805,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.selectChannel = (): ChannelProfile => highFpsChannel;
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = highFpsChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
 
     const request = makeStartRequest();
 
@@ -1834,7 +1834,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     ctx.host.selectChannel = (): ChannelProfile => highFpsChannel;
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = highFpsChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
 
     const request = makeStartRequest();
 
@@ -1856,7 +1856,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
 
     await prepareAndStart(ctx, makeStartRequest(), makePrepareRequest({ addressVersion: "ipv6", targetAddress: "fd00::1:2" }));
 
@@ -1911,7 +1911,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
 
     await prepareAndStart(ctx);
 
@@ -1935,7 +1935,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
 
     const startRequest = makeStartRequest();
 
@@ -1974,7 +1974,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     ctx.timeshift.buffer.isStarted = true;
     ctx.timeshift.buffer.channelProfile = stubChannel;
-    ctx.timeshift.buffer.getLast = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
+    ctx.timeshift.buffer.livePreload = (): Buffer => Buffer.concat([ MATCHING_INIT, Buffer.from("recent") ]);
 
     const sessionId = SESSION_ID + "-ipv6-zone";
 
