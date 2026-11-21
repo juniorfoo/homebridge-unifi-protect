@@ -336,6 +336,8 @@ describe("stream-live-wiring", () => {
     const copy = copyImpl as unknown as ProtectStreamingFfmpegProcess;
     let escalated = 0;
 
+    let activeFfmpeg: ProtectStreamingFfmpegProcess = copy;
+
     const { wireFfmpegExitBridge } = createLiveFfmpegCopyExitBridge({
 
       copyEscalationInFlightRef: { current: false },
@@ -352,7 +354,9 @@ describe("stream-live-wiring", () => {
 
         return Promise.resolve(copy);
       },
-      onRespawned: () => undefined,
+      getActiveVideoFfmpeg: () => activeFfmpeg,
+      onRespawned: (respawned) => { activeFfmpeg = respawned; },
+      reconfigureAwaitingEncoderReady: () => false,
       sessionDiagnostics: { escalatedFromCopy: false, segmentsFed: 1, videoCopy: true },
       sessionStartedAt: Date.now(),
       sessionStillOwned: () => true,
@@ -365,8 +369,7 @@ describe("stream-live-wiring", () => {
 
     assert.equal(escalated, 1);
     assert.equal(createTsbResumeCalls, 1);
-    assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: false, eligibleForEscalation: true, exitIsReplaced: false,
-      sessionStillOwned: true }), "escalate");
+    assert.equal(resolveVideoCopyExitBridgeAction({ eligibleForEscalation: true, exitIsReplaced: false, sessionStillOwned: true }), "escalate");
   });
 });
 

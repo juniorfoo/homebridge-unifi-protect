@@ -83,12 +83,16 @@ LOST:src/media/stream.ts:1516:upstream v8.2.2 comment not on fork head: @param o
 LOST:src/media/stream.ts:1517:upstream v8.2.2 comment not on fork head: @param options.established - The livestream's establishment answer.
 LOST:src/media/stream.ts:1518:upstream waitForLivestreamEstablishment JSDoc + deadline helper vs fork inlined waiter
 LOST:src/media/stream.ts:1520:upstream v8.2.2 comment not on fork head: @returns Whether the livestream established before the deadline.
-RESURRECTED:src/media/stream.ts:998:fork reads HomeKit packet_time >= 60 locally instead of resolveTranscodeDecision output
-RESURRECTED:src/media/stream.ts:1005:fork seeds targetBitrate before channel/encode policy on copy-first path
-RESURRECTED:src/media/stream.ts:1109:fork transcode channel select caps at 3840x2160 when host hardware encoder available
-RESURRECTED:src/media/stream.ts:1110:fork transcode channel select caps at 3840x2160 when host hardware encoder available
-RESURRECTED:src/media/stream.ts:1201:fork line resurrected vs upstream removal: const useInterpolationFilter = useTsb && !isPackageCameraContext(this.protectCamera.a
-RESURRECTED:src/media/stream.ts:1202:fork line resurrected vs upstream removal: ((this.platform.codecSupport.hostSystem === "macOS.Apple") && (this.platform.codecSup
+RESURRECTED:src/media/stream.ts:1106:fork reads HomeKit packet_time >= 60 locally instead of resolveTranscodeDecision output
+RESURRECTED:src/media/stream.ts:1113:fork seeds targetBitrate before channel/encode policy on copy-first path
+RESURRECTED:src/media/stream.ts:1218:fork transcode channel select uses 2160 height when host hardware encoder available
+RESURRECTED:src/media/stream.ts:1217:fork transcode channel select uses 3840 width when host hardware encoder available
+RESURRECTED:src/media/stream.ts:1309:fork line resurrected vs upstream removal: const useInterpolationFilter = useTsb && !isPackageCameraContext(this.protectCamera.a
+RESURRECTED:src/media/stream.ts:1310:fork line resurrected vs upstream removal: Apple Silicon generation gate for useInterpolationFilter
+RESURRECTED:src/media/stream.ts:1912:Theme 3 RTSP reconfigure channel reselect hardware height cap 2160
+RESURRECTED:src/media/stream.ts:1911:Theme 3 RTSP reconfigure channel reselect hardware width cap 3840
+LOST:src/media/stream.ts:1341:Theme 3 replaces upstream v8.2.2 RECONFIGURE no-op comment with in-session replan
+LOST:src/media/stream.ts:1342:Theme 3 replaces upstream v8.2.2 RECONFIGURE no-op comment with in-session replan
 LOST:src/media/testing.helpers.ts:278:fork fragment builders for fanout/FO2 segment injection tests not in upstream harness
 LOST:src/media/testing.helpers.ts:281:fork fragment builders for fanout/FO2 segment injection tests not in upstream harness
 LOST:src/media/testing.helpers.ts:282:fork testing.helpers fanout livestream double vs upstream slim harness

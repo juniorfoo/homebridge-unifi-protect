@@ -351,8 +351,12 @@ export function shouldRegisterOngoingSessionEntry(mappedOngoing: { abortControll
   return (mappedOngoing === undefined) || (mappedOngoing.abortController === sessionInfo.abortController);
 }
 
-export function resolveVideoCopyExitBridgeAction(input: { copyEscalationInFlight: boolean; eligibleForEscalation: boolean; exitIsReplaced: boolean;
-  sessionStillOwned: boolean; }): VideoCopyExitBridgeAction {
+export function resolveVideoCopyExitBridgeAction(input: {
+
+  eligibleForEscalation: boolean;
+  exitIsReplaced: boolean;
+  sessionStillOwned: boolean;
+}): VideoCopyExitBridgeAction {
 
   if(input.exitIsReplaced) {
 
@@ -364,7 +368,7 @@ export function resolveVideoCopyExitBridgeAction(input: { copyEscalationInFlight
     return "ignore";
   }
 
-  if(input.eligibleForEscalation && !input.copyEscalationInFlight) {
+  if(input.eligibleForEscalation) {
 
     return "escalate";
   }

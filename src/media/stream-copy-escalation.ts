@@ -11,15 +11,23 @@ import type { LiveTsbFeedState } from "./stream-live-feed.ts";
 import { primeLiveFfmpegStdinAfterRespawn } from "./stream-live-feed.ts";
 import type { LiveVideoFfmpegSpawnContext } from "./stream-live-ffmpeg-spawn.ts";
 import type { LivestreamSubscription } from "./livestream.ts";
+import type { HomeKitStreamVideoSnapshot } from "./stream-reconfigure.ts";
+import type { LiveStreamSessionSource } from "./stream-transcode-policy.ts";
 import { matchesSessionVideoFfmpegForEscalation, shouldRegisterOngoingSessionEntry } from "./stream-transcode-policy.ts";
 
 export interface StreamLiveEncodeRebuild {
 
+  bufferForcedTranscodeReason: string | null;
   channelProfile: ChannelProfile;
   ffmpegArgsThroughVideoMap: string[];
+  fmp4InitSegmentData: Buffer | null;
+  forceTranscodeDueToUserOption: boolean;
+  homeKitVideo: HomeKitStreamVideoSnapshot;
   isHighLatency: boolean;
+  preferCopyChannel: boolean;
   request: StartStreamRequest;
   sessionInfo: { abortController: AbortController; addressVersion: "ipv4" | "ipv6"; hasAudioSupport: boolean; videoReturnPort: number };
+  sessionSource: LiveStreamSessionSource;
   transcodeTargetBitrate: number;
   useInterpolationFilter: boolean;
   useTsb: boolean;

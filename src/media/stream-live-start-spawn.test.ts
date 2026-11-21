@@ -170,11 +170,25 @@ describe("startStream spawn hook", () => {
       hardwareTranscode: false,
       liveEncodeRebuild: {
 
+        bufferForcedTranscodeReason: null,
         channelProfile: stubChannel,
         ffmpegArgsThroughVideoMap: [ "-f", "mp4", "-i", "pipe:0" ],
+        fmp4InitSegmentData: null,
+        forceTranscodeDueToUserOption: false,
+        homeKitVideo: {
+
+          fps: 15,
+          h264Level: H264Level.LEVEL3_1,
+          h264Profile: H264Profile.MAIN,
+          height: 720,
+          maxBitRateKbps: 800,
+          width: 1280
+        },
         isHighLatency: false,
+        preferCopyChannel: true,
         request: makeRequest(),
         sessionInfo: sessionInfo,
+        sessionSource: "buffer" as const,
         transcodeTargetBitrate: 800,
         useInterpolationFilter: false,
         useTsb: true

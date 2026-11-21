@@ -316,8 +316,7 @@ describe("establishment copy-failure wiring", () => {
       videoCopy: true });
 
     assert.equal(eligible, true);
-    assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: false, eligibleForEscalation: eligible, exitIsReplaced: false,
-      sessionStillOwned: true }), "escalate");
+    assert.equal(resolveVideoCopyExitBridgeAction({ eligibleForEscalation: eligible, exitIsReplaced: false, sessionStillOwned: true }), "escalate");
   });
 
   test("tears down a non-eligible early copy failure cleanly", () => {
@@ -326,16 +325,23 @@ describe("establishment copy-failure wiring", () => {
       videoCopy: true });
 
     assert.equal(eligible, false);
-    assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: false, eligibleForEscalation: eligible, exitIsReplaced: false,
-      sessionStillOwned: true }), "teardown");
+    assert.equal(resolveVideoCopyExitBridgeAction({ eligibleForEscalation: eligible, exitIsReplaced: false, sessionStillOwned: true }), "teardown");
   });
 
   test("ignores replaced exits and stale session ownership", () => {
 
-    assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: false, eligibleForEscalation: true, exitIsReplaced: true,
-      sessionStillOwned: true }), "ignore");
-    assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: false, eligibleForEscalation: true, exitIsReplaced: false,
-      sessionStillOwned: false }), "ignore");
+    assert.equal(resolveVideoCopyExitBridgeAction({ eligibleForEscalation: true, exitIsReplaced: true, sessionStillOwned: true }), "ignore");
+    assert.equal(resolveVideoCopyExitBridgeAction({ eligibleForEscalation: true, exitIsReplaced: false, sessionStillOwned: false }), "ignore");
+  });
+
+  test("escalates eligible copy failures during an in-flight HomeKit replan replacement", () => {
+
+    assert.equal(resolveVideoCopyExitBridgeAction({ eligibleForEscalation: true, exitIsReplaced: false, sessionStillOwned: true }), "escalate");
+  });
+
+  test("tears down ineligible exits during HomeKit replan (no copy-runtime failure pattern)", () => {
+
+    assert.equal(resolveVideoCopyExitBridgeAction({ eligibleForEscalation: false, exitIsReplaced: false, sessionStillOwned: true }), "teardown");
   });
 });
 
