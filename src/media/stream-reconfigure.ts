@@ -102,7 +102,8 @@ export function resolveReconfigureMaterialityBaseline(input: { applied: HomeKitS
     return rebuildSnapshot;
   }
 
-  if(input.applied && !homeKitStreamVideoSnapshotsEqual(input.applied, rebuildSnapshot)) {
+  if(input.applied && !homeKitStreamVideoSnapshotsEqual(input.applied, rebuildSnapshot) &&
+    ((input.applied.width !== rebuildSnapshot.width) || (input.applied.height !== rebuildSnapshot.height) || (input.applied.fps !== rebuildSnapshot.fps))) {
 
     return rebuildSnapshot;
   }
