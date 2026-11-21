@@ -1443,6 +1443,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         activeFfmpeg = respawned;
         sessionDiagnostics.activeVideoFfmpeg = { current: respawned };
       },
+      reconfigureInFlight: () => Boolean(sessionDiagnostics.reconfigureInFlight),
       sessionDiagnostics: sessionDiagnostics,
       sessionStartedAt: sessionStartedAt,
       sessionStillOwned: sessionStillOwned,

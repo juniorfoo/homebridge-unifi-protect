@@ -367,6 +367,7 @@ export interface LiveFfmpegCopyExitBridgeInput {
     tsbResume: CopyEscalationTsbResume | undefined) => Promise<ProtectStreamingFfmpegProcess | null>;
   onEscalationSettled?: () => void;
   onRespawned: (respawned: ProtectStreamingFfmpegProcess) => void;
+  reconfigureInFlight: () => boolean;
   sessionDiagnostics: { escalatedFromCopy: boolean; segmentsFed: number; videoCopy: boolean };
   sessionStartedAt: number;
   sessionStillOwned: () => boolean;
@@ -390,7 +391,7 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
     });
     const bridgeAction = resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: input.copyEscalationInFlightRef.current,
       eligibleForEscalation: eligibleForEscalation, exitIsReplaced: isHbpuAbortReason(exitedProcess.signal.reason, "replaced"),
-      sessionStillOwned: input.sessionStillOwned() });
+      reconfigureInFlight: input.reconfigureInFlight(), sessionStillOwned: input.sessionStillOwned() });
 
     if(bridgeAction === "ignore") {
 

@@ -352,7 +352,7 @@ export function shouldRegisterOngoingSessionEntry(mappedOngoing: { abortControll
 }
 
 export function resolveVideoCopyExitBridgeAction(input: { copyEscalationInFlight: boolean; eligibleForEscalation: boolean; exitIsReplaced: boolean;
-  sessionStillOwned: boolean; }): VideoCopyExitBridgeAction {
+  reconfigureInFlight: boolean; sessionStillOwned: boolean; }): VideoCopyExitBridgeAction {
 
   if(input.exitIsReplaced) {
 
@@ -364,12 +364,13 @@ export function resolveVideoCopyExitBridgeAction(input: { copyEscalationInFlight
     return "ignore";
   }
 
-  if(input.copyEscalationInFlight) {
+  // Copy escalation and HomeKit replan share copyEscalationInFlightRef; only copy-owned windows suppress bridge handling.
+  if(input.copyEscalationInFlight && !input.reconfigureInFlight) {
 
     return "ignore";
   }
 
-  if(input.eligibleForEscalation) {
+  if(input.eligibleForEscalation && !input.reconfigureInFlight) {
 
     return "escalate";
   }

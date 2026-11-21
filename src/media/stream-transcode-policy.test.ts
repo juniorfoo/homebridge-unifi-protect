@@ -317,7 +317,7 @@ describe("establishment copy-failure wiring", () => {
 
     assert.equal(eligible, true);
     assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: false, eligibleForEscalation: eligible, exitIsReplaced: false,
-      sessionStillOwned: true }), "escalate");
+      reconfigureInFlight: false, sessionStillOwned: true }), "escalate");
   });
 
   test("tears down a non-eligible early copy failure cleanly", () => {
@@ -327,21 +327,27 @@ describe("establishment copy-failure wiring", () => {
 
     assert.equal(eligible, false);
     assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: false, eligibleForEscalation: eligible, exitIsReplaced: false,
-      sessionStillOwned: true }), "teardown");
+      reconfigureInFlight: false, sessionStillOwned: true }), "teardown");
   });
 
   test("ignores replaced exits and stale session ownership", () => {
 
     assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: false, eligibleForEscalation: true, exitIsReplaced: true,
-      sessionStillOwned: true }), "ignore");
+      reconfigureInFlight: false, sessionStillOwned: true }), "ignore");
     assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: false, eligibleForEscalation: true, exitIsReplaced: false,
-      sessionStillOwned: false }), "ignore");
+      reconfigureInFlight: false, sessionStillOwned: false }), "ignore");
   });
 
   test("ignores eligible copy failures while a live replacement is already in flight", () => {
 
     assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: true, eligibleForEscalation: true, exitIsReplaced: false,
-      sessionStillOwned: true }), "ignore");
+      reconfigureInFlight: false, sessionStillOwned: true }), "ignore");
+  });
+
+  test("teardown when HomeKit replan holds the shared mutex and the replacement exits unexpectedly", () => {
+
+    assert.equal(resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: true, eligibleForEscalation: true, exitIsReplaced: false,
+      reconfigureInFlight: true, sessionStillOwned: true }), "teardown");
   });
 });
 
