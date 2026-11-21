@@ -27,12 +27,50 @@ describe("stream-reconfigure", () => {
       { material: false, reason: "no-running-encode-plan" });
   });
 
-  test("restarts on resolution, fps, profile, level, encode-mode, and transcode bitrate threshold", () => {
+  test("treats width, height, fps, h264 level, and profile changes as material", () => {
 
     const previous = homeKitStreamVideoSnapshotFromRequest(baseVideo);
-    const fpsChange = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, fps: 15 });
 
-    assert.equal(isMaterialLiveStreamReconfigure({ next: fpsChange, nextEncode: "copy", previous: previous, previousEncode: "copy" }).material, true);
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, width: 1920 }),
+      nextEncode: "copy",
+      previous: previous,
+      previousEncode: "copy"
+    }).material, true);
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, height: 1080 }),
+      nextEncode: "copy",
+      previous: previous,
+      previousEncode: "copy"
+    }).material, true);
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, fps: 15 }),
+      nextEncode: "copy",
+      previous: previous,
+      previousEncode: "copy"
+    }).material, true);
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, level: H264Level.LEVEL4_0 }),
+      nextEncode: "copy",
+      previous: previous,
+      previousEncode: "copy"
+    }).material, true);
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, profile: H264Profile.HIGH }),
+      nextEncode: "copy",
+      previous: previous,
+      previousEncode: "copy"
+    }).material, true);
+  });
+
+  test("restarts on encode-mode and transcode bitrate threshold", () => {
+
+    const previous = homeKitStreamVideoSnapshotFromRequest(baseVideo);
 
     const immaterialBitrate = homeKitStreamVideoSnapshotFromRequest({
 
@@ -100,6 +138,28 @@ describe("stream-reconfigure", () => {
       previous: appliedTranscode,
       previousEncode: "transcode"
     }).material, true);
+  });
+
+  test("accumulates successive immaterial transcode bitrate bumps against the applied baseline", () => {
+
+    const applied = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, max_bit_rate: 800 });
+    const plusSixty = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, max_bit_rate: 860 });
+    const plusSixtyAgain = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, max_bit_rate: 920 });
+
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: plusSixty,
+      nextEncode: "transcode",
+      previous: applied,
+      previousEncode: "transcode"
+    }).material, false);
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: plusSixtyAgain,
+      nextEncode: "transcode",
+      previous: applied,
+      previousEncode: "transcode"
+    }).material, true, "two successive +60 kbps bumps must cross the 100 kbps transcode threshold from applied");
   });
 
   test("resolveReconfigureMaterialityBaseline uses negotiated rebuild target before applied catches up", () => {

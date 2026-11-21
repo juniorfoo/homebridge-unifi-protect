@@ -10,6 +10,30 @@ import { TestLiveStreamingFfmpegProcess } from "./test-live-ffmpeg-process.ts";
 
 describe("TestLiveStreamingFfmpegProcess", () => {
 
+  test("deferReady rejects ready after abort in real exit order", async () => {
+
+    const proc = new TestLiveStreamingFfmpegProcess("defer", { deferReady: true });
+
+    const exitedSettled = proc.exited.then(() => "exited" as const);
+    const readyRejected = proc.ready.then(() => "ready" as const, () => "rejected" as const);
+
+    proc.crash();
+
+    assert.equal(await exitedSettled, "exited");
+    assert.equal(await readyRejected, "rejected");
+  });
+
+  test("rejectReadyBeforeExit models startup-watchdog teardown before exited settles", async () => {
+
+    const proc = new TestLiveStreamingFfmpegProcess("defer-timeout", { deferReady: true });
+
+    const readyRejected = proc.ready.then(() => "ready" as const, () => "rejected" as const);
+
+    proc.rejectReadyBeforeExit();
+    assert.equal(await readyRejected, "rejected");
+    await proc.exited;
+  });
+
   test("exited settles when the parent signal is already aborted at construction", async () => {
 
     const parent = new AbortController();
