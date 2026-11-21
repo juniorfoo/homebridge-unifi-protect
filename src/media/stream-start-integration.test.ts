@@ -2557,6 +2557,44 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     await stopActiveSession(wrapped, wrapped.startRequest.sessionID);
   });
 
+  test("copy replan replacement rejectReadyBeforeExit without escalation tears down once", async () => {
+
+    const ctx = createHarness();
+
+    enableReplaTimeshiftBufferDefaults(ctx);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      const deferReady = ctx.spawnedProcesses.length >= 1;
+      const proc = new TestLiveStreamingFfmpegProcess("live-" + String(ctx.spawnedProcesses.length), { deferReady: deferReady, signal: init.signal });
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(proc);
+
+      return proc as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+
+    await prepareAndStart(ctx, startRequest);
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({
+
+        ...startRequest,
+        type: StreamRequestTypes.RECONFIGURE,
+        video: { ...startRequest.video, level: H264Level.LEVEL4_0 } as typeof startRequest.video
+      }, (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    await waitFor(() => ctx.spawnedProcesses.length === 2, "copy replan replacement");
+    ctx.spawnedProcesses[1]?.rejectReadyBeforeExit();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(ctx.forceStopSessionIds.length, 1);
+    assert.equal(ongoingSessionRegistered(ctx, startRequest.sessionID), false);
+  });
+
   test("copy replan replacement failure with failed transcode escalation tears down once", async () => {
 
     const ctx = createHarness();

@@ -1892,10 +1892,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       return;
     }
 
-    const baselineEncodePlan = this.resolveEncodePlanAfterHomeKitReconfigure({ ...pendingRebuild.request, video: pending.video }, pendingRebuild);
-    const previousEncode = baselineEncodePlan ?
-      baselineEncodePlan.encodeDecision.mode :
-      (owner.videoCopy ? "copy" : "transcode");
+    const previousEncode = owner.videoCopy ? "copy" : "transcode";
     const decision = isMaterialLiveStreamReconfigure({
 
       next: nextSnapshot,

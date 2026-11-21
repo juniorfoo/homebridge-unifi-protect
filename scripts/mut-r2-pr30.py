@@ -54,6 +54,7 @@ for name,f,needle,rep in M:
   p=os.path.join(R,f); s=open(p).read(); n=s.count(needle)
   if n!=1:
     print(f'{name} | NOT-APPLIED | needle count {n}',flush=True); not_applied=True; continue
+  saved=s
   open(p,'w').write(s.replace(needle,rep))
   try:
     r=subprocess.run(['timeout','400','node','--test','--test-timeout=15000','src/**/*.test.ts'],cwd=R,env=env,capture_output=True,text=True)
@@ -64,7 +65,7 @@ for name,f,needle,rep in M:
     if r.returncode==124: st='HANG(timeout)'
     print(f'{name} | {st} | rc={r.returncode} | {summ} | {fails[:4]}',flush=True)
   finally:
-    subprocess.run(['git','checkout','-q',f],cwd=R)
+    open(p,'w').write(saved)
 if not_applied:
   sys.exit(2)
 sys.exit(0)
