@@ -137,3 +137,4 @@ LOST:src/media/testing.helpers.ts:554:fork testing.helpers fanout livestream dou
 LOST:src/media/testing.helpers.ts:556:fork testing.helpers fanout livestream double vs upstream slim harness
 LOST:src/media/testing.helpers.ts:561:fork testing.helpers fanout livestream double vs upstream slim harness
 LOST:src/media/testing.helpers.ts:562:fork testing.helpers fanout livestream double vs upstream slim harness
+LOST:src/platform.ts:284:issue #2 P6.1 FFmpeg path validation replaces inline probe with configuredFfmpeg after concrete-path checks and resolved-path log
