@@ -4,7 +4,7 @@
  */
 /* eslint-disable sort-imports -- value/type import grouping follows dependency order */
 import type { StartStreamRequest } from "homebridge";
-import type { BackpressureWriter, FfmpegOptions, FfmpegStreamingProcess, Nullable } from "homebridge-plugin-utils";
+import type { BackpressureWriter, FfmpegOptions, Nullable, StreamingProcess } from "homebridge-plugin-utils";
 import { HOMEKIT_IDR_INTERVAL, isHbpuAbortReason } from "homebridge-plugin-utils";
 import type { ProtectCameraHost } from "./camera-host.ts";
 import type { CopyEscalationTsbResume } from "./stream-copy-escalation.ts";
@@ -19,6 +19,16 @@ import { classifyVideoCopyFailure, decideLiveVideoEncode, normalizeLiveSourceFps
 import type { ProtectStreamingFfmpegProcess } from "./stream-ffmpeg-process.ts";
 
 export { rotateBackpressureWriterForCopyEscalation };
+
+function streamingProcessStderrLog(process: ProtectStreamingFfmpegProcess): readonly string[] {
+
+  if(("stderrLog" in process) && Array.isArray((process as { stderrLog?: readonly string[] }).stderrLog)) {
+
+    return (process as { stderrLog: readonly string[] }).stderrLog;
+  }
+
+  return [];
+}
 
 export function resolveStartStreamForceTranscodeDueToUserOption(protectCamera: ProtectCameraHost, isHighLatency: boolean): boolean {
 
@@ -175,7 +185,7 @@ export function createCopyEscalationTsbResume(input: { feedState: LiveTsbFeedSta
 
     feedState: input.feedState,
     keyframePrimingBuffer: input.keyframePrimingBuffer ?? null,
-    rotateSegmentWriter: (replacement: FfmpegStreamingProcess): BackpressureWriter => input.rail.rotateSegmentWriter(replacement),
+    rotateSegmentWriter: (replacement: StreamingProcess): BackpressureWriter => input.rail.rotateSegmentWriter(replacement),
     subscription: input.subscription
   };
 }
@@ -385,7 +395,7 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
     const eligibleForEscalation = classifyLiveCopyEscalationEligible({
 
       elapsedMs: elapsedMs, escalatedFromCopy: input.sessionDiagnostics.escalatedFromCopy, segmentsFed: input.sessionDiagnostics.segmentsFed,
-      stderrLog: exitedProcess.stderrLog, useTimeshiftBuffer: input.useTsb, videoCopy: input.sessionDiagnostics.videoCopy
+      stderrLog: streamingProcessStderrLog(exitedProcess), useTimeshiftBuffer: input.useTsb, videoCopy: input.sessionDiagnostics.videoCopy
     });
     const bridgeAction = resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: input.copyEscalationInFlightRef.current,
       eligibleForEscalation: eligibleForEscalation, exitIsReplaced: isHbpuAbortReason(exitedProcess.signal.reason, "replaced"),
@@ -430,7 +440,7 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
 
   const wireFfmpegExitBridge = (process: ProtectStreamingFfmpegProcess): void => {
 
-    void process.exited.then((exitInfo) => bridgeFfmpegExit(process, exitInfo.exitCode), () => bridgeFfmpegExit(process));
+    void process.exited.then((exitInfo: { exitCode: number | null }) => bridgeFfmpegExit(process, exitInfo.exitCode), () => bridgeFfmpegExit(process));
   };
 
   return { bridgeFfmpegExit: bridgeFfmpegExit, wireFfmpegExitBridge: wireFfmpegExitBridge };

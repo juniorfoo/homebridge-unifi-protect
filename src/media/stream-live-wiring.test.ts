@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { BackpressureWriter, FfmpegOptions } from "homebridge-plugin-utils";
 import { FfmpegOptions as FfmpegOptionsImpl, H264Level, H264Profile, HOMEKIT_IDR_INTERVAL } from "homebridge-plugin-utils";
+import type { HomebridgePluginLogging } from "homebridge-plugin-utils";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import type { StartStreamRequest } from "homebridge";
 import { makeTestCameraHost } from "./testing.helpers.ts";
 import type { TestCameraHost } from "./testing.helpers.ts";
@@ -22,6 +24,14 @@ import type { ChannelProfile } from "./resolution.ts";
 import { parseH264AvcCFromFmp4Init } from "./h264-fmp4-avcc.ts";
 import { TEST_H264_MAIN_PPS, testH264SpsForProfileLevel } from "./h264-test-bytes.ts";
 import { makeChannel } from "../camera.fixtures.ts";
+
+const stubLog: HomebridgePluginLogging = {
+
+  debug: () => undefined,
+  error: () => undefined,
+  info: () => undefined,
+  warn: () => undefined
+};
 
 const stubChannel: ChannelProfile = {
 
@@ -222,7 +232,7 @@ describe("stream-live-wiring", () => {
     const replacement = new TestLiveStreamingFfmpegProcess("replacement");
     const signal = new AbortController().signal;
     const rotated: { poisoned?: BackpressureWriter; replacement?: BackpressureWriter } = {};
-    const railWithHook = createTsbSegmentWriterRail({ getStdin: () => copy.stdin, onRotateSegmentWriter: (event) => {
+    const railWithHook = createTsbSegmentWriterRail({ clock: new TestClock(0), getStdin: () => copy.stdin, log: stubLog, onRotateSegmentWriter: (event) => {
 
       rotated.poisoned = event.poisoned;
       rotated.replacement = event.replacement;
