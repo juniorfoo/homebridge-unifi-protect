@@ -2359,11 +2359,6 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
       const replacement = new TestLiveStreamingFfmpegProcess("escalation-" + String(spawnIndex), { deferReady: true, signal: init.signal });
 
-      if(spawnIndex === 2) {
-
-        escalationSlow = replacement;
-      }
-
       ctx.spawnedArgs.push(init.args ?? []);
       ctx.spawnedProcesses.push(replacement);
 
@@ -2378,7 +2373,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     await startPromise;
     await waitFor(() => ctx.spawnedProcesses.length >= 2, "copy escalation spawn");
 
-    const escalationReplacement = escalationSlow ?? ctx.spawnedProcesses[1];
+    const escalationReplacement = ctx.spawnedProcesses[1];
 
     assert.ok(escalationReplacement instanceof TestLiveStreamingFfmpegProcess, "escalation replacement must exist");
     escalationReplacement.crash();
