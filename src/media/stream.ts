@@ -1378,13 +1378,13 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         return;
       }
 
-      void subscription?.[Symbol.asyncDispose]();
-      tsbWriterRail?.getSegmentWriter().abort();
-
       if(sessionDiagnostics.activeVideoFfmpeg?.current !== exitedProcess) {
 
         return;
       }
+
+      void subscription?.[Symbol.asyncDispose]();
+      tsbWriterRail?.getSegmentWriter().abort();
 
       if(!isHbpuAbortReason(exitedProcess.signal.reason, "shutdown")) {
 
@@ -1431,6 +1431,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       endFfmpegBridge: endFfmpegBridge,
       escalateCopyFailure: (exitedProcess, onRespawned, tsbResume) => this.escalateCopyFailureToTranscode(request.sessionID, sessionDiagnostics, exitedProcess,
         "H.264 copy path failed at runtime", onRespawned, tsbResume),
+      getActiveVideoFfmpeg: () => sessionDiagnostics.activeVideoFfmpeg?.current,
       onEscalationSettled: () => {
 
         if(sessionStillOwned()) {
@@ -1443,7 +1444,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         activeFfmpeg = respawned;
         sessionDiagnostics.activeVideoFfmpeg = { current: respawned };
       },
-      reconfigureInFlight: () => Boolean(sessionDiagnostics.reconfigureInFlight),
       sessionDiagnostics: sessionDiagnostics,
       sessionStartedAt: sessionStartedAt,
       sessionStillOwned: sessionStillOwned,
@@ -2030,7 +2030,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     } catch(error) {
 
       unlinkSessionAbort();
-      this.log.error("Unable to replan the live view stream after HomeKit RECONFIGURE: %s.", formatErrorMessage(error));
+
+      if(!sessionSignal.aborted && !(error instanceof HbpuAbortError)) {
+
+        this.log.error("Unable to replan the live view stream after HomeKit RECONFIGURE: %s.", formatErrorMessage(error));
+      }
     } finally {
 
       handles.copyEscalationInFlightRef.current = false;
@@ -2158,7 +2162,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
                   void this.replanLiveStreamForHomeKitReconfigure(request.sessionID, updatedRequest, encodePlan, decision.reason);
                 }
-              } else if(!owner.reconfigureInFlight) {
+              } else {
 
                 rebuild.request = updatedRequest;
               }

@@ -37,7 +37,9 @@ export class TestLiveStreamingFfmpegProcess {
   readonly exited: Promise<FfmpegProcessExitInfo>;
   #exitedSettled = false;
   #rejectExitedRejector?: (reason: unknown) => void;
+  #rejectReady?: (reason: unknown) => void;
   #resolveReady?: () => void;
+  readonly #deferReady: boolean;
 
   constructor(id: string, init?: TestLiveStreamingFfmpegProcessInit) {
 
@@ -46,6 +48,7 @@ export class TestLiveStreamingFfmpegProcess {
     this.returnPort = init?.returnPort;
     this.blockStdin = init?.blockStdin ?? false;
     this.pipeBreakOnTeardown = init?.pipeBreakOnTeardown ?? this.blockStdin;
+    this.#deferReady = Boolean(init?.deferReady);
 
     this.stdin = new Writable({
 
@@ -114,11 +117,12 @@ export class TestLiveStreamingFfmpegProcess {
       }
     }
 
-    if(init?.deferReady) {
+    if(this.#deferReady) {
 
-      this.ready = new Promise<void>((resolve) => {
+      this.ready = new Promise<void>((resolve, reject) => {
 
         this.#resolveReady = resolve;
+        this.#rejectReady = reject;
       });
     } else {
 
@@ -128,8 +132,43 @@ export class TestLiveStreamingFfmpegProcess {
 
   releaseReady(): void {
 
-    this.#resolveReady?.();
+    const resolve = this.#resolveReady;
+
     this.#resolveReady = undefined;
+    this.#rejectReady = undefined;
+    resolve?.();
+  }
+
+  /** Real FfmpegProcess order after a runtime failure: exited settles, then ready rejects with the abort reason. */
+  crash(reason?: unknown): void {
+
+    this.abort(reason ?? new HbpuAbortError("failed"));
+  }
+
+  /** Startup-watchdog path: ready rejects before exited settles (unless exited already settled). */
+  rejectReadyBeforeExit(reason?: unknown): void {
+
+    const reject = this.#rejectReady;
+    const abortReason = reason ?? new HbpuAbortError("timeout");
+
+    this.#resolveReady = undefined;
+    this.#rejectReady = undefined;
+    reject?.(abortReason);
+    this.abort(abortReason);
+  }
+
+  #rejectDeferredReady(reason: unknown): void {
+
+    if(!this.#deferReady || !this.#rejectReady) {
+
+      return;
+    }
+
+    const reject = this.#rejectReady;
+
+    this.#resolveReady = undefined;
+    this.#rejectReady = undefined;
+    reject(reason);
   }
 
   rejectExitedNow(reason: unknown = new Error("ffmpeg exited rejected")): void {
@@ -206,6 +245,8 @@ export class TestLiveStreamingFfmpegProcess {
 
       this.#controller.abort(reason ?? new HbpuAbortError("shutdown"));
     }
+
+    this.#rejectDeferredReady(this.#controller.signal.reason ?? reason ?? new HbpuAbortError("shutdown"));
 
     this.#parentAbort?.();
   }

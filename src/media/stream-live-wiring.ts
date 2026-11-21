@@ -365,9 +365,9 @@ export interface LiveFfmpegCopyExitBridgeInput {
   endFfmpegBridge: (exitedProcess: ProtectStreamingFfmpegProcess, ffmpegExitCode?: number | null) => void;
   escalateCopyFailure: (exitedProcess: ProtectStreamingFfmpegProcess, onRespawned: (respawned: ProtectStreamingFfmpegProcess) => void,
     tsbResume: CopyEscalationTsbResume | undefined) => Promise<ProtectStreamingFfmpegProcess | null>;
+  getActiveVideoFfmpeg: () => ProtectStreamingFfmpegProcess | undefined;
   onEscalationSettled?: () => void;
   onRespawned: (respawned: ProtectStreamingFfmpegProcess) => void;
-  reconfigureInFlight: () => boolean;
   sessionDiagnostics: { escalatedFromCopy: boolean; segmentsFed: number; videoCopy: boolean };
   sessionStartedAt: number;
   sessionStillOwned: () => boolean;
@@ -383,20 +383,33 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
 
   const bridgeFfmpegExit = (exitedProcess: ProtectStreamingFfmpegProcess, ffmpegExitCode?: number | null): void => {
 
+    const exitingIsActiveEncoder = input.getActiveVideoFfmpeg() === exitedProcess;
+
+    if(input.copyEscalationInFlightRef.current && !exitingIsActiveEncoder) {
+
+      return;
+    }
+
     const elapsedMs = Date.now() - input.sessionStartedAt;
     const eligibleForEscalation = classifyLiveCopyEscalationEligible({
 
       elapsedMs: elapsedMs, escalatedFromCopy: input.sessionDiagnostics.escalatedFromCopy, segmentsFed: input.sessionDiagnostics.segmentsFed,
       stderrLog: exitedProcess.stderrLog, useTimeshiftBuffer: input.useTsb, videoCopy: input.sessionDiagnostics.videoCopy
     });
-    const bridgeAction = resolveVideoCopyExitBridgeAction({ copyEscalationInFlight: input.copyEscalationInFlightRef.current,
-      eligibleForEscalation: eligibleForEscalation, exitIsReplaced: isHbpuAbortReason(exitedProcess.signal.reason, "replaced"),
-      reconfigureInFlight: input.reconfigureInFlight(), sessionStillOwned: input.sessionStillOwned() });
+    const bridgeAction = resolveVideoCopyExitBridgeAction({ eligibleForEscalation: eligibleForEscalation,
+      exitIsReplaced: isHbpuAbortReason(exitedProcess.signal.reason, "replaced"), sessionStillOwned: input.sessionStillOwned() });
 
     if(bridgeAction === "ignore") {
 
       return;
     }
+
+    const endBridgeForActiveEncoder = (): void => {
+
+      const teardownTarget = input.getActiveVideoFfmpeg() ?? exitedProcess;
+
+      input.endFfmpegBridge(teardownTarget, ffmpegExitCode);
+    };
 
     if(bridgeAction === "escalate") {
 
@@ -414,7 +427,7 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
 
         if(!respawned && input.sessionStillOwned()) {
 
-          input.endFfmpegBridge(exitedProcess, ffmpegExitCode);
+          endBridgeForActiveEncoder();
         } else if(respawned && input.sessionStillOwned()) {
 
           input.onEscalationSettled?.();
@@ -424,7 +437,7 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
         if(input.sessionStillOwned()) {
 
           input.copyEscalationInFlightRef.current = false;
-          input.endFfmpegBridge(exitedProcess, ffmpegExitCode);
+          endBridgeForActiveEncoder();
           input.onEscalationSettled?.();
         }
       });
@@ -432,7 +445,7 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
       return;
     }
 
-    input.endFfmpegBridge(exitedProcess, ffmpegExitCode);
+    endBridgeForActiveEncoder();
   };
 
   const wireFfmpegExitBridge = (process: ProtectStreamingFfmpegProcess): void => {
