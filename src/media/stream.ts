@@ -7,12 +7,13 @@
 /* eslint-disable sort-imports -- production import block; order mirrors teardown coupling, not strict alphabetical sort. */
 import type { ControllerIdentity, StreamingDelegate, StreamingDelegateFactory } from "./stream-delegate.ts";
 import { AudioRecordingCodecType, AudioStreamingCodecType, AudioStreamingSamplerate, FfmpegOptions,
-  H264Level, H264Profile, HKSV_FRAGMENT_LENGTH, HbpuAbortError, MediaContainerType, Mp4FrameFeed, SRTPCryptoSuites,
+  H264Level, H264Profile, HKSV_FRAGMENT_LENGTH, HbpuAbortError, MediaContainerType, SRTPCryptoSuites,
   StreamRequestTypes, VideoCodecType, formatBps, formatErrorMessage, formatUrlHost, guardedDispatch, isHbpuAbortReason, mqttTopic } from "homebridge-plugin-utils";
-import type { BackpressureWriter, Clock, HomebridgePluginLogging, IpFamily, Nullable, PortReservation, RtpDemuxerHandle, StreamingProcess } from "homebridge-plugin-utils";
+import type { BackpressureWriter, Clock, HomebridgePluginLogging, IpFamily, Mp4FrameFeed, Nullable, PortReservation, RtpDemuxerHandle,
+  StreamingProcess } from "homebridge-plugin-utils";
 import type { CameraController, CameraControllerOptions, CameraStreamingDelegate, HAP, PrepareStreamCallback, PrepareStreamRequest, PrepareStreamResponse, Resolution,
   SnapshotRequest, SnapshotRequestCallback, StartStreamRequest, StreamRequestCallback, StreamingRequest } from "homebridge";
-import { HARDWARE_TRANSCODE_MARKER, PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_MS, PROTECT_LIVESTREAM_API_IDR_INTERVAL, PROTECT_LIVE_VIEW_START_DEADLINE_MS,
+import { HARDWARE_TRANSCODE_MARKER, PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_MS, PROTECT_LIVE_VIEW_START_DEADLINE_MS,
   PROTECT_PROBESIZE_OVERRIDE_MAX, PROTECT_PROBESIZE_OVERRIDE_PERMANENT_THRESHOLD, PROTECT_PROBESIZE_OVERRIDE_RESET_MS,
   PROTECT_TIMESHIFT_BUFFER_MAXDURATION } from "../settings.ts";
 import { ProtectAbortedError } from "unifi-protect";
@@ -36,6 +37,7 @@ import { resolveLiveTranscodeBitrate, shouldRegisterOngoingSessionEntry, shouldR
   shouldRemovePendingSessionEntry } from "./stream-transcode-policy.ts";
 import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, establishmentFailureStopReason, formatLiveViewPathLabel, formatNoOutputWarning, formatStreamSessionStart,
   formatStreamSessionStop, recordStreamMediaActivityIfOwner } from "./stream-telemetry.ts";
+import type { Writable } from "node:stream";
 import type { LiveTsbFeedState } from "./stream-live-feed.ts";
 import { consumeLiveStreamSegments, createLiveFrameFeed, createTsbSegmentWriterRail } from "./stream-live-feed.ts";
 import { appendLiveVideoEncodeToFfmpegArgs, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge, formatLiveEncodeDecisionLog,
@@ -700,12 +702,12 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
   }
 
   /* Consume Segments from a livestream subscription and feed them to FFmpeg through the supplied frame feed (upstream-shaped entry for stream-consume.test). */
-  private async consumeStreamSegments(ffmpegStream: StreamingProcess | { stdin: import("node:stream").Writable }, subscription: LivestreamSubscription,
+  private async consumeStreamSegments(ffmpegStream: StreamingProcess | { stdin: Writable }, subscription: LivestreamSubscription,
     feed: Mp4FrameFeed, tsBuffer: Nullable<Buffer>): Promise<void> {
 
     const feedState: LiveTsbFeedState = { allowTimeshiftPrefix: true, headerWritten: false, primeMediaFloor: null };
 
-    await consumeLiveStreamSegments(() => ffmpegStream as ProtectStreamingFfmpegProcess, feedState, subscription, feed, tsBuffer, this.log);
+    await consumeLiveStreamSegments(() => ffmpegStream as ProtectStreamingFfmpegProcess, feedState, subscription, () => feed, tsBuffer, this.log);
   }
 
   // FFmpeg argv through -map (before video encode / copy, metadata, and tee sinks).
@@ -910,7 +912,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
       hardwareTranscodes: this.ffmpegOptions.hardwareEncodes("stream"),
       log: this.log,
-      onRespawned: (process) => onRespawned(process as ProtectStreamingFfmpegProcess),
+      onRespawned: (process) => onRespawned(process),
       ongoingSessions: this.ongoingSessions,
       owner: owner,
       pendingSessions: this.pendingSessions,
@@ -980,7 +982,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       }
     });
 
-    return respawned as ProtectStreamingFfmpegProcess | null;
+    return respawned;
   }
 
   // Launch the Protect video (and audio) stream.
@@ -1450,8 +1452,10 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
       // Write FFmpeg's input with backpressure handling...if FFmpeg can't keep up, writes are queued and go out when it's ready. The writer holds each fragment's frames
       // on the platform's clock until they are due.
-      tsbWriterRail = createTsbSegmentWriterRail({ clock: this.platform.clock, feedState: tsbFeedState, getStdin: () => activeFfmpeg.stdin, log: this.log,
+      const liveTsbWriterRail = createTsbSegmentWriterRail({ clock: this.platform.clock, feedState: tsbFeedState, getStdin: () => activeFfmpeg.stdin, log: this.log,
         onRotateSegmentWriter: this.streamTestOptions?.onRotateSegmentWriter, signal: sessionInfo.abortController.signal });
+
+      tsbWriterRail = liveTsbWriterRail;
 
       // Subscribe to the pooled livestream via the camera interface. This call is synchronous and returns the subscription handle immediately; the underlying connection
       // begins establishing in the background. We start consuming segments below within the same synchronous frame, before any asynchronous segment can be delivered.
@@ -1469,7 +1473,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         urgency: () => PROTECT_LIVESTREAM_ACTIVE_TOLERANCE_MS });
 
       // Drive the segment iterator in the background, feeding FFmpeg through a frame feed over the writer.
-      void consumeLiveStreamSegments(() => activeFfmpeg, tsbFeedState, subscription, tsbWriterRail.getFrameFeed(), tsBuffer, this.log, (): void => {
+      void consumeLiveStreamSegments(() => activeFfmpeg, tsbFeedState, subscription, () => liveTsbWriterRail.getFrameFeed(), tsBuffer, this.log, (): void => {
 
         this.recordTsbMediaSegmentForOwner(request.sessionID, sessionDiagnostics);
       });

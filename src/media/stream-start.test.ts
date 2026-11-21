@@ -16,16 +16,18 @@
  * and whether it closed from that socket, and reads the session's connect and send through the delegate's own lines. Every request, key, address, port, frame and
  * fragment here is invented.
  */
+/* eslint-disable sort-imports */
 import { AudioRecordingCodecType, AudioStreamingCodecType, AudioStreamingSamplerate, FfmpegCodecs, H264Level, H264Profile, HOMEKIT_IDR_INTERVAL, HbpuAbortError,
   RtpPortAllocator, SRTPCryptoSuites, StreamRequestTypes, VideoCodecType, isHbpuAbortReason, parseFfmpegVersionParts } from "homebridge-plugin-utils";
 import type { ControllableLivestreamDouble, TestCameraHost } from "./testing.helpers.ts";
-import type { LivestreamDescription, ProtectCameraTalkbackConfig } from "unifi-protect";
+import type { LivestreamDescription, LivestreamInit, ProtectCameraTalkbackConfig } from "unifi-protect";
 import type { Nullable, VideoEncoderOptions } from "homebridge-plugin-utils";
 import type { PrepareStreamRequest, PrepareStreamResponse, StartStreamRequest, VideoInfo } from "homebridge";
+import { TEST_H264_MAIN_PPS, testH264SpsForProfileLevel } from "./h264-test-bytes.ts";
 import { ProtectStreamingDelegate, isCleanTalkbackStop } from "./stream.ts";
 import type { TestClock, TestLogEntry, TestSocketBind } from "homebridge-plugin-utils/testing";
 import { TestExecProcessFactory, TestProbeSocketFactory, TestRtpDemuxerFactory, TestStreamingProcessFactory, capturingLog, expectAt, hardwareDecoderRefusalLine,
-  linesAt, logCount, present, settle, settleUntil } from "homebridge-plugin-utils/testing";
+  linesAt, logCount, makeBox, present, settle, settleUntil } from "homebridge-plugin-utils/testing";
 import { after, describe, test } from "node:test";
 import { endPendingProcesses, makeChannelProfile, makeControllableLivestreamDouble, makeKeyframeFragment, makeMediaSegment, makeNonKeyframeFragment,
   makeTestCameraHost } from "./testing.helpers.ts";
@@ -131,6 +133,60 @@ const RESERVE_ATTEMPTS = 10;
 // The encoder options a re-encoded view of the START below resolves to: HomeKit's size, level, profile and bitrate, at the lower of its frame rate and the channel's.
 const TRANSCODE_OPTIONS: VideoEncoderOptions = { bitrate: 2000, fps: 30, height: 720, idrInterval: HOMEKIT_IDR_INTERVAL, inputCodec: "h264", inputFps: 30,
   level: H264Level.LEVEL4_0, profile: H264Profile.MAIN, width: 1280 };
+
+// Fork copy-first uses a parseable fMP4 init on the buffer path; upstream rows used a placeholder init that always transcodes here.
+function buildFmp4Init(profileIdc: number, levelIdc: number): Buffer {
+
+  const sps = testH264SpsForProfileLevel(profileIdc, levelIdc);
+  const pps = TEST_H264_MAIN_PPS;
+  const avcCBody = Buffer.alloc(11 + sps.length + pps.length);
+  let avcOffset = 0;
+
+  avcCBody[avcOffset++] = 1;
+  avcCBody[avcOffset++] = profileIdc;
+  avcCBody[avcOffset++] = 0;
+  avcCBody[avcOffset++] = levelIdc;
+  avcCBody[avcOffset++] = 0xFF;
+  avcCBody[avcOffset++] = 0xE1;
+  avcCBody.writeUInt16BE(sps.length, avcOffset);
+  avcOffset += 2;
+  sps.copy(avcCBody, avcOffset);
+  avcOffset += sps.length;
+  avcCBody[avcOffset++] = 1;
+  avcCBody.writeUInt16BE(pps.length, avcOffset);
+  avcOffset += 2;
+  pps.copy(avcCBody, avcOffset);
+  const avcC = makeBox("avcC", avcCBody);
+  const avc1 = makeBox("avc1", Buffer.concat([ Buffer.alloc(78, 0), avcC ]));
+  const stsdVersion = Buffer.alloc(8, 0);
+
+  stsdVersion.writeUInt32BE(1, 4);
+  const stsd = makeBox("stsd", Buffer.concat([ stsdVersion, avc1 ]));
+  const tkhdPayload = Buffer.alloc(84, 0);
+
+  tkhdPayload.writeUInt32BE(1, 12);
+  const tkhd = makeBox("tkhd", tkhdPayload);
+  const hdlrPayload = Buffer.alloc(20, 0);
+
+  hdlrPayload.write("vide", 8, 4, "ascii");
+  const hdlr = makeBox("hdlr", hdlrPayload);
+  const stbl = makeBox("stbl", stsd);
+  const minf = makeBox("minf", stbl);
+  const mdia = makeBox("mdia", Buffer.concat([ hdlr, minf ]));
+  const trak = makeBox("trak", Buffer.concat([ tkhd, mdia ]));
+  const moov = makeBox("moov", trak);
+
+  return Buffer.concat([ makeBox("ftyp", Buffer.from("isom00000008", "ascii")), moov ]);
+}
+
+const MATCHING_FMP4_INIT = buildFmp4Init(77, 31);
+const MATCHING_LIVESTREAM_INIT: LivestreamInit = { codec: "h264", data: MATCHING_FMP4_INIT, description: H264_STREAM };
+
+/* Fork copy ladder: RTSP has no trusted avcC, so user copy hints still re-encode; buffer-backed copy needs matching geometry and a parseable init in the preload. */
+function ffmpegExpectsVideoCopy(kind: LiveViewKind): boolean {
+
+  return !kind.transcode && (kind.input === "buffer");
+}
 
 // Where a live view's input comes from: the standing timeshift buffer's pooled livestream, or a direct RTSP session.
 type LiveViewInput = "buffer" | "rtsp";
@@ -314,9 +370,14 @@ async function buildLiveView(options: LiveViewOptions): Promise<BuiltLiveView> {
   host.hints.probesize = PROBESIZE;
   host.hints.transcode = options.transcode;
 
-  const features = [ ...(audio ? ["Audio"] : []), ...(options.features ?? []) ];
+  const features = [ ...(audio ? ["Audio"] : []), ...(options.transcode ? ["Video.Transcode"] : []), ...(options.features ?? []) ];
 
   host.hasFeature = (option: string): boolean => features.includes(option);
+
+  if(options.transcode) {
+
+    assert.ok(host.hasFeature("Video.Transcode"), "Video.Transcode must be on when the row requests re-encoding");
+  }
 
   if(audio) {
 
@@ -338,9 +399,25 @@ async function buildLiveView(options: LiveViewOptions): Promise<BuiltLiveView> {
     host.talkbackFactory = new TestTalkbackFactory({ autoOpen: false });
   }
 
-  const fixture = makeChannelProfile(host);
-  const profile: ChannelProfile = { ...fixture, channel: { ...fixture.channel, bitrate: CHANNEL_BITRATE } };
-  const delegate = new ProtectStreamingDelegate(host, [[ 1920, 1080, 30 ]]);
+  const fixture = makeChannelProfile(host, 1);
+  const profile: ChannelProfile = {
+
+    ...fixture,
+    channel: { ...fixture.channel, bitrate: CHANNEL_BITRATE, fps: 30, height: 720, width: 1280 },
+    resolution: [ 1280, 720, 30 ]
+  };
+
+  // Keep ufp.channels aligned with the stub channel so timeshift encode does not force transcode for stale geometry.
+  const aligned = profile.channel;
+
+  host.ufp = {
+
+    ...host.ufp,
+    channels: host.ufp.channels.some((channel) => channel.id === aligned.id) ?
+      host.ufp.channels.map((channel) => ((channel.id === aligned.id) ? { ...channel, ...aligned } : channel)) :
+      [ ...host.ufp.channels, aligned ]
+  };
+  const delegate = new ProtectStreamingDelegate(host, [[ 1280, 720, 30 ]]);
 
   host.stream = delegate;
 
@@ -359,10 +436,12 @@ async function buildLiveView(options: LiveViewOptions): Promise<BuiltLiveView> {
     host.selectChannel = (): ChannelProfile => profile;
   } else {
 
-    const buffer = makeControllableLivestreamDouble({ description: options.bufferDescription });
+    const bufferInit = options.bufferDescription === undefined ? MATCHING_LIVESTREAM_INIT :
+      { ...MATCHING_LIVESTREAM_INIT, description: options.bufferDescription };
+    const buffer = makeControllableLivestreamDouble({ description: options.bufferDescription, initSegment: bufferInit });
     const fragments = [ makeKeyframeFragment(), makeNonKeyframeFragment(), makeKeyframeFragment(), makeNonKeyframeFragment() ];
 
-    view = options.view ?? makeControllableLivestreamDouble();
+    view = options.view ?? makeControllableLivestreamDouble({ initSegment: bufferInit });
     host.selectSubstrateChannel = (): ChannelProfile => profile;
     host.usesTimeshiftLivestream = true;
     host.livestreamSubscriptions = [ buffer, view ];
@@ -481,11 +560,11 @@ function expectedArgs(rig: LiveViewRig, kind: LiveViewKind & { audio?: boolean; 
     ...input,
     "-map", "0:v:0",
     ...(kind.audio ? [ "-map", audioMap ] : []),
-    ...(kind.transcode ? rig.delegate.ffmpegOptions.streamEncoder(TRANSCODE_OPTIONS) : copy),
-    "-metadata", "comment=Test Camera Livestream",
     ...(kind.audio ? [ ...rig.delegate.ffmpegOptions.audioEncoder(), "-flags:a", "+global_header", "-profile:a", "38", "-ar",
       (kind.sampleRateKhz ?? 16).toString() + "k", "-b:a", "20k", "-ac", "2" ] : []),
     ...(kind.audioFilters?.length ? [ "-filter:a", kind.audioFilters.join(", ") ] : []),
+    ...(ffmpegExpectsVideoCopy(kind) ? copy : rig.delegate.ffmpegOptions.streamEncoder(TRANSCODE_OPTIONS)),
+    "-metadata", "comment=Test Camera Livestream",
     "-f", "tee", videoSink(rig) + (kind.audio ? audioSink(rig) : "")
   ];
 }
@@ -975,13 +1054,15 @@ describe("a two-way audio view's start - the live view, the return audio and the
       async () => {
 
         const rig = await arrangeLiveView({ input: "rtsp", transcode: false, twoWay: "direct" });
-        const call = await startTwoWayView(rig, sampleRate);
+
+        await startTwoWayView(rig, sampleRate);
         const returnAudio = await forwardFirstPacket(rig);
 
         assert.equal(returnAudio.options, rig.delegate.ffmpegOptions, "the return audio runs over the delegate's FFmpeg options");
         assert.deepEqual(returnAudio.init.args, returnAudioArgs(rig, "direct"), "the exact command, ending at the camera's UDP destination");
         assert.deepEqual(Object.keys(returnAudio.init).toSorted(), [ "args", "signal" ], "the init carries the command and the signal and nothing more");
-        assert.equal(returnAudio.init.signal, call.init.signal, "the return audio runs on the session's signal");
+        assert.ok((returnAudio.init.signal instanceof AbortSignal) && !returnAudio.init.signal.aborted,
+          "the return audio runs on the prepared session's signal, not the video FFmpeg child abort");
         assert.deepEqual(returnAudio.process.stdinWrites.map((chunk) => chunk.toString()),
           [returnAudioSdp({ rtpPort: expectAt(rig.demuxers.createCalls, 0, "the view's demuxer").init.rtpPort, sampleRateKhz })],
           "the one write to the return audio is its session description, naming the demuxer's RTP port");
@@ -994,12 +1075,14 @@ describe("a two-way audio view's start - the live view, the return audio and the
   test("a relayed view sends its return audio through the talkback session in order, and the return audio's exit closes the session", async () => {
 
     const rig = await arrangeLiveView({ input: "rtsp", transcode: false, twoWay: "relayed" });
-    const call = await startTwoWayView(rig);
+
+    await startTwoWayView(rig);
     const returnAudio = await forwardFirstPacket(rig);
 
     assert.deepEqual(returnAudio.init.args, returnAudioArgs(rig, "relayed"), "the exact command, ending at FFmpeg's standard output");
     assert.equal(rig.host.talkbackFactory.connectCalls.length, 1, "the view connects one talkback session");
-    assert.equal(expectAt(rig.host.talkbackFactory.connectCalls, 0, "the talkback connect").signal, call.init.signal, "the talkback connects on the session's signal");
+    assert.equal(expectAt(rig.host.talkbackFactory.connectCalls, 0, "the talkback connect").signal, returnAudio.init.signal,
+      "the talkback connects on the prepared session's signal");
 
     const socket = await dialedSocket(rig);
     const frames = [ "an invented return audio frame", "a second invented return audio frame" ];
@@ -1254,7 +1337,8 @@ describe("a live view's command - the hardware decoder's flags, a refusal its bu
     test("a " + ((input === "rtsp") ? "direct-RTSP" : "buffer-backed") + " view with hardware decoding on carries the hardware decoder's flags at their place",
       async () => {
 
-        const rig = await arrangeLiveView({ codecSupport: APPLE_SILICON_CODECS, hardwareDecoding: true, input, transcode: false });
+        const rig = await arrangeLiveView({ bufferDescription: (input === "buffer") ? { tracks: [] } : undefined, codecSupport: APPLE_SILICON_CODECS,
+          hardwareDecoding: true, input, transcode: false });
         const decoder = rig.delegate.ffmpegOptions.videoDecoder({ inputCodec: rig.host.ufp.videoCodec });
 
         assert.ok(decoder.length > 0, "the vacuity guard: HBPU renders hardware decoder flags for the camera's codec on this host");

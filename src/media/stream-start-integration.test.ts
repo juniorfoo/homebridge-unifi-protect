@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import type { PrepareStreamRequest, StartStreamRequest, StreamingRequest } from "homebridge";
 import type { BackpressureWriter, FfmpegOptions } from "homebridge-plugin-utils";
 import { H264Level, H264Profile, HOMEKIT_IDR_INTERVAL, RtpPortAllocator, StreamRequestTypes, formatBps } from "homebridge-plugin-utils";
-import type { TestLogEntry } from "homebridge-plugin-utils/testing";
+import type { TestClock, TestLogEntry } from "homebridge-plugin-utils/testing";
 import { formatLogEntry, settle } from "homebridge-plugin-utils/testing";
 import type { TestTimeshiftSupervisor } from "../testing.helpers.ts";
 import { makeTimeshiftSupervisorDouble } from "../testing.helpers.ts";
@@ -30,6 +30,9 @@ import { resolveLiveStreamTranscodePipelineOptions, shouldSubstituteSelectChanne
 import type { LiveVideoEncodeDecision } from "./stream-transcode-policy.ts";
 import type { LiveStreamEncoderPipelineOptions } from "./stream-live-wiring.ts";
 import { makeHarnessRtpDemuxer } from "./stream-test-rtp-double.ts";
+
+/** Virtual clock for the harness under test; advanced in waitFor so Mp4FrameFeed paced writes settle. */
+let harnessPacingClock: TestClock | undefined;
 
 const SESSION_ID = "sess-start-integration";
 
@@ -265,6 +268,26 @@ function assertSpawnedDecoderMatchesTranscodePipeline(delegate: ProtectStreaming
   assert.deepEqual(decoderPrefix, APPLE_TRANSCODE_DECODER_ARGS, "Apple interpolating transcode must use plain videotoolbox (CPU frames), not videotoolbox_vld");
 }
 
+function drainHarnessPacing(): void {
+
+  const clock = harnessPacingClock;
+
+  if(!clock) {
+
+    return;
+  }
+
+  for(let round = 0; round < 8; round += 1) {
+
+    clock.advance(33);
+
+    while(clock.advanceToNext()) {
+
+      /* flush BackpressureWriter paced entries (stream-consume.test cadence) */
+    }
+  }
+}
+
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 8000): Promise<void> {
 
   const started = Date.now();
@@ -276,8 +299,10 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 8000
       throw new Error("Timed out waiting for " + label);
     }
 
+    drainHarnessPacing();
+
     // eslint-disable-next-line no-await-in-loop -- intentional poll loop for async harness timing
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await settle();
   }
 }
 
@@ -345,6 +370,7 @@ function logInfoLineIncludes(entries: readonly TestLogEntry[], fragment: string)
 
 interface HarnessContext {
 
+  clock: TestClock;
   delegate: ProtectStreamingDelegate;
   host: TestCameraHost;
   logEntries: readonly TestLogEntry[];
@@ -372,8 +398,9 @@ function createHarness(options?: {
   hardwareTranscodingHint?: boolean; livestreamSegments?: number; patchAppleDecoderProbe?: boolean; transcodeBitrateKbps?: number; videoCodec?: string;
 }): HarnessContext {
 
-  const { host, logEntries } = makeTestCameraHost();
+  const { clock, host, logEntries } = makeTestCameraHost();
 
+  harnessPacingClock = clock;
   installProtectStreamingHarness(host);
   syncLiveUfpChannelsForStubBuffer(host);
   host.isReachable = true;
@@ -437,7 +464,7 @@ function createHarness(options?: {
     return proc as unknown as ProtectStreamingFfmpegProcess;
   });
 
-  return { delegate, host, logEntries, spawnedArgs, spawnedProcesses, timeshift };
+  return { clock, delegate, host, logEntries, spawnedArgs, spawnedProcesses, timeshift };
 }
 
 async function wireRealTimeshiftBuffer(ctx: HarnessContext, _bufferSub: ControllableLivestreamDouble,
@@ -853,6 +880,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     const startPromise = prepareAndStart(ctx);
 
     liveSub.push({ data: liveLead.data, mdat: liveLead.mdat, moof: liveLead.moof, type: "media" });
+    drainHarnessPacing();
     await startPromise;
 
     await waitFor(() => ctx.spawnedProcesses.length >= 2, "copy escalation replacement spawn", 25000);
@@ -891,6 +919,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     const followUp = makeNonKeyframeFragment(undefined, { baseMediaDecodeTime: 4000, sequenceNumber: 11 });
 
     liveSub.push({ data: followUp.data, mdat: followUp.mdat, moof: followUp.moof, type: "media" });
+    drainHarnessPacing();
 
     await waitFor(() => ((replacement.stdinWrites.length >= 2) && ((copyProcess?.stdinWrites.length ?? 0) === copyWritesBeforeFollowup)),
       "post-escalation media routes to replacement only");

@@ -1,7 +1,7 @@
 {
-  "old_upstream": "v8.1.0",
-  "new_upstream": "v8.2.2",
-  "fork_base": "c0b913d",
+  "old_upstream": "v8.2.2",
+  "new_upstream": "v8.3.0",
+  "fork_base": "4c259d6",
   "head": "HEAD",
   "allowlist": "scripts/upstream-sync-allowlist.txt"
 }
