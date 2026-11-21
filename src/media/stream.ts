@@ -1670,9 +1670,9 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       // Re-validate the pending session's identity now that the establishment wait has returned. A concurrent stopStream during the wait aborts this session's
       // controller and drops it from the pending map, yet whenEstablished can still resolve true off another subscriber sharing the pooled socket - so without this
       // check we would register an ongoing entry for a session already torn down, with no path left to ever remove it. On a mismatch we dispose defensively (safe to
-      // repeat: the concurrent stop's abort already ran) and bail. We do not answer the StreamRequestCallback here: it is owned by the FFmpeg ready bridge above, which
-      // the abort settles exactly once, so an explicit callback would double-answer. This closes the stop-during-establishment race; an organic FFmpeg exit during the
-      // same wait is an adjacent race tracked separately.
+      // repeat: the concurrent stop's abort already ran) and bail. settleStartStreamReadyBridge settles any pending START once (the concurrent stop may already have
+      // answered it; the helper is idempotent when settled). This closes the stop-during-establishment race; an organic FFmpeg exit during the same wait is an adjacent
+      // race tracked separately.
       if(this.pendingSessions.get(request.sessionID) !== sessionInfo) {
 
         this.settleStartStreamReadyBridge(sessionDiagnostics, new HbpuAbortError("shutdown"));
