@@ -282,8 +282,17 @@ export class ProtectPlatform implements DynamicPlatformPlugin {
 
     const configuredFfmpeg = this.config.videoProcessor;
     const resolvedFfmpegPath = resolveFfmpegExecutablePath(configuredFfmpeg);
-    const validationError = (path.isAbsolute(configuredFfmpeg) || configuredFfmpeg.includes("/") || ((path.sep !== "/") && configuredFfmpeg.includes(path.sep)) ||
-      (resolvedFfmpegPath !== configuredFfmpeg)) ? validateConcreteFfmpegPath(resolvedFfmpegPath) : undefined;
+
+    if(!path.isAbsolute(resolvedFfmpegPath)) {
+
+      this.log.error("FFmpeg executable was not found on PATH: " + configuredFfmpeg);
+      this.log.error("This plugin requires a working version of FFmpeg. " +
+        "If you need to specify a path to your FFmpeg, you can do so under 'Settings | Additional Settings' in the plugin configuration webUI.");
+
+      return;
+    }
+
+    const validationError = validateConcreteFfmpegPath(resolvedFfmpegPath);
 
     if(validationError) {
 

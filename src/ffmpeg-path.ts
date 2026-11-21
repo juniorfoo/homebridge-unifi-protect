@@ -51,21 +51,39 @@ export function validateConcreteFfmpegPath(resolvedPath: string): string | undef
 
 function findExecutableInPath(command: string, pathVariable: string, cwd: string): string | undefined {
 
+  let cwdReal: string | undefined;
+
+  try {
+
+    cwdReal = realpathSync(cwd);
+  } catch {
+
+    return undefined;
+  }
+
   for(const directory of pathVariable.split(path.delimiter)) {
 
-    if((directory === "") || (directory === ".")) {
+    if((directory === "") || !path.isAbsolute(directory)) {
 
       continue;
     }
 
-    const searchDirectory = path.isAbsolute(directory) ? directory : path.resolve(cwd, directory);
+    let directoryReal: string | undefined;
 
-    if(searchDirectory === cwd) {
+    try {
+
+      directoryReal = realpathSync(directory);
+    } catch {
 
       continue;
     }
 
-    const candidate = path.join(searchDirectory, command);
+    if(directoryReal === cwdReal) {
+
+      continue;
+    }
+
+    const candidate = path.join(directory, command);
 
     if(!isExecutableFile(candidate)) {
 

@@ -39,6 +39,7 @@ import { ProtectPlatform } from "./platform.ts";
 import type { ProtectPlatformConfig } from "./types.ts";
 import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
@@ -859,6 +860,71 @@ describe("platform FFmpeg path validation at launch", () => {
     assert.equal(probeMock.mock.callCount(), 0, "a missing concrete path stops before the probe");
     assertNoFfmpegPathInfoLog(log.entries);
     assert.ok(log.entries.some((entry) => (entry.level === "error") && entry.message.includes(missing)), "the error names the missing path");
+  });
+
+  test("an unresolved bare name stops before the probe", async (t) => {
+
+    const probeMock = t.mock.method(FfmpegCodecs, "probe", async (): Promise<FfmpegCodecs | null> => null);
+    const bareName = "hbup-missing-ffmpeg-bin";
+    const { api, log } = buildLaunchPlatform([], bareName);
+
+    api.emit(APIEvent.DID_FINISH_LAUNCHING);
+
+    await settle();
+
+    assert.equal(probeMock.mock.callCount(), 0);
+    assertNoFfmpegPathInfoLog(log.entries);
+    assert.ok(log.entries.some((entry) => (entry.level === "error") && entry.message.includes(bareName) && entry.message.includes("not found on PATH")));
+  });
+
+  test("a bare videoProcessor name probes the PATH-resolved absolute path", async (t) => {
+
+    const binDirectory = mkdtempSync(join(tmpdir(), "hbup-bare-launch-bin-"));
+    const workingDirectory = mkdtempSync(join(tmpdir(), "hbup-bare-launch-cwd-"));
+    const resolvedFfmpeg = join(binDirectory, "ffmpeg");
+    const ffmpegVersionParts = parseFfmpegVersionParts("8.0");
+
+    writeFileSync(resolvedFfmpeg, "#!/bin/sh\n", { mode: 0o755 });
+    writeFileSync(join(workingDirectory, "ffmpeg"), "#!/bin/sh\n", { mode: 0o755 });
+
+    if(process.env["HBUP_FFMPEG_BARE_LAUNCH"] === "1") {
+
+      const expectedFfmpeg = process.env["HBUP_FFMPEG_EXPECT"];
+
+      assert.ok(expectedFfmpeg, "HBUP_FFMPEG_EXPECT names the PATH-resolved absolute binary");
+
+      const probeMock = t.mock.method(FfmpegCodecs, "probe", async (options: { ffmpegExec: string }): Promise<FfmpegCodecs> => {
+
+        return FfmpegCodecs.fromState({ codecs: {}, cpuGeneration: 0, ffmpegExec: options.ffmpegExec, ffmpegVersion: "8.0", ffmpegVersionParts, gpuMem: 0,
+          hostSystem: "macOS.Apple", hwAccels: new Set<string>(), verbose: false });
+      });
+
+      const { api, log, platform } = buildLaunchPlatform([], "ffmpeg");
+
+      assert.equal(platform.config.videoProcessor, "ffmpeg");
+      assert.notEqual(platform.config.videoProcessor, expectedFfmpeg);
+
+      parkLogins(t, api, platform);
+
+      api.emit(APIEvent.DID_FINISH_LAUNCHING);
+
+      await settleUntil(() => probeMock.mock.callCount() > 0, { description: "the probe call" });
+
+      const probeOptions = probeMock.mock.calls[0]?.arguments[0] as { ffmpegExec: string };
+
+      assert.equal(probeOptions.ffmpegExec, expectedFfmpeg);
+      assert.ok(hasResolvedPathLog(log.entries, expectedFfmpeg));
+
+      return;
+    }
+
+    const testFile = new URL(import.meta.url).pathname;
+    const child = spawnSync(process.execPath, [ "--test", "--test-name-pattern=^a bare videoProcessor name probes", testFile ], {
+
+      cwd: workingDirectory, encoding: "utf8", env: { ...process.env, HBUP_FFMPEG_BARE_LAUNCH: "1", HBUP_FFMPEG_EXPECT: resolvedFfmpeg, PATH: binDirectory }
+    });
+
+    assert.equal(child.status, 0, child.stderr || child.stdout);
   });
 
   test("the probe receives the resolved absolute executable path", async (t) => {
