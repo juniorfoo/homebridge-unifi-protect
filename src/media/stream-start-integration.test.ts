@@ -2330,7 +2330,6 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     const bufferSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
     const streamSub = makeControllableLivestreamDouble({ initSegment: MATCHING_INIT_LIVESTREAM });
     const copyFailureLine = VIDEO_COPY_FAILURE_PATTERNS[1] ?? "Error initializing output stream";
-    let escalationSlow: TestLiveStreamingFfmpegProcess | null = null;
     let spawnIndex = 0;
 
     ctx.host.livestreamSubscriptions = [bufferSub];
