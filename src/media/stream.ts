@@ -1000,9 +1000,21 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     return new Error(accessoryName + ": " + (((reason instanceof HbpuAbortError) && (reason.cause instanceof Error)) ? reason.cause.message : String(reason)));
   }
 
-  private deferStartReadyBridgeForQueuedReplan(owner: StreamSessionDiagnostics): boolean {
+  private deferStartReadyBridgeForQueuedReplan(sessionId: string, owner: StreamSessionDiagnostics): boolean {
 
-    return Boolean(owner.pendingReconfigure);
+    if(!owner.pendingReconfigure) {
+
+      return false;
+    }
+
+    const ongoing = this.ongoingSessions.get(sessionId);
+
+    if(!ongoing || isHbpuAbortReason(ongoing.abortController.signal.reason, "shutdown")) {
+
+      return false;
+    }
+
+    return true;
   }
 
   private settleStartStreamReadyBridge(owner: StreamSessionDiagnostics, reason: unknown): void {
@@ -1019,7 +1031,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     bridge.callback(this.formatStartStreamReadyError(bridge.accessoryName, reason));
   }
 
-  private attachStartStreamReadyBridge(owner: StreamSessionDiagnostics, process: ProtectStreamingFfmpegProcess): void {
+  private attachStartStreamReadyBridge(sessionId: string, owner: StreamSessionDiagnostics, process: ProtectStreamingFfmpegProcess): void {
 
     const bridge = owner.startStreamReadyBridge;
 
@@ -1052,7 +1064,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         return;
       }
 
-      if(this.deferStartReadyBridgeForQueuedReplan(owner)) {
+      if(this.deferStartReadyBridgeForQueuedReplan(sessionId, owner)) {
 
         return;
       }
@@ -1439,7 +1451,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       callback: callback,
       settled: false
     };
-    this.attachStartStreamReadyBridge(sessionDiagnostics, activeFfmpeg);
+    this.attachStartStreamReadyBridge(request.sessionID, sessionDiagnostics, activeFfmpeg);
 
     let subscription: Nullable<LivestreamSubscription> = null;
     let tsbWriterRail: ReturnType<typeof createTsbSegmentWriterRail> | null = null;
@@ -1472,7 +1484,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         this.logStreamSessionStopForOwner(request.sessionID, sessionDiagnostics, "ffmpeg-exit", ffmpegExitCode);
 
-        if(this.ongoingSessions.has(request.sessionID) && !sessionDiagnostics.pendingReconfigure) {
+        if(this.ongoingSessions.has(request.sessionID) &&
+          !this.deferStartReadyBridgeForQueuedReplan(request.sessionID, sessionDiagnostics)) {
 
           this.settleStartStreamReadyBridge(sessionDiagnostics, exitedProcess.signal.reason ??
             new Error("Live stream encoder exited."));
@@ -1536,7 +1549,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         activeFfmpeg = respawned;
         sessionDiagnostics.activeVideoFfmpeg = { current: respawned };
-        this.attachStartStreamReadyBridge(sessionDiagnostics, respawned);
+        this.attachStartStreamReadyBridge(request.sessionID, sessionDiagnostics, respawned);
       },
       reconfigureAwaitingEncoderReady: () => Boolean(sessionDiagnostics.reconfigureAwaitingEncoderReady),
       sessionDiagnostics: sessionDiagnostics,
@@ -1647,6 +1660,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
           sessionDiagnostics.stopLogged = true;
         }
 
+        this.settleStartStreamReadyBridge(sessionDiagnostics, new HbpuAbortError("shutdown"));
         this.endStreamDiagnosticsIfStillOwned(request.sessionID, sessionDiagnostics);
         this.disposePreparedSession(request.sessionID, sessionInfo);
 
@@ -1661,6 +1675,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       // same wait is an adjacent race tracked separately.
       if(this.pendingSessions.get(request.sessionID) !== sessionInfo) {
 
+        this.settleStartStreamReadyBridge(sessionDiagnostics, new HbpuAbortError("shutdown"));
         this.endStreamDiagnosticsIfStillOwned(request.sessionID, sessionDiagnostics);
         this.disposePreparedSession(request.sessionID, sessionInfo);
 
@@ -2122,7 +2137,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
       handles.syncRunningVideoFfmpeg(respawned);
       handles.wireFfmpegExitBridge(respawned);
-      this.attachStartStreamReadyBridge(owner, respawned);
+      this.attachStartStreamReadyBridge(sessionId, owner, respawned);
 
       const tsbResume = handles.createTsbResume();
 
@@ -2443,6 +2458,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
       if(diagnosticsOwner) {
 
+        this.settleStartStreamReadyBridge(diagnosticsOwner, new HbpuAbortError("shutdown"));
         this.logStreamSessionStopForOwner(sessionId, diagnosticsOwner, "homekit-stop");
       }
 
