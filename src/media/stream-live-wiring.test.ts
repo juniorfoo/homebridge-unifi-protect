@@ -356,6 +356,7 @@ describe("stream-live-wiring", () => {
       },
       getActiveVideoFfmpeg: () => activeFfmpeg,
       onRespawned: (respawned) => { activeFfmpeg = respawned; },
+      reconfigureAwaitingEncoderReady: () => false,
       sessionDiagnostics: { escalatedFromCopy: false, segmentsFed: 1, videoCopy: true },
       sessionStartedAt: Date.now(),
       sessionStillOwned: () => true,

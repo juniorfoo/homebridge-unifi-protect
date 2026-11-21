@@ -186,6 +186,62 @@ describe("stream-reconfigure", () => {
     assert.equal(decision.material, true, "restore to 30 fps must be material vs negotiated 15 fps before ready, even if applied is still 30");
   });
 
+  test("in-flight transcode bitrate bumps compare incrementally against the latest acknowledged target", () => {
+
+    const frozen = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, fps: 15, max_bit_rate: 800 });
+    const ack850 = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, fps: 15, max_bit_rate: 850 });
+    const ack900 = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, fps: 15, max_bit_rate: 900 });
+    const incremental850 = { ...frozen, maxBitRateKbps: 800 };
+
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: ack850,
+      nextEncode: "transcode",
+      previous: incremental850,
+      previousEncode: "transcode"
+    }).reason, "immaterial");
+    const incremental900 = { ...frozen, maxBitRateKbps: 850 };
+
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: ack900,
+      nextEncode: "transcode",
+      previous: incremental900,
+      previousEncode: "transcode"
+    }).reason, "immaterial");
+  });
+
+  test("inFlightMaterialityBaseline stays frozen while rebuild.request picks up immaterial acks", () => {
+
+    const applied = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, fps: 30, max_bit_rate: 800 });
+    const frozenTarget = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, fps: 15, max_bit_rate: 800 });
+    const ack = homeKitStreamVideoSnapshotFromRequest({ ...baseVideo, fps: 15, max_bit_rate: 850 });
+
+    const baseline = resolveReconfigureMaterialityBaseline({
+
+      applied: applied,
+      inFlightMaterialityBaseline: frozenTarget,
+      rebuildRequestVideo: { ...baseVideo, fps: 15, max_bit_rate: 850 },
+      reconfigureInFlight: true
+    });
+
+    assert.equal(baseline?.fps, 15);
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: ack,
+      nextEncode: "transcode",
+      previous: baseline,
+      previousEncode: "transcode"
+    }).material, false);
+    assert.equal(isMaterialLiveStreamReconfigure({
+
+      next: ack,
+      nextEncode: "transcode",
+      previous: baseline,
+      previousEncode: "transcode"
+    }).reason, "immaterial");
+  });
+
   test("resolveReconfigureMaterialityBaseline uses in-flight target while replan is pending", () => {
 
     const applied = homeKitStreamVideoSnapshotFromRequest(baseVideo);

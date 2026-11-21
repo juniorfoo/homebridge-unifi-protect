@@ -13,14 +13,22 @@ describe("TestLiveStreamingFfmpegProcess", () => {
   test("deferReady rejects ready after abort in real exit order", async () => {
 
     const proc = new TestLiveStreamingFfmpegProcess("defer", { deferReady: true });
+    const order: string[] = [];
 
-    const exitedSettled = proc.exited.then(() => "exited" as const);
-    const readyRejected = proc.ready.then(() => "ready" as const, () => "rejected" as const);
+    void proc.exited.then(() => {
+
+      order.push("exited");
+    });
+    void proc.ready.then(() => order.push("ready"), () => {
+
+      order.push("ready-rejected");
+    });
 
     proc.crash();
+    await proc.exited;
+    await proc.ready.catch(() => undefined);
 
-    assert.equal(await exitedSettled, "exited");
-    assert.equal(await readyRejected, "rejected");
+    assert.deepEqual(order, [ "exited", "ready-rejected" ]);
   });
 
   test("rejectReadyBeforeExit models startup-watchdog teardown before exited settles", async () => {

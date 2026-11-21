@@ -38,8 +38,8 @@ import { STREAM_NO_OUTPUT_WARNING_MS, StreamOutputWatchdog, establishmentFailure
   formatStreamSessionStop, recordStreamMediaActivityIfOwner } from "./stream-telemetry.ts";
 import type { LiveTsbFeedState } from "./stream-live-feed.ts";
 import { consumeLiveStreamSegments, createTsbSegmentWriterRail, primeLiveFfmpegStdinAfterRespawn } from "./stream-live-feed.ts";
-import { hasOutstandingLiveStreamReconfigureTarget, homeKitStreamVideoSnapshotFromRequest, isMaterialLiveStreamReconfigure, resolveReconfigureMaterialityBaseline,
-  unlinkOnFfmpegExitedSettled } from "./stream-reconfigure.ts";
+import { hasOutstandingLiveStreamReconfigureTarget, homeKitStreamVideoSnapshotFromRequest, homeKitStreamVideoSnapshotToRequestVideo, homeKitStreamVideoSnapshotsEqual,
+  isMaterialLiveStreamReconfigure, resolveReconfigureMaterialityBaseline, unlinkOnFfmpegExitedSettled } from "./stream-reconfigure.ts";
 import type { HomeKitStreamVideoSnapshot } from "./stream-reconfigure.ts";
 import { appendLiveVideoEncodeToFfmpegArgs, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge, formatLiveEncodeDecisionLog,
   resolveCopyEscalationKeyframePrimingBuffer, resolveFmp4InitForLiveDeclaredCheck, resolveStartStreamEncodePlan, resolveStartStreamForceTranscodeDueToUserOption,
@@ -69,6 +69,10 @@ interface StreamSessionDiagnostics {
   homeKitVideo?: HomeKitStreamVideoSnapshot;
   liveEncodeRebuild?: StreamLiveEncodeRebuild;
   pendingReconfigure?: StartStreamRequest;
+  /** HomeKit target frozen for in-flight materiality while a replan awaits ready (immaterial acks must not move it). */
+  reconfigureMaterialityBaseline?: HomeKitStreamVideoSnapshot;
+  /** Integration harness: reason from the last handled RECONFIGURE materiality decision. */
+  lastReconfigureMaterialityReason?: string;
   outputWatchdog: StreamOutputWatchdog;
   path: string;
   profile: string;
@@ -1444,6 +1448,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         activeFfmpeg = respawned;
         sessionDiagnostics.activeVideoFfmpeg = { current: respawned };
       },
+      reconfigureAwaitingEncoderReady: () => Boolean(sessionDiagnostics.reconfigureAwaitingEncoderReady),
       sessionDiagnostics: sessionDiagnostics,
       sessionStartedAt: sessionStartedAt,
       sessionStillOwned: sessionStillOwned,
@@ -2027,6 +2032,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       await respawned.ready;
       owner.appliedHomeKitVideo = nextSnapshot;
       owner.reconfigureAwaitingEncoderReady = false;
+      this.enqueueNegotiatedFollowUpReconfigure(sessionId, owner, rebuild);
     } catch(error) {
 
       unlinkSessionAbort();
@@ -2035,14 +2041,54 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         this.log.error("Unable to replan the live view stream after HomeKit RECONFIGURE: %s.", formatErrorMessage(error));
       }
+
+      if(!owner.pendingReconfigure && !sessionSignal.aborted && this.ongoingSessions.has(sessionId)) {
+
+        this.logStreamSessionStopForOwner(sessionId, owner, "ffmpeg-exit", null);
+        this.controller.forceStopStreamingSession(sessionId);
+        this.stopStream(sessionId);
+      }
     } finally {
 
       handles.copyEscalationInFlightRef.current = false;
       owner.reconfigureAwaitingEncoderReady = false;
       owner.reconfigureInFlight = false;
+      owner.reconfigureMaterialityBaseline = undefined;
 
       this.drainPendingHomeKitReconfigure(sessionId);
     }
+  }
+
+  private enqueueNegotiatedFollowUpReconfigure(_sessionId: string, owner: StreamSessionDiagnostics, rebuild: StreamLiveEncodeRebuild): void {
+
+    const ackSnapshot = homeKitStreamVideoSnapshotFromRequest(rebuild.request.video);
+
+    if(!owner.appliedHomeKitVideo || homeKitStreamVideoSnapshotsEqual(owner.appliedHomeKitVideo, ackSnapshot)) {
+
+      return;
+    }
+
+    const encodePlan = this.resolveEncodePlanAfterHomeKitReconfigure(rebuild.request, rebuild);
+
+    if(!encodePlan) {
+
+      return;
+    }
+
+    const decision = isMaterialLiveStreamReconfigure({
+
+      next: ackSnapshot,
+      nextEncode: encodePlan.encodeDecision.mode,
+      previous: owner.appliedHomeKitVideo,
+      previousEncode: owner.videoCopy ? "copy" : "transcode"
+    });
+
+    if(!decision.material) {
+
+      return;
+    }
+
+    owner.pendingReconfigure = rebuild.request;
   }
 
   /** Integration harness assertions only (not a supported production API). */
@@ -2050,6 +2096,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     activeVideoFfmpegProcess: ProtectStreamingFfmpegProcess | undefined;
     appliedHomeKitVideo: HomeKitStreamVideoSnapshot | undefined;
     copyEscalationInFlight: boolean;
+    lastReconfigureMaterialityReason: string | undefined;
     ongoingVideoFfmpegProcess: ProtectStreamingFfmpegProcess | undefined;
     pendingReconfigure: StartStreamRequest | undefined;
     reconfigureAwaitingEncoderReady: boolean | undefined;
@@ -2070,6 +2117,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       activeVideoFfmpegProcess: owner.activeVideoFfmpeg?.current,
       appliedHomeKitVideo: owner.appliedHomeKitVideo,
       copyEscalationInFlight: Boolean(owner.reconfigureHandles?.copyEscalationInFlightRef.current),
+      lastReconfigureMaterialityReason: owner.lastReconfigureMaterialityReason,
       ongoingVideoFfmpegProcess: ongoing?.ffmpeg[0] as ProtectStreamingFfmpegProcess | undefined,
       pendingReconfigure: owner.pendingReconfigure,
       reconfigureAwaitingEncoderReady: owner.reconfigureAwaitingEncoderReady,
@@ -2119,17 +2167,47 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
               const baseline = resolveReconfigureMaterialityBaseline({
 
                 applied: owner.appliedHomeKitVideo,
+                inFlightMaterialityBaseline: owner.reconfigureMaterialityBaseline,
                 pendingRequestVideo: owner.pendingReconfigure?.video,
                 rebuildRequestVideo: rebuild.request.video,
                 reconfigureInFlight: Boolean(owner.reconfigureInFlight)
               });
+              const baselineVideo = ((): typeof rebuild.request.video => {
+
+                if(owner.reconfigureMaterialityBaseline) {
+
+                  const frozen = homeKitStreamVideoSnapshotToRequestVideo(owner.reconfigureMaterialityBaseline);
+
+                  return {
+
+                    ...rebuild.request.video,
+                    fps: frozen.fps,
+                    height: frozen.height,
+                    // eslint-disable-next-line camelcase -- HomeKit streaming request field name.
+                    max_bit_rate: frozen.max_bit_rate,
+                    width: frozen.width
+                  };
+                }
+
+                return owner.pendingReconfigure?.video ?? rebuild.request.video;
+              })();
+              const baselineEncodePlan = this.resolveEncodePlanAfterHomeKitReconfigure({ ...rebuild.request, video: baselineVideo }, rebuild);
+              const previousEncode = (owner.reconfigureInFlight || owner.pendingReconfigure || owner.reconfigureMaterialityBaseline) &&
+                baselineEncodePlan ?
+                baselineEncodePlan.encodeDecision.mode :
+                (owner.videoCopy ? "copy" : "transcode");
+              const materialityPrevious = (baseline && owner.reconfigureInFlight && owner.reconfigureMaterialityBaseline) ?
+                { ...baseline, maxBitRateKbps: rebuild.request.video.max_bit_rate } :
+                baseline;
               const decision = isMaterialLiveStreamReconfigure({
 
                 next: nextSnapshot,
                 nextEncode: encodePlan.encodeDecision.mode,
-                previous: baseline,
-                previousEncode: owner.videoCopy ? "copy" : "transcode"
+                previous: materialityPrevious,
+                previousEncode: previousEncode
               });
+
+              owner.lastReconfigureMaterialityReason = decision.reason;
 
               if(decision.material) {
 
@@ -2146,6 +2224,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
                   (Boolean(owner.reconfigureInFlight) || Boolean(owner.reconfigureAwaitingEncoderReady) ||
                   Boolean(handles?.copyEscalationInFlightRef.current)));
 
+                owner.reconfigureMaterialityBaseline = homeKitStreamVideoSnapshotFromRequest(updatedRequest.video);
                 rebuild.request = updatedRequest;
 
                 if(queueForInFlightReplan) {

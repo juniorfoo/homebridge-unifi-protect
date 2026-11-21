@@ -389,6 +389,14 @@ function ongoingSessionRegistered(ctx: HarnessContext, sessionId: string): boole
   return (ctx.delegate as unknown as { ongoingSessions: Map<string, unknown> }).ongoingSessions.has(sessionId);
 }
 
+function enableForcedTranscodeSession(ctx: HarnessContext, transcodeBitrateKbps = 900): void {
+
+  const defaultHasFeature = ctx.host.hasFeature.bind(ctx.host);
+
+  ctx.host.hasFeature = (option: string): boolean => (option === "Video.Transcode") ? true : defaultHasFeature(option);
+  ctx.host.hints = { ...ctx.host.hints, transcodeBitrate: transcodeBitrateKbps };
+}
+
 function syncLiveUfpChannelsForStubBuffer(host: TestCameraHost): void {
 
   const stub = stubChannel.channel;
@@ -2384,6 +2392,139 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     await stopActiveSession(ctx, startRequest.sessionID);
   });
 
+  test("replan replacement crash before ready with queued RECONFIGURE survives and drains", async () => {
+
+    const ctx = createHarness();
+    const replanHold: TestLiveStreamingFfmpegProcess[] = [];
+
+    enableReplaTimeshiftBufferDefaults(ctx);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      const deferReady = ctx.spawnedProcesses.length >= 1;
+      const proc = new TestLiveStreamingFfmpegProcess("live-" + String(ctx.spawnedProcesses.length), { deferReady: deferReady, signal: init.signal });
+
+      if(deferReady) {
+
+        replanHold.push(proc);
+      }
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(proc);
+
+      return proc as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+
+    startRequest.video.fps = 30;
+    await prepareAndStart(ctx, startRequest);
+
+    const reconf = (fps: number): Promise<void> => new Promise((resolve) => {
+
+      ctx.delegate.handleStreamRequest({ ...startRequest, type: StreamRequestTypes.RECONFIGURE, video: { ...startRequest.video, fps } }, () => resolve());
+    });
+
+    await reconf(15);
+    await waitFor(() => ctx.spawnedArgs.length === 2, "first replan");
+    await reconf(10);
+    assert.ok(ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID)?.pendingReconfigure);
+    replanHold[0]?.crash();
+    await waitFor(() => ctx.spawnedArgs.length >= 3, "drain after crash");
+    replanHold[1]?.releaseReady();
+    await waitFor(() => peekAppliedHomeKitFps(ctx, startRequest.sessionID) === 10, "queued target must apply");
+    assert.equal(ctx.forceStopSessionIds.length, 0);
+    await stopActiveSession(ctx, startRequest.sessionID);
+  });
+
+  test("replan replacement crash before ready without pending tears down once", async () => {
+
+    const ctx = createHarness();
+
+    enableReplaTimeshiftBufferDefaults(ctx);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      const deferReady = ctx.spawnedProcesses.length >= 1;
+      const proc = new TestLiveStreamingFfmpegProcess("live-" + String(ctx.spawnedProcesses.length), { deferReady: deferReady, signal: init.signal });
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(proc);
+
+      return proc as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+
+    startRequest.video.fps = 30;
+    await prepareAndStart(ctx, startRequest);
+    await new Promise<void>((resolve) => {
+
+      ctx.delegate.handleStreamRequest({ ...startRequest, type: StreamRequestTypes.RECONFIGURE, video: { ...startRequest.video, fps: 15 } },
+        () => resolve());
+    });
+    await waitFor(() => ctx.spawnedArgs.length === 2, "replan spawn");
+    ctx.spawnedProcesses[1]?.crash();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(ctx.forceStopSessionIds.length, 1);
+    assert.equal(ongoingSessionRegistered(ctx, startRequest.sessionID), false);
+  });
+
+  test("immaterial bitrate bumps during fps replan enqueue follow-up transcode replan after ready", async () => {
+
+    const ctx = createHarness();
+
+    enableForcedTranscodeSession(ctx, 900);
+    enableReplaTimeshiftBufferDefaults(ctx);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      const deferReady = ctx.spawnedProcesses.length >= 1;
+      const proc = new TestLiveStreamingFfmpegProcess("live-" + String(ctx.spawnedProcesses.length), { deferReady: deferReady, signal: init.signal });
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(proc);
+
+      return proc as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+
+    startRequest.video.fps = 30;
+    startRequest.video.max_bit_rate = 800;
+    await prepareAndStart(ctx, startRequest);
+    assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), false, "session must be transcode for bitrate materiality");
+
+    const reconf = (fps: number, br: number): Promise<void> => new Promise((resolve) => {
+
+      ctx.delegate.handleStreamRequest({
+
+        ...startRequest,
+        type: StreamRequestTypes.RECONFIGURE,
+        video: { ...startRequest.video, fps, max_bit_rate: br }
+      }, () => resolve());
+    });
+
+    await reconf(15, 800);
+    await waitFor(() => ctx.spawnedArgs.length === 2, "fps replan");
+    await reconf(15, 850);
+    assert.equal(ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID)?.lastReconfigureMaterialityReason, "immaterial");
+    await reconf(15, 900);
+    assert.equal(ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID)?.lastReconfigureMaterialityReason, "immaterial");
+    const fpsReplanProc = ctx.spawnedProcesses[1];
+
+    assert.ok(fpsReplanProc);
+    fpsReplanProc.releaseReady();
+    await waitFor(() => ctx.spawnedArgs.length === 3, "bitrate follow-up replan");
+    const bitrateFollowUpProc = ctx.spawnedProcesses[2];
+
+    assert.ok(bitrateFollowUpProc);
+    bitrateFollowUpProc.releaseReady();
+    await waitFor(() => ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID)?.appliedHomeKitVideo?.maxBitRateKbps === 900,
+      "accumulated immaterial acks must materialize after fps replan ready");
+    await stopActiveSession(ctx, startRequest.sessionID);
+  });
+
   test("replan replacement timeout before ready with queued RECONFIGURE keeps livestream feed alive", async () => {
 
     const ctx = createHarness();
@@ -2548,6 +2689,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     const ctx = createHarness();
     const replanHold: TestLiveStreamingFfmpegProcess[] = [];
 
+    enableForcedTranscodeSession(ctx, 900);
     enableReplaTimeshiftBufferDefaults(ctx);
 
     setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
@@ -2590,7 +2732,9 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     const peek = ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID);
 
-    assert.equal(peek?.pendingReconfigure?.video.max_bit_rate, 850, "queued pending must track latest immaterial bitrate");
+    assert.ok(peek);
+    assert.equal(peek.lastReconfigureMaterialityReason, "immaterial");
+    assert.equal(peek.pendingReconfigure?.video.max_bit_rate, 850, "queued pending must track latest immaterial bitrate");
     replanHold[0]?.releaseReady();
     await waitFor(() => ctx.spawnedArgs.length === 3, "drain spawn");
     await stopActiveSession(ctx, startRequest.sessionID);

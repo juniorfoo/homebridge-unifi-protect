@@ -80,17 +80,42 @@ export interface HomeKitReconfigureRequestVideo {
   width: number;
 }
 
-function homeKitStreamVideoSnapshotsEqual(a: HomeKitStreamVideoSnapshot, b: HomeKitStreamVideoSnapshot): boolean {
+export function homeKitStreamVideoSnapshotsEqual(a: HomeKitStreamVideoSnapshot, b: HomeKitStreamVideoSnapshot): boolean {
 
   return (a.fps === b.fps) && (a.height === b.height) && (a.width === b.width) && (a.h264Level === b.h264Level) &&
     (a.h264Profile === b.h264Profile) && (a.maxBitRateKbps === b.maxBitRateKbps);
 }
 
-/** While a replan is in flight, materiality compares against the latest negotiated target, not the last applied encode. */
-export function resolveReconfigureMaterialityBaseline(input: { applied: HomeKitStreamVideoSnapshot | undefined; pendingRequestVideo?: HomeKitReconfigureRequestVideo;
-  rebuildRequestVideo: HomeKitReconfigureRequestVideo; reconfigureInFlight: boolean; }): HomeKitStreamVideoSnapshot | undefined {
+export function homeKitStreamVideoSnapshotToRequestVideo(snapshot: HomeKitStreamVideoSnapshot): HomeKitReconfigureRequestVideo {
+
+  return {
+
+    fps: snapshot.fps,
+    height: snapshot.height,
+    level: snapshot.h264Level,
+    // eslint-disable-next-line camelcase -- HomeKit streaming request field name.
+    max_bit_rate: snapshot.maxBitRateKbps,
+    profile: snapshot.h264Profile,
+    width: snapshot.width
+  };
+}
+
+/** While a replan is in flight, materiality compares against the frozen in-flight target, not immaterial acks on rebuild.request. */
+export function resolveReconfigureMaterialityBaseline(input: {
+
+  applied: HomeKitStreamVideoSnapshot | undefined;
+  inFlightMaterialityBaseline?: HomeKitStreamVideoSnapshot;
+  pendingRequestVideo?: HomeKitReconfigureRequestVideo;
+  rebuildRequestVideo: HomeKitReconfigureRequestVideo;
+  reconfigureInFlight: boolean;
+}): HomeKitStreamVideoSnapshot | undefined {
 
   const rebuildSnapshot = homeKitStreamVideoSnapshotFromRequest(input.rebuildRequestVideo);
+
+  if(input.inFlightMaterialityBaseline) {
+
+    return input.inFlightMaterialityBaseline;
+  }
 
   if(input.pendingRequestVideo) {
 

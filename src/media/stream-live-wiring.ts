@@ -368,6 +368,7 @@ export interface LiveFfmpegCopyExitBridgeInput {
   getActiveVideoFfmpeg: () => ProtectStreamingFfmpegProcess | undefined;
   onEscalationSettled?: () => void;
   onRespawned: (respawned: ProtectStreamingFfmpegProcess) => void;
+  reconfigureAwaitingEncoderReady: () => boolean;
   sessionDiagnostics: { escalatedFromCopy: boolean; segmentsFed: number; videoCopy: boolean };
   sessionStartedAt: number;
   sessionStillOwned: () => boolean;
@@ -405,6 +406,12 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
     }
 
     const endBridgeForActiveEncoder = (): void => {
+
+      if(input.reconfigureAwaitingEncoderReady() && exitingIsActiveEncoder &&
+        !isHbpuAbortReason(exitedProcess.signal.reason, "replaced")) {
+
+        return;
+      }
 
       const teardownTarget = input.getActiveVideoFfmpeg() ?? exitedProcess;
 
