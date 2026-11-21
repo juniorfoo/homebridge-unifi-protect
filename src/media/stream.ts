@@ -79,6 +79,8 @@ interface StreamSessionDiagnostics {
   reconfigureHandles?: StreamReconfigureHandles;
   reconfigureAwaitingEncoderReady?: boolean;
   reconfigureInFlight?: boolean;
+  /** Set when a replan copy replacement exits into transcode escalation before `ready`. */
+  replanFailureEscalationInFlight?: boolean;
   segmentsFed: number;
   sessionStartedAt: number;
   stopLogged: boolean;
@@ -1440,8 +1442,17 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         if(sessionStillOwned()) {
 
+          sessionDiagnostics.replanFailureEscalationInFlight = false;
           this.drainPendingHomeKitReconfigure(request.sessionID);
         }
+      },
+      onReplanFailureEscalationFinished: () => {
+
+        sessionDiagnostics.replanFailureEscalationInFlight = false;
+      },
+      onReplanFailureEscalationStarted: () => {
+
+        sessionDiagnostics.replanFailureEscalationInFlight = true;
       },
       onRespawned: (respawned) => {
 
@@ -1870,12 +1881,27 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     }
 
     const nextSnapshot = homeKitStreamVideoSnapshotFromRequest(pending.video);
+    const activeEncoder = owner.activeVideoFfmpeg?.current;
+    const encoderUnavailable = !activeEncoder || activeEncoder.signal.aborted;
+
+    if(encoderUnavailable) {
+
+      pendingRebuild.request = pending;
+      void this.replanLiveStreamForHomeKitReconfigure(sessionId, pending, encodePlan, "encoder-aborted");
+
+      return;
+    }
+
+    const baselineEncodePlan = this.resolveEncodePlanAfterHomeKitReconfigure({ ...pendingRebuild.request, video: pending.video }, pendingRebuild);
+    const previousEncode = baselineEncodePlan ?
+      baselineEncodePlan.encodeDecision.mode :
+      (owner.videoCopy ? "copy" : "transcode");
     const decision = isMaterialLiveStreamReconfigure({
 
       next: nextSnapshot,
       nextEncode: encodePlan.encodeDecision.mode,
       previous: owner.appliedHomeKitVideo,
-      previousEncode: owner.videoCopy ? "copy" : "transcode"
+      previousEncode: previousEncode
     });
 
     if(decision.material) {
@@ -2042,7 +2068,10 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
         this.log.error("Unable to replan the live view stream after HomeKit RECONFIGURE: %s.", formatErrorMessage(error));
       }
 
-      if(!owner.pendingReconfigure && !sessionSignal.aborted && this.ongoingSessions.has(sessionId)) {
+      const copyReplacementFailedBeforeReady = Boolean(owner.reconfigureAwaitingEncoderReady) && owner.videoCopy;
+
+      if(!owner.pendingReconfigure && !sessionSignal.aborted && this.ongoingSessions.has(sessionId) &&
+        !owner.replanFailureEscalationInFlight && !copyReplacementFailedBeforeReady) {
 
         this.logStreamSessionStopForOwner(sessionId, owner, "ffmpeg-exit", null);
         this.controller.forceStopStreamingSession(sessionId);
@@ -2050,12 +2079,21 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       }
     } finally {
 
-      handles.copyEscalationInFlightRef.current = false;
+      const deferPendingDrain = Boolean(owner.replanFailureEscalationInFlight);
+
+      if(!deferPendingDrain) {
+
+        handles.copyEscalationInFlightRef.current = false;
+      }
+
       owner.reconfigureAwaitingEncoderReady = false;
       owner.reconfigureInFlight = false;
       owner.reconfigureMaterialityBaseline = undefined;
 
-      this.drainPendingHomeKitReconfigure(sessionId);
+      if(!deferPendingDrain) {
+
+        this.drainPendingHomeKitReconfigure(sessionId);
+      }
     }
   }
 

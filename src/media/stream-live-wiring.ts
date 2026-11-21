@@ -367,6 +367,8 @@ export interface LiveFfmpegCopyExitBridgeInput {
     tsbResume: CopyEscalationTsbResume | undefined) => Promise<ProtectStreamingFfmpegProcess | null>;
   getActiveVideoFfmpeg: () => ProtectStreamingFfmpegProcess | undefined;
   onEscalationSettled?: () => void;
+  onReplanFailureEscalationFinished?: (respawned: boolean) => void;
+  onReplanFailureEscalationStarted?: () => void;
   onRespawned: (respawned: ProtectStreamingFfmpegProcess) => void;
   reconfigureAwaitingEncoderReady: () => boolean;
   sessionDiagnostics: { escalatedFromCopy: boolean; segmentsFed: number; videoCopy: boolean };
@@ -422,6 +424,11 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
 
       input.copyEscalationInFlightRef.current = true;
 
+      if(input.reconfigureAwaitingEncoderReady()) {
+
+        input.onReplanFailureEscalationStarted?.();
+      }
+
       const tsbResume = input.createTsbResume();
 
       void input.escalateCopyFailure(exitedProcess, (respawned) => {
@@ -431,6 +438,7 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
       }, tsbResume).then((respawned) => {
 
         input.copyEscalationInFlightRef.current = false;
+        input.onReplanFailureEscalationFinished?.(Boolean(respawned));
 
         if(!respawned && input.sessionStillOwned()) {
 
@@ -444,6 +452,7 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
         if(input.sessionStillOwned()) {
 
           input.copyEscalationInFlightRef.current = false;
+          input.onReplanFailureEscalationFinished?.(false);
           endBridgeForActiveEncoder();
           input.onEscalationSettled?.();
         }

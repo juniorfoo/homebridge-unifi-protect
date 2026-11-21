@@ -2441,6 +2441,7 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
 
     const ctx = createHarness();
 
+    enableForcedTranscodeSession(ctx, 900);
     enableReplaTimeshiftBufferDefaults(ctx);
 
     setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
@@ -2468,6 +2469,185 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     await new Promise((resolve) => setTimeout(resolve, 400));
     assert.equal(ctx.forceStopSessionIds.length, 1);
     assert.equal(ongoingSessionRegistered(ctx, startRequest.sessionID), false);
+  });
+
+  const exerciseCopyReplanReplacementFailure = async (failReplacement: (proc: TestLiveStreamingFfmpegProcess) => void): Promise<HarnessContext & {
+    startRequest: StartStreamRequest;
+  }> => {
+
+    const ctx = createHarness();
+    const copyFailureLine = VIDEO_COPY_FAILURE_PATTERNS[1] ?? "Error initializing output stream";
+
+    enableReplaTimeshiftBufferDefaults(ctx);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      const isReplanCopy = ctx.spawnedProcesses.length >= 1;
+      const deferReady = isReplanCopy;
+      const replacement = new TestLiveStreamingFfmpegProcess("copy-replan-" + String(ctx.spawnedProcesses.length), {
+
+        deferReady: deferReady,
+        signal: init.signal,
+        stderrLog: isReplanCopy ? [copyFailureLine] : []
+      });
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(replacement);
+
+      return replacement as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+
+    await prepareAndStart(ctx, startRequest);
+    assert.equal(ctx.spawnedProcesses.length, 1);
+    assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), true, "start must be copy");
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({
+
+        ...startRequest,
+        type: StreamRequestTypes.RECONFIGURE,
+        video: { ...startRequest.video, level: H264Level.LEVEL4_0 } as typeof startRequest.video
+      }, (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    await waitFor(() => ctx.spawnedProcesses.length === 2, "copy replan replacement");
+    assert.equal(argsUseVideoCopy(ctx.spawnedArgs[0] ?? []), true, "start must be copy");
+    assert.equal(argsUseVideoCopy(ctx.spawnedArgs[1] ?? []), true, "replan replacement must be copy");
+    const replanCopy = ctx.spawnedProcesses[1];
+
+    assert.ok(replanCopy instanceof TestLiveStreamingFfmpegProcess);
+    failReplacement(replanCopy);
+
+    return { ...ctx, startRequest: startRequest };
+  };
+
+  test("copy replan replacement crash before ready escalates to transcode without force-stop", async () => {
+
+    const wrapped = await exerciseCopyReplanReplacementFailure((proc) => proc.crash());
+
+    await waitFor(() => wrapped.spawnedProcesses.length >= 3, "transcode escalation after copy replan failure", 25000);
+    const transcoder = wrapped.spawnedProcesses[2];
+
+    assert.ok(transcoder instanceof TestLiveStreamingFfmpegProcess);
+    transcoder.releaseReady();
+    await waitFor(() => ongoingSessionRegistered(wrapped, wrapped.startRequest.sessionID), "session stays registered");
+    assert.equal(wrapped.forceStopSessionIds.length, 0);
+    assert.equal(argsUseVideoCopy(wrapped.spawnedArgs[2] ?? []), false);
+    assert.equal(wrapped.delegate.peekSessionDiagnosticsForHarness(wrapped.startRequest.sessionID)?.activeVideoFfmpegProcess, transcoder);
+
+    await stopActiveSession(wrapped, wrapped.startRequest.sessionID);
+  });
+
+  test("copy replan replacement rejectReadyBeforeExit escalates to transcode without force-stop", async () => {
+
+    const wrapped = await exerciseCopyReplanReplacementFailure((proc) => proc.rejectReadyBeforeExit());
+
+    await waitFor(() => wrapped.spawnedProcesses.length >= 3, "transcode escalation after copy replan failure", 25000);
+    const transcoder = wrapped.spawnedProcesses[2];
+
+    assert.ok(transcoder instanceof TestLiveStreamingFfmpegProcess);
+    transcoder.releaseReady();
+    await waitFor(() => ongoingSessionRegistered(wrapped, wrapped.startRequest.sessionID), "session stays registered");
+    assert.equal(wrapped.forceStopSessionIds.length, 0);
+    assert.equal(argsUseVideoCopy(wrapped.spawnedArgs[2] ?? []), false);
+
+    await stopActiveSession(wrapped, wrapped.startRequest.sessionID);
+  });
+
+  test("copy replan replacement failure with failed transcode escalation tears down once", async () => {
+
+    const ctx = createHarness();
+    const copyFailureLine = VIDEO_COPY_FAILURE_PATTERNS[1] ?? "Error initializing output stream";
+
+    enableReplaTimeshiftBufferDefaults(ctx);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      const deferReady = ctx.spawnedProcesses.length >= 1;
+      const replacement = new TestLiveStreamingFfmpegProcess("copy-replan-" + String(ctx.spawnedProcesses.length), {
+
+        deferReady: deferReady,
+        signal: init.signal,
+        stderrLog: ctx.spawnedProcesses.length === 1 ? [copyFailureLine] : []
+      });
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(replacement);
+
+      return replacement as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+
+    await prepareAndStart(ctx, startRequest);
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({
+
+        ...startRequest,
+        type: StreamRequestTypes.RECONFIGURE,
+        video: { ...startRequest.video, level: H264Level.LEVEL4_0 } as typeof startRequest.video
+      }, (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    await waitFor(() => ctx.spawnedProcesses.length === 2, "copy replan replacement");
+    ctx.spawnedProcesses[1]?.crash();
+    await waitFor(() => ctx.spawnedProcesses.length >= 3, "transcode escalation spawn");
+    ctx.spawnedProcesses[2]?.crash();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(ctx.forceStopSessionIds.length, 1);
+    assert.equal(ongoingSessionRegistered(ctx, startRequest.sessionID), false);
+  });
+
+  test("pending restore after failed replan replans when queued target matches applied", async () => {
+
+    const ctx = createHarness();
+    const replanHold: TestLiveStreamingFfmpegProcess[] = [];
+
+    enableForcedTranscodeSession(ctx, 900);
+    enableReplaTimeshiftBufferDefaults(ctx);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      const deferReady = ctx.spawnedProcesses.length >= 1;
+      const proc = new TestLiveStreamingFfmpegProcess("live-" + String(ctx.spawnedProcesses.length), { deferReady: deferReady, signal: init.signal });
+
+      if(deferReady) {
+
+        replanHold.push(proc);
+      }
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(proc);
+
+      return proc as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+
+    startRequest.video.fps = 30;
+    await prepareAndStart(ctx, startRequest);
+
+    const reconf = (fps: number): Promise<void> => new Promise((resolve) => {
+
+      ctx.delegate.handleStreamRequest({ ...startRequest, type: StreamRequestTypes.RECONFIGURE, video: { ...startRequest.video, fps } }, () => resolve());
+    });
+
+    await reconf(15);
+    await waitFor(() => ctx.spawnedArgs.length === 2, "first replan");
+    await reconf(30);
+    assert.ok(ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID)?.pendingReconfigure);
+    replanHold[0]?.crash();
+    await waitFor(() => ctx.spawnedArgs.length >= 3, "pending restore must replan after aborted encoder");
+    replanHold[1]?.releaseReady();
+    await waitFor(() => peekAppliedHomeKitFps(ctx, startRequest.sessionID) === 30, "restore target must apply");
+    assert.equal(ctx.forceStopSessionIds.length, 0);
+
+    await stopActiveSession(ctx, startRequest.sessionID);
   });
 
   test("immaterial bitrate bumps during fps replan enqueue follow-up transcode replan after ready", async () => {
