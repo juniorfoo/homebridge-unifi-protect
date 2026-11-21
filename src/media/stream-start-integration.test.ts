@@ -2374,6 +2374,83 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     await stopActiveSession(ctx, startRequest.sessionID);
   });
 
+  test("material RECONFIGURE replacement spawn throw before ready answers START once with error", async () => {
+
+    const ctx = createHarness();
+    const streamSub = makeControllableLivestreamDouble({ deferEstablishment: true, initSegment: MATCHING_INIT_LIVESTREAM });
+    const spawnThrow = new Error("replacement spawn failed");
+    let spawnIndex = 0;
+
+    ctx.host.livestreamSubscriptions = [streamSub];
+    enableReplaTimeshiftBufferDefaults(ctx);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      spawnIndex += 1;
+
+      if(spawnIndex >= 2) {
+
+        throw spawnThrow;
+      }
+
+      const proc = new TestLiveStreamingFfmpegProcess("live-" + String(spawnIndex), { deferReady: true, signal: init.signal });
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(proc);
+
+      return proc as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+    const liveLead = makeNonKeyframeFragment();
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.prepareStream(makePrepareRequest(), (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    let startCallbacks = 0;
+    const startSettled = new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({ ...startRequest, type: StreamRequestTypes.START }, (error) => {
+
+        startCallbacks += 1;
+
+        if(error instanceof Error) {
+
+          reject(error);
+
+          return;
+        }
+
+        resolve();
+      });
+    });
+
+    streamSub.push({ data: liveLead.data, mdat: liveLead.mdat, moof: liveLead.moof, type: "media" });
+    await waitFor(() => ctx.spawnedProcesses.length >= 1, "initial encoder spawn");
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({
+
+        ...startRequest,
+        type: StreamRequestTypes.RECONFIGURE,
+        video: { ...startRequest.video, fps: 10 }
+      }, (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    await assert.rejects(startSettled, /replacement spawn failed/);
+    assert.equal(startCallbacks, 1, "HomeKit START must answer exactly once when replan replacement construction throws");
+
+    streamSub.releaseEstablishment();
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({ sessionID: startRequest.sessionID, type: StreamRequestTypes.STOP },
+        (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+  });
+
   test("RECONFIGURE restore fps while replan is pending queues a follow-up replan", async () => {
 
     const ctx = createHarness();
