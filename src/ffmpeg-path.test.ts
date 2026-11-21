@@ -161,3 +161,4 @@ describe("ffmpeg path resolution", () => {
     assert.equal(validateConcreteFfmpegPath(resolveFfmpegExecutablePath(relative, { cwd: tempDirectory })), undefined);
   });
 });
+
