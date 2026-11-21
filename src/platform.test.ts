@@ -21,6 +21,7 @@
  *
  * The restore sweep's rows hand the platform an accessory the way Homebridge hands one back from its cache, and read and write it through HAP's own paths.
  */
+/* eslint-disable sort-imports -- FFmpeg-path launch rows extend the import block with node:fs, node:os, node:path, and ffmpeg-for-homebridge. */
 import type { API, Logging } from "homebridge";
 import { APIEvent, FeatureOptions, FfmpegCodecs, HAPStatus, Perms, createMqttClient, parseFfmpegVersionParts } from "homebridge-plugin-utils";
 import type { CapturingLog, TestHomebridgeApi, TestLogEntry } from "homebridge-plugin-utils/testing";
@@ -31,13 +32,18 @@ import { TestMqttClientFactory, assertNoUnhandledRejections, capturingLog, expec
 import { describe, test } from "node:test";
 import { featureOptionCategories, featureOptions } from "./options.ts";
 import { makeConnectedClient, makeNvrConfig } from "./nvr/testing.helpers.ts";
+import { FFMPEG_RESOLVED_PATH_LOG } from "./ffmpeg-path.ts";
 import { ProtectClient } from "unifi-protect";
 import type { ProtectNvr } from "./nvr/nvr.ts";
 import { ProtectPlatform } from "./platform.ts";
 import type { ProtectPlatformConfig } from "./types.ts";
 import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import ffmpegBundledPath from "ffmpeg-for-homebridge";
 
 // The controller and camera these rows resolve against.
 const CONTROLLER = "AABBCCDDEEFF";
@@ -753,5 +759,159 @@ describe("the restore sweep", () => {
 
     await assert.rejects(triggerGet(on), hapStatus(HAPStatus.SERVICE_COMMUNICATION_FAILURE), "the restored accessory refuses");
     assert.ok(platform.accessories.includes(accessory), "and stays registered");
+  });
+});
+
+function readBundledFfmpegPath(): string {
+
+  if(typeof ffmpegBundledPath !== "string") {
+
+    throw new Error("ffmpeg-for-homebridge did not publish a bundled path");
+  }
+
+  return ffmpegBundledPath;
+}
+
+describe("platform FFmpeg path validation at launch", () => {
+
+  const BUNDLED_FFMPEG_PATH = readBundledFfmpegPath();
+  const LAUNCH_CREDENTIALS = { address: "10.0.0.1", password: "password", username: "username" };
+
+  function answerProbe(t: TestContext): void {
+
+    const ffmpegVersionParts = parseFfmpegVersionParts("8.0");
+    const state = { codecs: {}, cpuGeneration: 0, ffmpegExec: "ffmpeg", ffmpegVersion: "8.0", ffmpegVersionParts, gpuMem: 0, hostSystem: "macOS.Apple",
+      hwAccels: new Set<string>(), verbose: false };
+
+    t.mock.method(FfmpegCodecs, "probe", async (): Promise<FfmpegCodecs> => FfmpegCodecs.fromState(state));
+  }
+
+  function buildLaunchPlatform(options: string[] = [], videoProcessor?: string):
+  { api: TestHomebridgeApi; log: CapturingLog; platform: ProtectPlatform } {
+
+    const log = capturingLog();
+    const homebridgeLog = Object.assign((message: string, ...params: unknown[]): void => log.info(message, ...params), { debug: log.debug, error: log.error,
+      info: log.info, log: log.info, success: log.info, warn: log.warn });
+    const config: ProtectPlatformConfig = { controllers: [LAUNCH_CREDENTIALS], name: "UniFi Protect", options, platform: "UniFi Protect",
+      ...(videoProcessor === undefined ? {} : { videoProcessor }) };
+    const api = makeTestApi();
+
+    return { api, log, platform: new ProtectPlatform(homebridgeLog as unknown as Logging, config, api as unknown as API) };
+  }
+
+  function parkLogins(t: TestContext, api: TestHomebridgeApi, platform: ProtectPlatform): void {
+
+    t.after(() => void api.emit(APIEvent.SHUTDOWN));
+
+    for(const controller of configuredControllers(platform)) {
+
+      controller.login = async (): Promise<void> => {
+
+        await once(controller.signal, "abort");
+      };
+    }
+  }
+
+  function hasResolvedPathLog(entries: readonly TestLogEntry[], resolved: string): boolean {
+
+    return entries.some((entry) => (entry.level === "info") && (entry.message === FFMPEG_RESOLVED_PATH_LOG) && (entry.params[0] === resolved));
+  }
+
+  test("a non-executable absolute path fails before the probe", async (t) => {
+
+    const tempDirectory = mkdtempSync(join(tmpdir(), "hbup-platform-nox-"));
+    const nonExecutable = join(tempDirectory, "ffmpeg");
+
+    writeFileSync(nonExecutable, "#!/bin/sh\n", { mode: 0o644 });
+
+    const probeMock = t.mock.method(FfmpegCodecs, "probe", async (): Promise<FfmpegCodecs | null> => null);
+    const { api, log } = buildLaunchPlatform([], nonExecutable);
+
+    api.emit(APIEvent.DID_FINISH_LAUNCHING);
+
+    await settle();
+
+    assert.equal(probeMock.mock.callCount(), 0);
+    assert.ok(log.entries.some((entry) => (entry.level === "error") && entry.message.includes("not executable")));
+  });
+
+  test("a missing absolute path fails before the probe with a clear error", async (t) => {
+
+    const missing = join(tmpdir(), "hbup-platform-missing-" + String(Date.now()));
+    const probeMock = t.mock.method(FfmpegCodecs, "probe", async (): Promise<FfmpegCodecs | null> => null);
+    const { api, log, platform } = buildLaunchPlatform([], missing);
+
+    assert.equal(platform.config.videoProcessor, missing);
+
+    api.emit(APIEvent.DID_FINISH_LAUNCHING);
+
+    await settle();
+
+    assert.equal(probeMock.mock.callCount(), 0, "a missing concrete path stops before the probe");
+    assert.ok(log.entries.some((entry) => (entry.level === "error") && entry.message.includes("does not exist")), "the error names the missing path");
+  });
+
+  test("a successful probe logs the resolved absolute path once", async (t) => {
+
+    answerProbe(t);
+
+    const resolved = BUNDLED_FFMPEG_PATH;
+    const { api, log, platform } = buildLaunchPlatform([], resolved);
+
+    parkLogins(t, api, platform);
+
+    api.emit(APIEvent.DID_FINISH_LAUNCHING);
+
+    await settleUntil(() => hasResolvedPathLog(log.entries, resolved), { description: "the resolved FFmpeg path log" });
+
+    const pathLines = log.entries.filter((entry) => (entry.level === "info") && (entry.message === FFMPEG_RESOLVED_PATH_LOG));
+
+    assert.equal(pathLines.length, 1, "the resolved path is logged once");
+    assert.deepEqual(pathLines[0]?.params, [resolved]);
+  });
+
+  test("an empty Video.FFmpeg.Path falls through to the bundled default and logs that path", async (t) => {
+
+    answerProbe(t);
+
+    const { api, log, platform } = buildLaunchPlatform([]);
+
+    assert.equal(platform.config.videoProcessor, BUNDLED_FFMPEG_PATH);
+
+    parkLogins(t, api, platform);
+
+    api.emit(APIEvent.DID_FINISH_LAUNCHING);
+
+    await settleUntil(() => hasResolvedPathLog(log.entries, BUNDLED_FFMPEG_PATH), { description: "the bundled FFmpeg path log" });
+
+    assert.ok(hasResolvedPathLog(log.entries, BUNDLED_FFMPEG_PATH));
+  });
+
+  test("Video.FFmpeg.Path overrides the legacy videoProcessor value", async (t) => {
+
+    answerProbe(t);
+
+    const tempDirectory = mkdtempSync(join(tmpdir(), "hbup-platform-opt-"));
+    const configured = join(tempDirectory, "ffmpeg");
+
+    writeFileSync(configured, "#!/bin/sh\n", { mode: 0o755 });
+
+    const log = capturingLog();
+    const homebridgeLog = Object.assign((message: string, ...params: unknown[]): void => log.info(message, ...params), { debug: log.debug, error: log.error,
+      info: log.info, log: log.info, success: log.info, warn: log.warn });
+    const config: ProtectPlatformConfig = { controllers: [LAUNCH_CREDENTIALS], name: "UniFi Protect", options: ["Enable.Video.FFmpeg.Path=" + configured],
+      platform: "UniFi Protect", videoProcessor: join(tempDirectory, "legacy") };
+    const api = makeTestApi();
+    const platform = new ProtectPlatform(homebridgeLog as unknown as Logging, config, api as unknown as API);
+
+    assert.equal(platform.config.videoProcessor, configured);
+
+    parkLogins(t, api, platform);
+
+    api.emit(APIEvent.DID_FINISH_LAUNCHING);
+
+    await settleUntil(() => hasResolvedPathLog(log.entries, configured), { description: "the feature-option FFmpeg path log" });
+
+    assert.ok(hasResolvedPathLog(log.entries, configured));
   });
 });
