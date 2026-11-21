@@ -2543,4 +2543,57 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     });
   }
 
+  test("immaterial bitrate during queued pending replan refreshes pendingReconfigure for drain", async () => {
+
+    const ctx = createHarness();
+    const replanHold: TestLiveStreamingFfmpegProcess[] = [];
+
+    enableReplaTimeshiftBufferDefaults(ctx);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      const deferReady = ctx.spawnedProcesses.length >= 1;
+      const proc = new TestLiveStreamingFfmpegProcess("live-" + String(ctx.spawnedProcesses.length), { deferReady: deferReady, signal: init.signal });
+
+      if(deferReady) {
+
+        replanHold.push(proc);
+      }
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(proc);
+
+      return proc as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+
+    startRequest.video.fps = 30;
+    startRequest.video.max_bit_rate = 800;
+    await prepareAndStart(ctx, startRequest);
+
+    const reconf = (fps: number, br: number): Promise<void> => new Promise((resolve) => {
+
+      ctx.delegate.handleStreamRequest({
+
+        ...startRequest,
+        type: StreamRequestTypes.RECONFIGURE,
+        video: { ...startRequest.video, fps, max_bit_rate: br }
+      }, () => resolve());
+    });
+
+    await reconf(15, 800);
+    await waitFor(() => ctx.spawnedArgs.length === 2, "first replan");
+    await reconf(10, 800);
+    assert.equal(ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID)?.pendingReconfigure?.video.fps, 10);
+    await reconf(10, 850);
+
+    const peek = ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID);
+
+    assert.equal(peek?.pendingReconfigure?.video.max_bit_rate, 850, "queued pending must track latest immaterial bitrate");
+    replanHold[0]?.releaseReady();
+    await waitFor(() => ctx.spawnedArgs.length === 3, "drain spawn");
+    await stopActiveSession(ctx, startRequest.sessionID);
+  });
+
 });

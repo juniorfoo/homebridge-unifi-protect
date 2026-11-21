@@ -2165,6 +2165,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
               } else {
 
                 rebuild.request = updatedRequest;
+
+                owner.pendingReconfigure &&= updatedRequest;
               }
             }
           }
