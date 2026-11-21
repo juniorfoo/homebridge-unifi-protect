@@ -2377,10 +2377,11 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     streamSub.push({ data: liveLead.data, mdat: liveLead.mdat, moof: liveLead.moof, type: "media" });
     await startPromise;
     await waitFor(() => ctx.spawnedProcesses.length >= 2, "copy escalation spawn");
-    assert.ok(escalationSlow instanceof TestLiveStreamingFfmpegProcess, "escalation replacement must exist");
 
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-call -- crash() is defined on the spawn-free test double
-    escalationSlow.crash();
+    const escalationReplacement = escalationSlow ?? ctx.spawnedProcesses[1];
+
+    assert.ok(escalationReplacement instanceof TestLiveStreamingFfmpegProcess, "escalation replacement must exist");
+    escalationReplacement.crash();
     await new Promise((resolve) => setTimeout(resolve, 500));
 
     assert.equal(ongoingSessionRegistered(ctx, startRequest.sessionID), false,
