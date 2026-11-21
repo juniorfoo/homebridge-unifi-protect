@@ -203,17 +203,28 @@ def self_test_loss(config: dict, allow_path: Path) -> int:
     """Verify the guard fails when a known upstream line is missing from head."""
     global _GIT_SHOW_OVERRIDE
     probe = "src/media/stream-encode-policy.ts"
+    old_upstream_lines = git_show(config["old_upstream"], probe)
     upstream_lines = git_show(config["new_upstream"], probe)
     if not upstream_lines:
         print("self-test-loss: skip (no upstream snapshot for stream-encode-policy.ts)", file=sys.stderr)
         return 0
-    target_idx = next((i for i, line in enumerate(upstream_lines) if line.strip()), None)
+    base_c = collections.Counter(line.strip() for line in old_upstream_lines)
+    up_c = collections.Counter(line.strip() for line in upstream_lines)
+    new_in_release = [line for line in (up_c - base_c) if line]
+    if not new_in_release:
+        print("self-test-loss: skip (no new lines in encode policy between upstream tags)", file=sys.stderr)
+        return 0
+    target_stripped = new_in_release[0]
+    target_idx = next(
+        (i for i, line in enumerate(upstream_lines) if line.strip() == target_stripped),
+        None,
+    )
     if target_idx is None:
-        print("self-test-loss: skip (empty upstream file)", file=sys.stderr)
+        print("self-test-loss: skip (could not locate new upstream line)", file=sys.stderr)
         return 0
     lineno = target_idx + 1
     head_lines = git_show(config["head"], probe)
-    planted = [line for i, line in enumerate(head_lines) if i != target_idx]
+    planted = [line for line in head_lines if line.strip() != target_stripped]
 
     _GIT_SHOW_OVERRIDE = {(config["head"], probe): planted}
     code = run_check(config, allow_path)

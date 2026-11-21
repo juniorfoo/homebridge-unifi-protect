@@ -10,6 +10,7 @@ export type ProtectStreamingFfmpegProcess = StreamingProcess & {
   abort?: (reason?: unknown) => void;
   stderrLog?: readonly string[];
 };
+
 import { exhaustiveGuard } from "../types.ts";
 
 // Known-benign FFmpeg error patterns unique to the UniFi Protect livestream API path. These occasional inconsistencies in the controller's livestream output are not

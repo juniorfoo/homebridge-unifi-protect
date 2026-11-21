@@ -8,8 +8,10 @@ import type { BackpressureWriter, Clock, HomebridgePluginLogging, Mp4FrameFeed, 
 import { BackpressureWriter as BackpressureWriterImpl, HbpuAbortError, Mp4FrameFeed as Mp4FrameFeedImpl } from "homebridge-plugin-utils";
 import type { LivestreamSubscription } from "./livestream.ts";
 import type { ProtectStreamingFfmpegProcess } from "./stream-ffmpeg-process.ts";
+
 // Re-export for tests and fork modules that only need stdin from a replacement process.
 export type LiveFfmpegStdinSource = StreamingProcess;
+
 import { logLivestreamIterationError } from "./livestream.ts";
 import type { LivePrimeMediaFloor } from "./fmp4-fragment-identity.ts";
 import { applyPrimeMediaFloorClearAfterComparableAheadLiveWrite, COPY_ESCALATION_PRIME_FLOOR_MAX_WRITTEN_LIVE_MOOF_CHECKS,
@@ -56,6 +58,7 @@ export function createLiveFrameFeed(writer: BackpressureWriter, clock: Clock, lo
 /** Production TSB segment writer rail (rotation uses rotateBackpressureWriterForCopyEscalation). */
 export function createTsbSegmentWriterRail(input: { clock: Clock; feedState?: LiveTsbFeedState; getStdin: () => Writable; log: HomebridgePluginLogging;
   onRotateSegmentWriter?: (event: { poisoned: BackpressureWriter; replacement: BackpressureWriter }) => void; signal: AbortSignal;
+  // eslint-disable-next-line @typescript-eslint/no-generated-empty-object-type -- HBPU BackpressureWriter opts are only clock/signal here
   writerInit?: Omit<ConstructorParameters<typeof BackpressureWriterImpl>[1], "clock" | "signal">; }): TsbSegmentWriterRail & { feedState: LiveTsbFeedState } {
 
   const feedState = input.feedState ?? { allowTimeshiftPrefix: true, headerWritten: false, primeMediaFloor: null };
@@ -102,7 +105,7 @@ export function createTsbSegmentWriterRail(input: { clock: Clock; feedState?: Li
  * duration after the one before it.
  */
 export async function consumeLiveStreamSegments(getFfmpeg: () => ProtectStreamingFfmpegProcess, feedState: LiveTsbFeedState,
-  subscription: LivestreamSubscription, feed: Mp4FrameFeed, tsBuffer: Nullable<Buffer>, log: HomebridgePluginLogging,
+  subscription: LivestreamSubscription, getFeed: () => Mp4FrameFeed, tsBuffer: Nullable<Buffer>, log: HomebridgePluginLogging,
   onMediaSegment?: () => void): Promise<void> {
 
   try {
@@ -150,7 +153,7 @@ export async function consumeLiveStreamSegments(getFfmpeg: () => ProtectStreamin
           feedState.allowTimeshiftPrefix = false;
         }
 
-        void feed.writeHeader(header).catch((error: unknown) => log.debug("Live stream backpressure write dropped.", { error }));
+        void getFeed().writeHeader(header).catch((error: unknown) => log.debug("Live stream backpressure write dropped.", { error }));
       }
 
       onMediaSegment?.();
@@ -184,7 +187,7 @@ export async function consumeLiveStreamSegments(getFfmpeg: () => ProtectStreamin
       // Feed the media fragment as its frames, without awaiting it. The feed's write returns a typed-rejecting Promise; the .catch (debug) swallows
       // BackpressureClosedStreamError / signal.reason on teardown (the common case when FFmpeg exits mid-write), when the frames of a fragment still waiting their turn
       // are dropped. No highWaterMark (unbounded) and no segment-count accounting, unlike HKSV.
-      void feed.writeFragment(segment.data).catch((error: unknown) => log.debug("Live stream backpressure write dropped.", { error }));
+      void getFeed().writeFragment(segment.data).catch((error: unknown) => log.debug("Live stream backpressure write dropped.", { error }));
     }
   } catch(error) {
 

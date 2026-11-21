@@ -18,8 +18,8 @@ import type { LivestreamDescription, LivestreamInit, LivestreamSubscriptionState
 import type { LivestreamHostOptions, ProtectCameraHost } from "./camera-host.ts";
 import { SAMPLE_FLAG_NON_SYNC, onAbort, splitMoofMdat } from "homebridge-plugin-utils";
 import type { TestClock, TestExecProcessFactory, TestLogEntry, TestStreamingProcess, TestStreamingProcessFactory } from "homebridge-plugin-utils/testing";
-import { TestExecProcess, TestStateStore, makeProtectState, makeTestAccessory } from "../testing.helpers.ts";
-import { makeBox, makeContainer, makeTrunBox, settle } from "homebridge-plugin-utils/testing";
+import { TestExecProcess, makeBox, makeContainer, makeTrunBox, settle } from "homebridge-plugin-utils/testing";
+import { TestStateStore, makeProtectState, makeTestAccessory } from "../testing.helpers.ts";
 import type { API } from "homebridge";
 import { G2_PRO_CHANNELS } from "../camera.fixtures.ts";
 import type { LivestreamSubscription } from "./livestream.ts";
@@ -30,8 +30,8 @@ import type { ProtectPlatform } from "../platform.ts";
 import type { StreamingDelegate } from "./stream-delegate.ts";
 import type { TestProtectAccessory } from "../testing.helpers.ts";
 import type { TestProtectNvr } from "../nvr/testing.helpers.ts";
-import { makeCameraConfig } from "../devices/testing.helpers.ts";
 import { TestTalkbackFactory } from "unifi-protect/testing";
+import { makeCameraConfig } from "../devices/testing.helpers.ts";
 import { makeTestNvr } from "../nvr/testing.helpers.ts";
 
 /* The reusable camera-host test double: the small stand-in every media-delegate test constructs a delegate against, in place of a full ProtectCamera. The

@@ -6,15 +6,15 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { Writable } from "node:stream";
-import type { HomebridgePluginLogging } from "homebridge-plugin-utils";
+import type { HomebridgePluginLogging, Mp4FrameFeed } from "homebridge-plugin-utils";
 import { BackpressureWriter } from "homebridge-plugin-utils";
-import { makeBox, makeContainer } from "homebridge-plugin-utils/testing";
+import { TestClock, makeBox, makeContainer } from "homebridge-plugin-utils/testing";
 import { makeNonKeyframeFragment, makeUntimedNonKeyframeFragment } from "./testing.helpers.ts";
 import { COPY_ESCALATION_PRIME_FLOOR_MAX_WRITTEN_LIVE_MOOF_CHECKS, livePrimeMediaFloorFromIdentity,
   parsePrimeMediaFloorFromPrimingBuffer } from "./fmp4-fragment-identity.ts";
 import type { LivestreamSubscription } from "./livestream.ts";
 import type { LiveTsbFeedState } from "./stream-live-feed.ts";
-import { consumeLiveStreamSegments, primeLiveFfmpegStdinAfterRespawn, rotateBackpressureWriterForCopyEscalation } from "./stream-live-feed.ts";
+import { consumeLiveStreamSegments, createLiveFrameFeed, primeLiveFfmpegStdinAfterRespawn, rotateBackpressureWriterForCopyEscalation } from "./stream-live-feed.ts";
 import { TestLiveStreamingFfmpegProcess } from "./test-live-ffmpeg-process.ts";
 
 const makeStreamMultiTrafFragment = (sequenceNumber: number, trafs: { baseMediaDecodeTime?: number; trackId: number }[], tag?: number): Buffer => {
@@ -132,6 +132,8 @@ describe("primeLiveFfmpegStdinAfterRespawn", () => {
   });
 });
 
+const testClock = new TestClock(0);
+
 const stubLog: HomebridgePluginLogging = {
 
   debug: () => undefined,
@@ -190,7 +192,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
       makeMediaSubscription([
         { data: untimed.data, type: "media" },
         { data: lagging.data, type: "media" }
-      ]), () => writer, null, stubLog);
+      ]), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.ok(proc.stdinWrites.some((buf) => buf.equals(untimed.data)));
@@ -215,7 +217,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
       makeMediaSubscription([
         { data: otherTrack.data, type: "media" },
         { data: lagging.data, type: "media" }
-      ]), () => writer, null, stubLog);
+      ]), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(feedState.primeMediaFloor?.trackDecodeTimes[1], 100);
@@ -242,7 +244,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
         { data: lagging.data, type: "media" },
         { data: ahead.data, type: "media" },
         { data: replayLow.data, type: "media" }
-      ]), () => writer, null, stubLog);
+      ]), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(feedState.primeMediaFloor, null);
@@ -274,7 +276,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
         { data: equal, type: "media" },
         { data: ahead, type: "media" },
         { data: replayLow, type: "media" }
-      ]), () => writer, null, stubLog);
+      ]), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(proc.stdinWrites.some((buf) => buf.equals(lagging)), false);
@@ -310,7 +312,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
         { data: audioLagging.data, type: "media" },
         { data: videoAhead.data, type: "media" },
         { data: audioAhead.data, type: "media" }
-      ]), () => writer, null, stubLog);
+      ]), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(proc.stdinWrites.some((buf) => buf.equals(videoLagging.data)), false);
@@ -341,7 +343,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
       makeMediaSubscription([
         { data: videoAhead.data, type: "media" },
         { data: audioLagging.data, type: "media" }
-      ]), () => writer, null, stubLog);
+      ]), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(feedState.primeMediaFloor?.trackDecodeTimes[1], undefined);
@@ -368,7 +370,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
     const writer = new BackpressureWriter(() => proc.stdin, { signal: new AbortController().signal });
 
     await consumeLiveStreamSegments(() => proc as never, feedState,
-      makeMediaSubscription([{ data: track3.data, type: "media" }]), () => writer, null, stubLog);
+      makeMediaSubscription([{ data: track3.data, type: "media" }]), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.ok(proc.stdinWrites.some((buf) => buf.equals(track3.data)));
@@ -409,7 +411,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
     const writer = new BackpressureWriter(() => proc.stdin, { signal: new AbortController().signal });
 
     await consumeLiveStreamSegments(() => proc as never, feedState,
-      makeMediaSubscription([{ data: liveAudio, type: "media" }]), () => writer, null, stubLog);
+      makeMediaSubscription([{ data: liveAudio, type: "media" }]), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.ok(proc.stdinWrites.some((buf) => buf.equals(liveAudio)));
@@ -437,7 +439,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
       makeMediaSubscription([
         { data: aheadVideo.data, type: "media" },
         { data: laggingAudio.data, type: "media" }
-      ]), () => writer, null, stubLog);
+      ]), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(feedState.primeMediaFloor?.trackDecodeTimes[1], undefined);
@@ -466,7 +468,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
     const skipped = Array.from({ length: 50 }, () => laggingReplay);
 
     await consumeLiveStreamSegments(() => proc as never, feedState,
-      makeMediaSubscription(skipped.map((frag) => ({ data: frag.data, type: "media" as const }))), () => writer, null, stubLog);
+      makeMediaSubscription(skipped.map((frag) => ({ data: frag.data, type: "media" as const }))), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.ok(feedState.primeMediaFloor);
@@ -499,7 +501,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
     const segments = [ ...Array.from({ length: 50 }, () => lagging), ...ahead ];
 
     await consumeLiveStreamSegments(() => proc as never, feedState,
-      makeMediaSubscription(segments.map((frag) => ({ data: frag.data, type: "media" as const }))), () => writer, null, stubLog);
+      makeMediaSubscription(segments.map((frag) => ({ data: frag.data, type: "media" as const }))), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(proc.stdinWrites.length, 5);
@@ -525,8 +527,10 @@ describe("consumeLiveStreamSegments prime dedup", () => {
       trackId: 1
     }));
 
-    await consumeLiveStreamSegments(() => proc as never, feedState,
-      makeMediaSubscription(liveOtherTrack.map((frag) => ({ data: frag.data, type: "media" as const }))), () => writer, null, stubLog);
+    const liveMedia = liveOtherTrack.map((frag) => ({ data: frag.data, type: "media" as const }));
+    const frameFeed = (): Mp4FrameFeed => createLiveFrameFeed(writer, testClock, stubLog);
+
+    await consumeLiveStreamSegments(() => proc as never, feedState, makeMediaSubscription(liveMedia), frameFeed, null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.ok(feedState.primeMediaFloor);
@@ -535,7 +539,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
     const oneMore = makeNonKeyframeFragment(99, { baseMediaDecodeTime: 9999, sequenceNumber: 99, trackId: 1 });
 
     await consumeLiveStreamSegments(() => proc as never, feedState,
-      makeMediaSubscription([{ data: oneMore.data, type: "media" }]), () => writer, null, stubLog);
+      makeMediaSubscription([{ data: oneMore.data, type: "media" }]), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(feedState.primeMediaFloor, null);
@@ -572,7 +576,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
     }
 
     await consumeLiveStreamSegments(() => proc as never, feedState,
-      makeMediaSubscription(segments), () => writer, null, stubLog);
+      makeMediaSubscription(segments), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(proc.stdinWrites.some((buf) => buf.equals(laggingVideo.data)), false);
@@ -598,8 +602,10 @@ describe("consumeLiveStreamSegments prime dedup", () => {
       trackId: 1
     }));
 
-    await consumeLiveStreamSegments(() => proc as never, feedState,
-      makeMediaSubscription(liveOtherTrack.map((frag) => ({ data: frag.data, type: "media" as const }))), () => writer, null, stubLog);
+    const liveMedia = liveOtherTrack.map((frag) => ({ data: frag.data, type: "media" as const }));
+    const frameFeed = (): Mp4FrameFeed => createLiveFrameFeed(writer, testClock, stubLog);
+
+    await consumeLiveStreamSegments(() => proc as never, feedState, makeMediaSubscription(liveMedia), frameFeed, null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(feedState.primeMediaFloor, null);
@@ -623,16 +629,17 @@ describe("consumeLiveStreamSegments prime dedup", () => {
       trackId: 1
     }));
 
-    await consumeLiveStreamSegments(() => proc as never, feedState,
-      makeMediaSubscription(liveOtherTrack.map((frag) => ({ data: frag.data, type: "media" as const }))), () => writer, null, stubLog);
+    const liveMedia = liveOtherTrack.map((frag) => ({ data: frag.data, type: "media" as const }));
+    const frameFeed = (): Mp4FrameFeed => createLiveFrameFeed(writer, testClock, stubLog);
+
+    await consumeLiveStreamSegments(() => proc as never, feedState, makeMediaSubscription(liveMedia), frameFeed, null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.ok(feedState.primeMediaFloor);
 
     const oneMore = makeNonKeyframeFragment(99, { baseMediaDecodeTime: 9999, sequenceNumber: 99, trackId: 1 });
 
-    await consumeLiveStreamSegments(() => proc as never, feedState,
-      makeMediaSubscription([{ data: oneMore.data, type: "media" }]), () => writer, null, stubLog);
+    await consumeLiveStreamSegments(() => proc as never, feedState, makeMediaSubscription([{ data: oneMore.data, type: "media" }]), frameFeed, null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(feedState.primeMediaFloor, null);
@@ -655,7 +662,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
     const ahead = makeStreamMultiTrafFragment(11, [{ trackId: 1 }]);
 
     await consumeLiveStreamSegments(() => proc as never, feedState,
-      makeMediaSubscription([{ data: ahead, type: "media" }]), () => writer, null, stubLog);
+      makeMediaSubscription([{ data: ahead, type: "media" }]), () => createLiveFrameFeed(writer, testClock, stubLog), null, stubLog);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(feedState.primeMediaFloor, null);

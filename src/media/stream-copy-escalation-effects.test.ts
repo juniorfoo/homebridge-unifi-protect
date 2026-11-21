@@ -5,8 +5,8 @@
 /* eslint-disable camelcase, no-restricted-syntax, sort-imports, sort-keys, @stylistic/max-len -- effect harness mirrors HomeKit request shapes and dense spawn closures */
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import type { FfmpegOptions, FfmpegStreamingProcess, HomebridgePluginLogging } from "homebridge-plugin-utils";
-import { BackpressureWriter, H264Level, H264Profile, HbpuAbortError, isHbpuAbortReason } from "homebridge-plugin-utils";
+import type { FfmpegOptions, HomebridgePluginLogging, StreamingProcess } from "homebridge-plugin-utils";
+import { BackpressureWriter, FfmpegOptions as FfmpegOptionsImpl, H264Level, H264Profile, HbpuAbortError, isHbpuAbortReason } from "homebridge-plugin-utils";
 import type { CopyEscalationSessionDiagnostics, StreamLiveEncodeRebuild } from "./stream-copy-escalation.ts";
 import { replaceFailedCopyWithTranscode } from "./stream-copy-escalation.ts";
 import type { LiveTsbFeedState } from "./stream-live-feed.ts";
@@ -139,7 +139,7 @@ function makeWriterRail(sessionInfo: SessionInfoStub, getActive: () => TestLiveS
   current: BackpressureWriter;
   getFrameFeed: () => ReturnType<typeof createTsbSegmentWriterRail>["getFrameFeed"] extends () => infer R ? R : never;
   getSegmentWriter: () => BackpressureWriter;
-  rotateSegmentWriter: (replacement: FfmpegStreamingProcess) => BackpressureWriter;
+  rotateSegmentWriter: (replacement: StreamingProcess) => BackpressureWriter;
 } {
 
   const rail = createTsbSegmentWriterRail({
@@ -162,8 +162,22 @@ function makeWriterRail(sessionInfo: SessionInfoStub, getActive: () => TestLiveS
 
     getSegmentWriter: (): BackpressureWriter => rail.getSegmentWriter(),
 
-    rotateSegmentWriter: (replacement: FfmpegStreamingProcess): BackpressureWriter => rail.rotateSegmentWriter(replacement)
+    rotateSegmentWriter: (replacement: StreamingProcess): BackpressureWriter => rail.rotateSegmentWriter(replacement)
   };
+}
+
+function stubFfmpegOptions(): FfmpegOptions {
+
+  return new FfmpegOptionsImpl({
+
+    codecSupport: { cpuGeneration: 0, hostSystem: "test" } as never,
+    crop: undefined,
+    debug: false,
+    hardwareDecoding: false,
+    hardwareTranscoding: false,
+    log: stubLog,
+    name: (): string => "stub-camera"
+  });
 }
 
 function makeHarness(spawned: TestLiveStreamingFfmpegProcess[]): LiveVideoFfmpegSpawner {
@@ -224,7 +238,7 @@ describe("copy-to-transcode replacement effects", () => {
       prior: castProtect(copy),
       sessionDiagnosticsById: diagnosticsById,
       sessionId: sessionId,
-      spawnLiveVideo: (_ctx: LiveVideoFfmpegSpawnContext, ffmpegAbort) => makeHarness(spawned)({} as FfmpegOptions, {
+      spawnLiveVideo: (_ctx: LiveVideoFfmpegSpawnContext, ffmpegAbort) => makeHarness(spawned)(stubFfmpegOptions(), {
 
         onProbesizeError: () => undefined,
         returnPort: { ipFamily: "ipv4", port: sessionInfo.videoReturnPort + spawned.length },
@@ -238,7 +252,7 @@ describe("copy-to-transcode replacement effects", () => {
 
     assert.ok(active !== copy);
 
-    await consumeLiveStreamSegments(() => castProtect(active), feedState, subscription, writerRail.getFrameFeed(), null, stubLog);
+    await consumeLiveStreamSegments(() => castProtect(active), feedState, subscription, () => writerRail.getFrameFeed(), null, stubLog);
     await drainBackpressureWrites();
 
     assert.equal(copy.abortCalls.length, 1);
@@ -279,7 +293,7 @@ describe("copy-to-transcode replacement effects", () => {
       prior: castProtect(copy),
       sessionDiagnosticsById: new Map([[ "sess-1", owner ]]),
       sessionId: "sess-1",
-      spawnLiveVideo: (_ctx, ffmpegAbort) => makeHarness(spawned)({} as FfmpegOptions, {
+      spawnLiveVideo: (_ctx, ffmpegAbort) => makeHarness(spawned)(stubFfmpegOptions(), {
 
         onProbesizeError: () => undefined,
         signal: ffmpegAbort.signal,
@@ -295,7 +309,7 @@ describe("copy-to-transcode replacement effects", () => {
     feedState.headerWritten = false;
     const replacement = spawnedAt(spawned, 0);
 
-    await consumeLiveStreamSegments(() => castProtect(replacement), feedState, subscription, writerRail.getFrameFeed(), null, stubLog);
+    await consumeLiveStreamSegments(() => castProtect(replacement), feedState, subscription, () => writerRail.getFrameFeed(), null, stubLog);
     await drainBackpressureWrites();
 
     assert.ok(replacement.stdinWrites[0]);
@@ -322,7 +336,7 @@ describe("copy-to-transcode replacement effects", () => {
       log: stubLog,
       onRespawned: (proc) => {
 
-        ongoing.ffmpeg[0] = proc as unknown as typeof ongoing.ffmpeg[number];
+        ongoing.ffmpeg[0] = proc;
       },
       ongoingSessions: ongoingSessions,
       owner: owner,
@@ -330,7 +344,7 @@ describe("copy-to-transcode replacement effects", () => {
       prior: castProtect(copy),
       sessionDiagnosticsById: new Map([[ sessionId, owner ]]),
       sessionId: sessionId,
-      spawnLiveVideo: (_ctx, ffmpegAbort) => makeHarness(spawned)({} as FfmpegOptions, {
+      spawnLiveVideo: (_ctx, ffmpegAbort) => makeHarness(spawned)(stubFfmpegOptions(), {
 
         onProbesizeError: () => undefined,
         returnPort: { ipFamily: "ipv4", port: sessionInfo.videoReturnPort },
@@ -388,7 +402,7 @@ describe("copy-to-transcode replacement effects", () => {
       prior: castProtect(copy),
       sessionDiagnosticsById: new Map([[ sessionId, owner ]]),
       sessionId: sessionId,
-      spawnLiveVideo: (_ctx, ffmpegAbort) => makeHarness(spawned)({} as FfmpegOptions, {
+      spawnLiveVideo: (_ctx, ffmpegAbort) => makeHarness(spawned)(stubFfmpegOptions(), {
 
         onProbesizeError: () => undefined,
         signal: ffmpegAbort.signal,
@@ -426,7 +440,7 @@ describe("copy-to-transcode replacement effects", () => {
       prior: castProtect(staleCopy),
       sessionDiagnosticsById: new Map([[ sessionId, staleOwner ]]),
       sessionId: sessionId,
-      spawnLiveVideo: (_ctx, ffmpegAbort) => makeHarness(spawned)({} as FfmpegOptions, {
+      spawnLiveVideo: (_ctx, ffmpegAbort) => makeHarness(spawned)(stubFfmpegOptions(), {
 
         onProbesizeError: () => undefined,
         signal: ffmpegAbort.signal,
@@ -513,7 +527,7 @@ describe("copy-to-transcode replacement effects", () => {
       prior: castProtect(copy),
       sessionDiagnosticsById: new Map([[ "sess-1", owner ]]),
       sessionId: "sess-1",
-      spawnLiveVideo: (_ctx, ffmpegAbort) => makeHarness(spawned)({} as FfmpegOptions, {
+      spawnLiveVideo: (_ctx, ffmpegAbort) => makeHarness(spawned)(stubFfmpegOptions(), {
 
         onProbesizeError: () => undefined,
         signal: ffmpegAbort.signal,
@@ -547,7 +561,7 @@ describe("copy-to-transcode replacement effects", () => {
     assert.ok(!replacement.stdinWrites.some((buf) => buf.compare(MEDIA_B) === 0));
 
     await consumeLiveStreamSegments(() => castProtect(replacement), feedState, makeSubscription([{ data: MEDIA_C, type: "media" }]),
-      createLiveFrameFeed(liveWriter, testClock, stubLog), null, stubLog);
+      () => createLiveFrameFeed(liveWriter, testClock, stubLog), null, stubLog);
     await drainBackpressureWrites();
 
     assert.ok(replacement.stdinWrites.some((buf) => buf.compare(MEDIA_C) === 0));

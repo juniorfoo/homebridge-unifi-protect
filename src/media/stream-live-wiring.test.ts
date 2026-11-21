@@ -3,9 +3,8 @@
 /* eslint-disable camelcase, sort-imports */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type { BackpressureWriter, FfmpegOptions } from "homebridge-plugin-utils";
+import type { BackpressureWriter, FfmpegOptions, HomebridgePluginLogging } from "homebridge-plugin-utils";
 import { FfmpegOptions as FfmpegOptionsImpl, H264Level, H264Profile, HOMEKIT_IDR_INTERVAL } from "homebridge-plugin-utils";
-import type { HomebridgePluginLogging } from "homebridge-plugin-utils";
 import { TestClock } from "homebridge-plugin-utils/testing";
 import type { StartStreamRequest } from "homebridge";
 import { makeTestCameraHost } from "./testing.helpers.ts";

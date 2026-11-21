@@ -44,7 +44,7 @@ export function spawnLiveVideoFfmpegProcess(options: FfmpegOptions, factory: Str
     onFailed: liveViewOnFailed({ log: log, onProbesizeError: init.onProbesizeError, suppressLivestreamApiErrors: init.suppressLivestreamApiErrors }),
     returnPort: init.returnPort,
     signal: init.signal
-  }) as ProtectStreamingFfmpegProcess;
+  });
 }
 
 /** Arguments required to spawn a transcode replacement (subset of startStream state). */
