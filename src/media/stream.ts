@@ -42,6 +42,7 @@ import { hasOutstandingLiveStreamReconfigureTarget, homeKitStreamVideoSnapshotFr
   isMaterialLiveStreamReconfigure, resolveReconfigureMaterialityBaseline, unlinkOnFfmpegExitedSettled } from "./stream-reconfigure.ts";
 import type { HomeKitStreamVideoSnapshot } from "./stream-reconfigure.ts";
 import { appendLiveVideoEncodeToFfmpegArgs, classifyLiveCopyEscalationEligible, createCopyEscalationTsbResume, createLiveFfmpegCopyExitBridge,
+  liveCopyEscalationElapsedMs,
   formatLiveEncodeDecisionLog,
   resolveCopyEscalationKeyframePrimingBuffer, resolveFmp4InitForLiveDeclaredCheck, resolveStartStreamEncodePlan, resolveStartStreamForceTranscodeDueToUserOption,
   resolveLiveStreamTranscodePipelineOptions, resolveStreamEgressBitrateBps, resolveTimeshiftBufferLiveChannel,
@@ -1357,7 +1358,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       throw error;
     }
 
-    const currentVideoFfmpegForOngoing = (): ProtectStreamingFfmpegProcess => sessionDiagnostics.activeVideoFfmpeg?.current ?? activeFfmpeg;
+    const currentVideoFfmpegForOngoing = (): ProtectStreamingFfmpegProcess => activeFfmpeg;
 
     // Bridge FFmpeg's ready signal to HomeKit's StreamRequestCallback, exactly once, for all input sources. ready resolves on FFmpeg's first stderr byte regardless
     // of source and rejects on a spawn failure (-> callback(error)). We prefer the underlying cause on the reject path so an ENOENT surfaces usefully rather than the
@@ -1838,12 +1839,12 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     }
 
     const owner = this.sessionDiagnosticsById.get(updatedRequest.sessionID);
-    const forceTranscodeDueToUserOption = rebuild.forceTranscodeDueToUserOption || Boolean(owner?.escalatedFromCopy);
 
     const encodePlan = resolveStartStreamEncodePlan({
 
       bufferForcedTranscodeReason: bufferForcedTranscodeReason, channelProfile: channelProfile, ffmpegOptions: this.ffmpegOptions,
-      fmp4InitSegmentData: rebuild.fmp4InitSegmentData, forceTranscodeDueToUserOption: forceTranscodeDueToUserOption,
+      fmp4InitSegmentData: rebuild.fmp4InitSegmentData, forceTranscodeDueToCopyEscalation: Boolean(owner?.escalatedFromCopy),
+      forceTranscodeDueToUserOption: rebuild.forceTranscodeDueToUserOption,
       homeKitBitrateKbps: updatedRequest.video.max_bit_rate, isHighLatency: rebuild.isHighLatency, preferCopyChannel: rebuild.preferCopyChannel,
       protectCamera: this.protectCamera, request: updatedRequest, sessionSource: rebuild.sessionSource, useTsb: rebuild.useTsb
     });
@@ -2080,7 +2081,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
           copyReplacementEscalationEligible = classifyLiveCopyEscalationEligible({
 
-            elapsedMs: Date.now() - owner.sessionStartedAt, escalatedFromCopy: owner.escalatedFromCopy, segmentsFed: owner.segmentsFed,
+            elapsedMs: liveCopyEscalationElapsedMs(owner.sessionStartedAt), escalatedFromCopy: owner.escalatedFromCopy, segmentsFed: owner.segmentsFed,
             stderrLog: failedEncoder.stderrLog, useTimeshiftBuffer: liveRebuild.useTsb, videoCopy: owner.videoCopy
           });
         }

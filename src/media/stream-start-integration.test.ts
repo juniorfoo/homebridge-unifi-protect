@@ -2636,13 +2636,19 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
   test("copy replan replacement past escalation window without escalation tears down once", async () => {
 
     const ctx = createHarness();
+    const copyFailureLine = VIDEO_COPY_FAILURE_PATTERNS[1] ?? "Error initializing output stream";
 
     enableReplaTimeshiftBufferDefaults(ctx);
 
     setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
 
       const deferReady = ctx.spawnedProcesses.length >= 1;
-      const proc = new TestLiveStreamingFfmpegProcess("live-" + String(ctx.spawnedProcesses.length), { deferReady: deferReady, signal: init.signal });
+      const proc = new TestLiveStreamingFfmpegProcess("live-" + String(ctx.spawnedProcesses.length), {
+
+        deferReady: deferReady,
+        signal: init.signal,
+        stderrLog: deferReady ? [copyFailureLine] : []
+      });
 
       ctx.spawnedArgs.push(init.args ?? []);
       ctx.spawnedProcesses.push(proc);

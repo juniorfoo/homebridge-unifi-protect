@@ -261,7 +261,8 @@ export function appendLiveVideoEncodeToFfmpegArgs(ffmpegOptions: FfmpegOptions, 
 
 /** Mirrors startStream channel reselect + copy-first encode (before spawn). */
 export function resolveStartStreamEncodePlan(input: { bufferForcedTranscodeReason?: string | null; channelProfile: ChannelProfile;
-  ffmpegOptions: FfmpegOptions; fmp4InitSegmentData: Buffer | null; forceTranscodeDueToUserOption: boolean; homeKitBitrateKbps?: number; isHighLatency: boolean;
+  ffmpegOptions: FfmpegOptions; fmp4InitSegmentData: Buffer | null; forceTranscodeDueToCopyEscalation?: boolean; forceTranscodeDueToUserOption: boolean;
+  homeKitBitrateKbps?: number; isHighLatency: boolean;
   preferCopyChannel: boolean; protectCamera: ProtectCameraHost; request: StartStreamRequest; sessionSource: LiveStreamSessionSource; useTsb: boolean; }): {
 
   channelProfile: ChannelProfile;
@@ -286,6 +287,11 @@ export function resolveStartStreamEncodePlan(input: { bufferForcedTranscodeReaso
   if(input.bufferForcedTranscodeReason) {
 
     encodeDecision = { logReason: input.bufferForcedTranscodeReason, mode: "transcode" };
+  }
+
+  if(input.forceTranscodeDueToCopyEscalation) {
+
+    encodeDecision = { logReason: "H.264 copy path previously escalated to transcode", mode: "transcode" };
   }
 
   let transcodeReselectMissing = false;
@@ -344,6 +350,12 @@ export function resolveStartStreamEncodePlan(input: { bufferForcedTranscodeReaso
   };
 }
 
+/** Elapsed session time for copy-failure escalation eligibility (shared by exit bridge and replan catch). */
+export function liveCopyEscalationElapsedMs(sessionStartedAt: number, nowMs: number = Date.now()): number {
+
+  return nowMs - sessionStartedAt;
+}
+
 export function classifyLiveCopyEscalationEligible(input: { elapsedMs: number; escalatedFromCopy: boolean; segmentsFed: number; stderrLog: readonly string[];
   useTimeshiftBuffer: boolean; videoCopy: boolean; }): boolean {
 
@@ -393,7 +405,7 @@ export function createLiveFfmpegCopyExitBridge(input: LiveFfmpegCopyExitBridgeIn
       return;
     }
 
-    const elapsedMs = Date.now() - input.sessionStartedAt;
+    const elapsedMs = liveCopyEscalationElapsedMs(input.sessionStartedAt);
     const eligibleForEscalation = classifyLiveCopyEscalationEligible({
 
       elapsedMs: elapsedMs, escalatedFromCopy: input.sessionDiagnostics.escalatedFromCopy, segmentsFed: input.sessionDiagnostics.segmentsFed,

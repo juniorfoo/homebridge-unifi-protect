@@ -3,6 +3,7 @@ import subprocess, os, sys
 R=os.environ.get('MUT_R2_REPO', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 S='src/media/stream.ts'; P='src/media/stream-transcode-policy.ts'; C='src/media/stream-reconfigure.ts'
 W='src/media/stream-live-wiring.ts'; T='src/media/test-live-ffmpeg-process.ts'
+E='src/media/stream-copy-escalation.ts'
 M=[
 ('M0 baseline',S,'Replanning live view stream for HomeKit RECONFIGURE (%s).','Replanning live view stream for HomeKit RECONFIGURE (%s).'),
 ('M1 threshold >= -> >',C,'maxBitRateKbps) >= LIVE_STREAM','maxBitRateKbps) > LIVE_STREAM'),
@@ -44,6 +45,12 @@ M=[
 ('M31 crash() rejects ready before abort',T,
  '  crash(reason?: unknown): void {\n\n    this.abort(reason ?? new HbpuAbortError("failed"));\n  }',
  '  crash(reason?: unknown): void {\n\n    this.rejectReadyBeforeExit(reason ?? new HbpuAbortError("failed"));\n  }'),
+('M36 catch escalation elapsedMs forced 0',S,'            elapsedMs: liveCopyEscalationElapsedMs(owner.sessionStartedAt), escalatedFromCopy: owner.escalatedFromCopy,',
+ '            elapsedMs: 0, escalatedFromCopy: owner.escalatedFromCopy,'),
+('M37 no escalatedFromCopy after copy escalation',E,'    owner.escalatedFromCopy = true;\n    owner.transcode = true;\n    owner.videoCopy = false;',
+ '    owner.transcode = true;\n    owner.videoCopy = false;'),
+('M38 replan ignore escalatedFromCopy sticky',S,'forceTranscodeDueToCopyEscalation: Boolean(owner?.escalatedFromCopy),',
+ 'forceTranscodeDueToCopyEscalation: false,'),
 ]
 only=set(sys.argv[1:]) if len(sys.argv)>1 else set()
 node_bin=os.environ.get('MUT_R2_NODE_BIN', '/home/ubuntu/.nvm/versions/node/v24.22.3/bin')
