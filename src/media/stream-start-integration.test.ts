@@ -2451,6 +2451,84 @@ describe("startStream integration harness", { concurrency: 1 }, () => {
     });
   });
 
+  test("queued RECONFIGURE while deferred START survives failed replan replacement", async () => {
+
+    const ctx = createHarness();
+    const streamSub = makeControllableLivestreamDouble({ deferEstablishment: true, initSegment: MATCHING_INIT_LIVESTREAM });
+    const replanHold: TestLiveStreamingFfmpegProcess[] = [];
+
+    ctx.host.livestreamSubscriptions = [streamSub];
+    enableReplaTimeshiftBufferDefaults(ctx);
+
+    setLiveVideoFfmpegSpawnerForTests((_ffmpegOptions, init) => {
+
+      const deferReady = true;
+      const proc = new TestLiveStreamingFfmpegProcess("live-" + String(ctx.spawnedProcesses.length), { deferReady: deferReady, signal: init.signal });
+
+      if(ctx.spawnedProcesses.length >= 1) {
+
+        replanHold.push(proc);
+      }
+
+      ctx.spawnedArgs.push(init.args ?? []);
+      ctx.spawnedProcesses.push(proc);
+
+      return proc as unknown as ProtectStreamingFfmpegProcess;
+    });
+
+    const startRequest = makeStartRequest();
+
+    startRequest.video.fps = 30;
+    const liveLead = makeNonKeyframeFragment();
+
+    await new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.prepareStream(makePrepareRequest(), (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    let startCallbacks = 0;
+    const startSettled = new Promise<void>((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({ ...startRequest, type: StreamRequestTypes.START }, (error) => {
+
+        startCallbacks += 1;
+
+        if(error instanceof Error) {
+
+          reject(error);
+
+          return;
+        }
+
+        resolve();
+      });
+    });
+
+    streamSub.push({ data: liveLead.data, mdat: liveLead.mdat, moof: liveLead.moof, type: "media" });
+    await waitFor(() => ctx.spawnedProcesses.length >= 1, "initial encoder spawn");
+
+    const reconf = (fps: number): Promise<void> => new Promise((resolve, reject) => {
+
+      ctx.delegate.handleStreamRequest({ ...startRequest, type: StreamRequestTypes.RECONFIGURE, video: { ...startRequest.video, fps } },
+        (error) => ((error instanceof Error) ? reject(error) : resolve()));
+    });
+
+    await reconf(15);
+    await waitFor(() => ctx.spawnedArgs.length >= 2, "first replan before START ready");
+    await reconf(10);
+    assert.ok(ctx.delegate.peekSessionDiagnosticsForHarness(startRequest.sessionID)?.pendingReconfigure);
+
+    replanHold[0]?.crash();
+    await waitFor(() => ctx.spawnedArgs.length >= 3, "drain after crashed replan");
+    replanHold[1]?.releaseReady();
+    await startSettled;
+    assert.equal(startCallbacks, 1, "deferred START must settle once after queued replan recovery");
+    await waitFor(() => peekAppliedHomeKitFps(ctx, startRequest.sessionID) === 10, "queued fps must apply");
+
+    streamSub.releaseEstablishment();
+    await stopActiveSession(ctx, startRequest.sessionID);
+  });
+
   test("RECONFIGURE restore fps while replan is pending queues a follow-up replan", async () => {
 
     const ctx = createHarness();

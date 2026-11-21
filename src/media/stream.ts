@@ -1000,6 +1000,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     return new Error(accessoryName + ": " + (((reason instanceof HbpuAbortError) && (reason.cause instanceof Error)) ? reason.cause.message : String(reason)));
   }
 
+  private deferStartReadyBridgeForQueuedReplan(owner: StreamSessionDiagnostics): boolean {
+
+    return Boolean(owner.pendingReconfigure);
+  }
+
   private settleStartStreamReadyBridge(owner: StreamSessionDiagnostics, reason: unknown): void {
 
     const bridge = owner.startStreamReadyBridge;
@@ -1043,6 +1048,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       }
 
       if(isHbpuAbortReason(reason, "replaced")) {
+
+        return;
+      }
+
+      if(this.deferStartReadyBridgeForQueuedReplan(owner)) {
 
         return;
       }
@@ -1462,7 +1472,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
 
         this.logStreamSessionStopForOwner(request.sessionID, sessionDiagnostics, "ffmpeg-exit", ffmpegExitCode);
 
-        if(this.ongoingSessions.has(request.sessionID)) {
+        if(this.ongoingSessions.has(request.sessionID) && !sessionDiagnostics.pendingReconfigure) {
 
           this.settleStartStreamReadyBridge(sessionDiagnostics, exitedProcess.signal.reason ??
             new Error("Live stream encoder exited."));
