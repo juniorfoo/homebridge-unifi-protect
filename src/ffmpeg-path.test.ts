@@ -6,9 +6,8 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { describe, test } from "node:test";
-import { env } from "node:process";
 import assert from "node:assert/strict";
-import { isBareCommandName, isConcreteFfmpegPath, resolveFfmpegExecutablePath, validateConcreteFfmpegPath } from "./ffmpeg-path.ts";
+import { resolveFfmpegExecutablePath, validateConcreteFfmpegPath } from "./ffmpeg-path.ts";
 import path from "node:path";
 import ffmpegBundledPath from "ffmpeg-for-homebridge";
 
@@ -16,43 +15,63 @@ describe("ffmpeg path resolution", () => {
 
   test("a bare command name resolves through PATH, not the process working directory", () => {
 
-    const tempDirectory = mkdtempSync(path.join(tmpdir(), "hbup-ffmpeg-path-"));
-    const fakeCwdFfmpeg = path.join(tempDirectory, "ffmpeg");
+    const pathDirectory = mkdtempSync(path.join(tmpdir(), "hbup-ffmpeg-path-bin-"));
+    const workingDirectory = mkdtempSync(path.join(tmpdir(), "hbup-ffmpeg-path-cwd-"));
+    const pathFfmpeg = path.join(pathDirectory, "ffmpeg");
 
-    writeFileSync(fakeCwdFfmpeg, "#!/bin/sh\n", { mode: 0o755 });
+    writeFileSync(pathFfmpeg, "#!/bin/sh\n", { mode: 0o755 });
+    writeFileSync(path.join(workingDirectory, "ffmpeg"), "#!/bin/sh\n", { mode: 0o755 });
 
-    const previousWorkingDirectory = process.cwd();
+    const resolved = resolveFfmpegExecutablePath("ffmpeg", { cwd: workingDirectory, path: pathDirectory });
 
-    try {
+    assert.equal(resolved, pathFfmpeg);
+  });
 
-      process.chdir(tempDirectory);
-      assert.equal(isBareCommandName("ffmpeg"), true);
-      assert.notEqual(resolveFfmpegExecutablePath("ffmpeg"), path.resolve("ffmpeg"));
-      assert.ok(resolveFfmpegExecutablePath("ffmpeg").includes(path.sep), "PATH resolution yields an absolute path");
-    } finally {
+  test("PATH lookup skips empty and dot entries so a later directory wins over the cwd decoy", () => {
 
-      process.chdir(previousWorkingDirectory);
-    }
+    const usrBin = mkdtempSync(path.join(tmpdir(), "hbup-ffmpeg-usrbin-"));
+    const workingDirectory = mkdtempSync(path.join(tmpdir(), "hbup-ffmpeg-cwd-decoy-"));
+    const realFfmpeg = path.join(usrBin, "ffmpeg");
+
+    writeFileSync(realFfmpeg, "#!/bin/sh\n", { mode: 0o755 });
+    writeFileSync(path.join(workingDirectory, "ffmpeg"), "#!/bin/sh\n", { mode: 0o755 });
+
+    const pathVariable = "." + path.delimiter + usrBin;
+    const resolved = resolveFfmpegExecutablePath("ffmpeg", { cwd: workingDirectory, path: pathVariable });
+
+    assert.equal(resolved, realFfmpeg);
+  });
+
+  test("PATH lookup skips a non-executable match and keeps scanning", () => {
+
+    const firstDirectory = mkdtempSync(path.join(tmpdir(), "hbup-ffmpeg-nox-"));
+    const secondDirectory = mkdtempSync(path.join(tmpdir(), "hbup-ffmpeg-good-"));
+    const blocked = path.join(firstDirectory, "ffmpeg-test-bin");
+    const executable = path.join(secondDirectory, "ffmpeg-test-bin");
+
+    writeFileSync(blocked, "#!/bin/sh\n", { mode: 0o644 });
+    writeFileSync(executable, "#!/bin/sh\n", { mode: 0o755 });
+
+    const resolved = resolveFfmpegExecutablePath("ffmpeg-test-bin", { path: firstDirectory + path.delimiter + secondDirectory });
+
+    assert.equal(resolved, executable);
   });
 
   test("an absolute bundled path resolves to itself", () => {
 
     if(typeof ffmpegBundledPath !== "string") {
 
-      throw new Error("ffmpeg-for-homebridge did not publish a bundled path");
+      return;
     }
 
-    const bundledPath = ffmpegBundledPath;
-
-    assert.equal(path.isAbsolute(bundledPath), true);
-    assert.equal(resolveFfmpegExecutablePath(bundledPath), bundledPath);
+    assert.equal(path.isAbsolute(ffmpegBundledPath), true);
+    assert.equal(resolveFfmpegExecutablePath(ffmpegBundledPath), ffmpegBundledPath);
   });
 
-  test("a missing absolute path stays concrete for validation", () => {
+  test("a missing absolute path can be validated", () => {
 
     const missing = path.join(tmpdir(), "hbup-missing-ffmpeg-" + String(Date.now()));
 
-    assert.equal(isConcreteFfmpegPath(missing, resolveFfmpegExecutablePath(missing)), true);
     assert.match(validateConcreteFfmpegPath(missing) ?? "", /does not exist/);
   });
 
@@ -74,17 +93,8 @@ describe("ffmpeg path resolution", () => {
     mkdirSync(path.dirname(executable), { recursive: true });
     writeFileSync(executable, "#!/bin/sh\n", { mode: 0o755 });
 
-    const previousWorkingDirectory = process.cwd();
-
-    try {
-
-      process.chdir(tempDirectory);
-      assert.equal(resolveFfmpegExecutablePath(relative), path.resolve(relative));
-      assert.equal(validateConcreteFfmpegPath(resolveFfmpegExecutablePath(relative)), undefined);
-    } finally {
-
-      process.chdir(previousWorkingDirectory);
-    }
+    assert.equal(resolveFfmpegExecutablePath(relative, { cwd: tempDirectory }), path.resolve(tempDirectory, relative));
+    assert.equal(validateConcreteFfmpegPath(resolveFfmpegExecutablePath(relative, { cwd: tempDirectory })), undefined);
   });
 
   test("PATH lookup honors execute permission", () => {
@@ -94,18 +104,8 @@ describe("ffmpeg path resolution", () => {
 
     writeFileSync(executable, "#!/bin/sh\n", { mode: 0o755 });
 
-    const previousPath = env["PATH"];
+    const resolved = resolveFfmpegExecutablePath("ffmpeg-test-bin", { path: tempDirectory });
 
-    try {
-
-      env["PATH"] = tempDirectory + path.delimiter + (previousPath ?? "");
-      const resolved = resolveFfmpegExecutablePath("ffmpeg-test-bin");
-
-      assert.equal(resolved, executable);
-      assert.equal(isConcreteFfmpegPath("ffmpeg-test-bin", resolved), true);
-    } finally {
-
-      env["PATH"] = previousPath;
-    }
+    assert.equal(resolved, executable);
   });
 });

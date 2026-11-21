@@ -2,11 +2,12 @@
  *
  * platform.ts: homebridge-unifi-protect platform class.
  */
+import * as path from "node:path";
 import type { API, DynamicPlatformPlugin, Logging } from "homebridge";
 import { APIEvent, AccessoryPersistence, FeatureOptions, FfmpegCodecs, Perms, RtpPortAllocator, addressListingForm, createMqttClient, debugGatedLog, formatErrorMessage,
   livestreamProcessFactory, notResponding, recordingProcessFactory, systemClock } from "homebridge-plugin-utils";
 import type { Clock, HomebridgePluginLogging, LivestreamProcessFactory, Nullable, RecordingProcessFactory, RetiredTranslation } from "homebridge-plugin-utils";
-import { FFMPEG_RESOLVED_PATH_LOG, isConcreteFfmpegPath, resolveFfmpegExecutablePath, validateConcreteFfmpegPath } from "./ffmpeg-path.ts";
+import { FFMPEG_RESOLVED_PATH_LOG, resolveFfmpegExecutablePath, validateConcreteFfmpegPath } from "./ffmpeg-path.ts";
 import { PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import type { ProtectAccessory, ProtectPlatformConfig } from "./types.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
@@ -279,28 +280,21 @@ export class ProtectPlatform implements DynamicPlatformPlugin {
   // Launch our configured controllers once all accessories have been loaded. Once we do, they will sustain themselves.
   private async launchControllers(): Promise<void> {
 
-    // First things first - ensure we've got a working video processor before we do anything else. The configured value is what the probe spawns; the resolved path is for
-    // startup logging and for validating concrete paths ahead of the probe, so a missing absolute custom path logs clearly instead of HBPU's PATH-oriented wording alone.
     const configuredFfmpeg = this.config.videoProcessor;
     const resolvedFfmpegPath = resolveFfmpegExecutablePath(configuredFfmpeg);
+    const validationError = (path.isAbsolute(configuredFfmpeg) || configuredFfmpeg.includes("/") || ((path.sep !== "/") && configuredFfmpeg.includes(path.sep)) ||
+      (resolvedFfmpegPath !== configuredFfmpeg)) ? validateConcreteFfmpegPath(resolvedFfmpegPath) : undefined;
 
-    if(isConcreteFfmpegPath(configuredFfmpeg, resolvedFfmpegPath)) {
+    if(validationError) {
 
-      const validationError = validateConcreteFfmpegPath(resolvedFfmpegPath);
+      this.log.error(validationError);
+      this.log.error("This plugin requires a working version of FFmpeg. " +
+        "If you need to specify a path to your FFmpeg, you can do so under 'Settings | Additional Settings' in the plugin configuration webUI.");
 
-      if(validationError) {
-
-        this.log.error(validationError);
-        this.log.error("This plugin requires a working version of FFmpeg. " +
-          "If you need to specify a path to your FFmpeg, you can do so under 'Settings | Additional Settings' in the plugin configuration webUI.");
-
-        return;
-      }
+      return;
     }
 
-    // The probe runs the full FFmpeg capability detection and returns a populated, immutable FfmpegCodecs value object on success, or null when probing fails. We run it
-    // without a cancellation signal: the platform has no shutdown controller, and probing happens once at launch, before any controller is brought up.
-    const codecs = await FfmpegCodecs.probe({ clock: this.clock, ffmpegExec: configuredFfmpeg, log: this.log,
+    const codecs = await FfmpegCodecs.probe({ clock: this.clock, ffmpegExec: resolvedFfmpegPath, log: this.log,
       verbose: this.featureOptions.test("Log.FFmpeg") || this.config.verboseFfmpeg });
 
     if(!codecs) {

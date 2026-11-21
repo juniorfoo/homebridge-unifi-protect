@@ -2,53 +2,35 @@
  *
  * ffmpeg-path.ts: Resolve and validate the configured FFmpeg executable before launch probing.
  */
-import { accessSync, constants, realpathSync } from "node:fs";
+import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import { env } from "node:process";
 import path from "node:path";
 
-// The startup log line for the resolved absolute FFmpeg path, emitted once after a successful probe.
 export const FFMPEG_RESOLVED_PATH_LOG = "Using FFmpeg at: %s.";
 
-// Whether a configured value names a bare command with no directory component, which must be resolved through PATH rather than the process working directory.
-export function isBareCommandName(execPath: string): boolean {
+export interface FfmpegPathLookup { cwd?: string; path?: string }
 
-  return !path.isAbsolute(execPath) && !hasDirectoryComponent(execPath);
-}
+export function resolveFfmpegExecutablePath(configured: string, lookup: FfmpegPathLookup = {}): string {
 
-// Whether a configured value carries a directory component, including explicit relative prefixes.
-export function hasDirectoryComponent(execPath: string): boolean {
+  const cwd = lookup.cwd ?? process.cwd();
+  const hasDirectory = configured.includes("/") || ((path.sep !== "/") && configured.includes(path.sep));
 
-  return execPath.includes("/") || ((path.sep !== "/") && execPath.includes(path.sep));
-}
+  if(!path.isAbsolute(configured) && !hasDirectory) {
 
-// Resolve the configured FFmpeg value to the absolute path that startup validation and logging use.
-export function resolveFfmpegExecutablePath(configured: string): string {
-
-  if(isBareCommandName(configured)) {
-
-    return findExecutableInPath(configured) ?? configured;
+    return findExecutableInPath(configured, lookup.path ?? env["PATH"] ?? "", cwd) ?? configured;
   }
 
-  if(path.isAbsolute(configured)) {
+  const resolved = path.isAbsolute(configured) ? configured : path.resolve(cwd, configured);
 
-    return tryRealpath(configured);
+  try {
+
+    return realpathSync(resolved);
+  } catch {
+
+    return resolved;
   }
-
-  return tryRealpath(path.resolve(configured));
 }
 
-// Whether the configured value points at a concrete filesystem path that can be validated before the probe runs.
-export function isConcreteFfmpegPath(configured: string, resolvedPath: string): boolean {
-
-  if(!isBareCommandName(configured)) {
-
-    return true;
-  }
-
-  return resolvedPath !== configured;
-}
-
-// Validate that a resolved concrete path exists and is executable. Returns an error sentence when validation fails.
 export function validateConcreteFfmpegPath(resolvedPath: string): string | undefined {
 
   try {
@@ -59,10 +41,7 @@ export function validateConcreteFfmpegPath(resolvedPath: string): string | undef
     return "FFmpeg path does not exist: " + resolvedPath;
   }
 
-  try {
-
-    accessSync(resolvedPath, constants.X_OK);
-  } catch {
+  if(!isExecutableFile(resolvedPath)) {
 
     return "FFmpeg path is not executable: " + resolvedPath;
   }
@@ -70,40 +49,49 @@ export function validateConcreteFfmpegPath(resolvedPath: string): string | undef
   return undefined;
 }
 
-function findExecutableInPath(command: string): string | undefined {
-
-  const pathVariable = env["PATH"] ?? "";
+function findExecutableInPath(command: string, pathVariable: string, cwd: string): string | undefined {
 
   for(const directory of pathVariable.split(path.delimiter)) {
 
-    if(!directory) {
+    if((directory === "") || (directory === ".")) {
 
       continue;
     }
 
-    const candidate = path.join(directory, command);
+    const searchDirectory = path.isAbsolute(directory) ? directory : path.resolve(cwd, directory);
 
-    try {
-
-      accessSync(candidate, constants.X_OK);
-
-      return realpathSync(candidate);
-    } catch {
+    if(searchDirectory === cwd) {
 
       continue;
     }
+
+    const candidate = path.join(searchDirectory, command);
+
+    if(!isExecutableFile(candidate)) {
+
+      continue;
+    }
+
+    return realpathSync(candidate);
   }
 
   return undefined;
 }
 
-function tryRealpath(filePath: string): string {
+function isExecutableFile(filePath: string): boolean {
 
   try {
 
-    return realpathSync(filePath);
+    if(!statSync(filePath).isFile()) {
+
+      return false;
+    }
+
+    accessSync(filePath, constants.X_OK);
+
+    return true;
   } catch {
 
-    return filePath;
+    return false;
   }
 }
