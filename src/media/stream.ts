@@ -2065,7 +2065,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
       activeVideoFfmpegProcess: owner.activeVideoFfmpeg?.current,
       appliedHomeKitVideo: owner.appliedHomeKitVideo,
       copyEscalationInFlight: Boolean(owner.reconfigureHandles?.copyEscalationInFlightRef.current),
-      ongoingVideoFfmpegProcess: ongoing?.ffmpeg[0],
+      ongoingVideoFfmpegProcess: ongoing?.ffmpeg[0] as ProtectStreamingFfmpegProcess | undefined,
       pendingReconfigure: owner.pendingReconfigure,
       reconfigureAwaitingEncoderReady: owner.reconfigureAwaitingEncoderReady,
       reconfigureInFlight: owner.reconfigureInFlight
