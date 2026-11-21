@@ -50,7 +50,7 @@ describe("TestLiveStreamingFfmpegProcess", () => {
 
     const proc = new TestLiveStreamingFfmpegProcess("pre-aborted-defer", { deferReady: true, signal: parent.signal });
 
-    await assert.rejects(proc.ready, (error: unknown) => error instanceof HbpuAbortError);
+    await assert.rejects(proc.ready, HbpuAbortError);
     await proc.exited;
   });
 
