@@ -202,6 +202,167 @@ describe("harness growth: the timeshift behavior doubles", () => {
 
     assert.equal(double.disposed, true, "dispose records disposed");
   });
+
+  test("makeControllableLivestreamDouble broadcasts push to every concurrent iterator", async () => {
+
+    const initData = Buffer.from("test-init-segment");
+    const double = makeControllableLivestreamDouble({ initSegment: { codec: "h264", data: initData, description: { tracks: [] } } });
+    const fragment = makeKeyframeFragment();
+
+    const collectThroughMedia = async (): Promise<Segment[]> => {
+
+      const segments: Segment[] = [];
+
+      for await(const segment of double) {
+
+        segments.push(segment);
+
+        if((segments.length >= 2) && (segments[1]?.type === "media")) {
+
+          break;
+        }
+      }
+
+      return segments;
+    };
+
+    const first = collectThroughMedia();
+    const second = collectThroughMedia();
+
+    await settle();
+    double.push({ codec: "h264", data: initData, description: { tracks: [] }, type: "init" });
+    await settle();
+    double.push(makeMediaSegment(fragment));
+    await settle();
+
+    const [ firstSegments, secondSegments ] = await Promise.all([ first, second ]);
+
+    assert.equal(firstSegments.length, 2);
+    assert.equal(secondSegments.length, 2);
+    assert.ok(firstSegments[1]?.data.equals(fragment.data));
+    assert.ok(secondSegments[1]?.data.equals(fragment.data),
+      "pooled fanout must deliver the same pushed media to every active iterator (FO2 regression)");
+  });
+
+  test("makeControllableLivestreamDouble replays orphan segments after first iterator breaks", async () => {
+
+    const double = makeControllableLivestreamDouble();
+    const fragment = makeNonKeyframeFragment();
+
+    const warmup = makeNonKeyframeFragment(0xF001);
+
+    double.push(makeMediaSegment(warmup));
+
+    for await(const _ of double) {
+
+      break;
+    }
+
+    await settle();
+    double.push(makeMediaSegment(fragment));
+
+    const segments: Segment[] = [];
+
+    for await(const segment of double) {
+
+      segments.push(segment);
+
+      break;
+    }
+
+    assert.equal(segments.length, 1);
+    assert.ok(segments[0]?.data.equals(fragment.data));
+  });
+
+  test("makeControllableLivestreamDouble delivers segment pushed between two concurrent iterators", async () => {
+
+    const double = makeControllableLivestreamDouble();
+    const fragment = makeNonKeyframeFragment();
+
+    const pullOne = async (): Promise<Segment | undefined> => {
+
+      for await(const segment of double) {
+
+        return segment;
+      }
+
+      return undefined;
+    };
+
+    const first = pullOne();
+    const second = pullOne();
+
+    await settle();
+    double.push(makeMediaSegment(fragment));
+    await settle();
+
+    const [ a, b ] = await Promise.all([ first, second ]);
+
+    assert.ok(a?.data.equals(fragment.data));
+    assert.ok(b?.data.equals(fragment.data));
+  });
+
+  test("makeControllableLivestreamDouble throwError terminates and rejects a later iterator", async () => {
+
+    const double = makeControllableLivestreamDouble();
+    const boom = new Error("iterator fault");
+
+    double.throwError(boom);
+
+    await assert.rejects(async () => {
+
+      for await(const _ of double) { /* drain */ }
+    }, boom);
+    double.push(makeMediaSegment(makeNonKeyframeFragment()));
+  });
+
+  test("makeControllableLivestreamDouble ignores push after throwError terminates subscription", async () => {
+
+    const double = makeControllableLivestreamDouble();
+    const fragment = makeNonKeyframeFragment();
+
+    double.throwError(new Error("terminated"));
+
+    await assert.rejects(async () => {
+
+      for await(const _ of double) { /* drain */ }
+    });
+    double.push(makeMediaSegment(fragment));
+
+    const segments: Segment[] = [];
+
+    for await(const segment of double) {
+
+      segments.push(segment);
+    }
+
+    assert.equal(segments.length, 0, "media pushed after throwError must not be delivered once the subscription is globally terminated");
+  });
+
+  test("makeControllableLivestreamDouble iterator created after end() finishes without hanging", async () => {
+
+    const double = makeControllableLivestreamDouble();
+    const established = double[Symbol.asyncIterator]();
+
+    await settle();
+
+    void established.next();
+
+    await settle();
+
+    double.end();
+
+    await established.next();
+
+    const segments: Segment[] = [];
+
+    for await(const segment of double) {
+
+      segments.push(segment);
+    }
+
+    assert.equal(segments.length, 0, "a late iterator after global terminate must complete immediately");
+  });
 });
 
 describe("harness growth: the fragment splitter", () => {
