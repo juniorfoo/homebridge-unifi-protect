@@ -32,6 +32,7 @@ import { TestMqttClientFactory, assertNoUnhandledRejections, capturingLog, expec
 import { describe, test } from "node:test";
 import { featureOptionCategories, featureOptions } from "./options.ts";
 import { makeConnectedClient, makeNvrConfig } from "./nvr/testing.helpers.ts";
+import type { FfmpegPathLookup } from "./ffmpeg-path.ts";
 import { FFMPEG_RESOLVED_PATH_LOG } from "./ffmpeg-path.ts";
 import { ProtectClient } from "unifi-protect";
 import type { ProtectNvr } from "./nvr/nvr.ts";
@@ -39,11 +40,10 @@ import { ProtectPlatform } from "./platform.ts";
 import type { ProtectPlatformConfig } from "./types.ts";
 import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import path, { join } from "node:path";
 import ffmpegBundledPath from "ffmpeg-for-homebridge";
 
 // The controller and camera these rows resolve against.
@@ -790,7 +790,7 @@ describe("platform FFmpeg path validation at launch", () => {
     t.mock.method(FfmpegCodecs, "probe", async (): Promise<FfmpegCodecs> => FfmpegCodecs.fromState(state));
   }
 
-  function buildLaunchPlatform(options: string[] = [], videoProcessor?: string):
+  function buildLaunchPlatform(options: string[] = [], videoProcessor?: string, { ffmpegPathLookup }: { ffmpegPathLookup?: FfmpegPathLookup } = {}):
   { api: TestHomebridgeApi; log: CapturingLog; platform: ProtectPlatform } {
 
     const log = capturingLog();
@@ -800,7 +800,7 @@ describe("platform FFmpeg path validation at launch", () => {
       ...(videoProcessor === undefined ? {} : { videoProcessor }) };
     const api = makeTestApi();
 
-    return { api, log, platform: new ProtectPlatform(homebridgeLog as unknown as Logging, config, api as unknown as API) };
+    return { api, log, platform: new ProtectPlatform(homebridgeLog as unknown as Logging, config, api as unknown as API, { ffmpegPathLookup }) };
   }
 
   function parkLogins(t: TestContext, api: TestHomebridgeApi, platform: ProtectPlatform): void {
@@ -883,48 +883,33 @@ describe("platform FFmpeg path validation at launch", () => {
     const workingDirectory = mkdtempSync(join(tmpdir(), "hbup-bare-launch-cwd-"));
     const resolvedFfmpeg = join(binDirectory, "ffmpeg");
     const ffmpegVersionParts = parseFfmpegVersionParts("8.0");
+    const pathVariable = "." + path.delimiter + binDirectory;
 
     writeFileSync(resolvedFfmpeg, "#!/bin/sh\n", { mode: 0o755 });
     writeFileSync(join(workingDirectory, "ffmpeg"), "#!/bin/sh\n", { mode: 0o755 });
 
-    if(process.env["HBUP_FFMPEG_BARE_LAUNCH"] === "1") {
+    const probeMock = t.mock.method(FfmpegCodecs, "probe", async (options: { ffmpegExec: string }): Promise<FfmpegCodecs> => {
 
-      const expectedFfmpeg = process.env["HBUP_FFMPEG_EXPECT"];
-
-      assert.ok(expectedFfmpeg, "HBUP_FFMPEG_EXPECT names the PATH-resolved absolute binary");
-
-      const probeMock = t.mock.method(FfmpegCodecs, "probe", async (options: { ffmpegExec: string }): Promise<FfmpegCodecs> => {
-
-        return FfmpegCodecs.fromState({ codecs: {}, cpuGeneration: 0, ffmpegExec: options.ffmpegExec, ffmpegVersion: "8.0", ffmpegVersionParts, gpuMem: 0,
-          hostSystem: "macOS.Apple", hwAccels: new Set<string>(), verbose: false });
-      });
-
-      const { api, log, platform } = buildLaunchPlatform([], "ffmpeg");
-
-      assert.equal(platform.config.videoProcessor, "ffmpeg");
-      assert.notEqual(platform.config.videoProcessor, expectedFfmpeg);
-
-      parkLogins(t, api, platform);
-
-      api.emit(APIEvent.DID_FINISH_LAUNCHING);
-
-      await settleUntil(() => probeMock.mock.callCount() > 0, { description: "the probe call" });
-
-      const probeOptions = probeMock.mock.calls[0]?.arguments[0] as { ffmpegExec: string };
-
-      assert.equal(probeOptions.ffmpegExec, expectedFfmpeg);
-      assert.ok(hasResolvedPathLog(log.entries, expectedFfmpeg));
-
-      return;
-    }
-
-    const testFile = new URL(import.meta.url).pathname;
-    const child = spawnSync(process.execPath, [ "--test", "--test-name-pattern=^a bare videoProcessor name probes", testFile ], {
-
-      cwd: workingDirectory, encoding: "utf8", env: { ...process.env, HBUP_FFMPEG_BARE_LAUNCH: "1", HBUP_FFMPEG_EXPECT: resolvedFfmpeg, PATH: binDirectory }
+      return FfmpegCodecs.fromState({ codecs: {}, cpuGeneration: 0, ffmpegExec: options.ffmpegExec, ffmpegVersion: "8.0", ffmpegVersionParts, gpuMem: 0,
+        hostSystem: "macOS.Apple", hwAccels: new Set<string>(), verbose: false });
     });
 
-    assert.equal(child.status, 0, child.stderr || child.stdout);
+    const { api, log, platform } = buildLaunchPlatform([], "ffmpeg", { ffmpegPathLookup: { cwd: workingDirectory, path: pathVariable } });
+
+    assert.equal(platform.config.videoProcessor, "ffmpeg");
+    assert.notEqual(platform.config.videoProcessor, resolvedFfmpeg);
+
+    parkLogins(t, api, platform);
+
+    api.emit(APIEvent.DID_FINISH_LAUNCHING);
+
+    await settleUntil(() => probeMock.mock.callCount() > 0, { description: "the probe call" });
+
+    const probeOptions = probeMock.mock.calls[0]?.arguments[0] as { ffmpegExec: string };
+
+    assert.equal(probeOptions.ffmpegExec, resolvedFfmpeg);
+    assert.notEqual(probeOptions.ffmpegExec, platform.config.videoProcessor, "M8: the probe must not receive the bare configured name");
+    assert.ok(hasResolvedPathLog(log.entries, resolvedFfmpeg));
   });
 
   test("the probe receives the resolved absolute executable path", async (t) => {

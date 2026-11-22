@@ -7,7 +7,7 @@ import type { API, DynamicPlatformPlugin, Logging } from "homebridge";
 import { APIEvent, AccessoryPersistence, FeatureOptions, FfmpegCodecs, Perms, RtpPortAllocator, addressListingForm, createMqttClient, debugGatedLog, formatErrorMessage,
   livestreamProcessFactory, notResponding, recordingProcessFactory, systemClock } from "homebridge-plugin-utils";
 import type { Clock, HomebridgePluginLogging, LivestreamProcessFactory, Nullable, RecordingProcessFactory, RetiredTranslation } from "homebridge-plugin-utils";
-import { FFMPEG_RESOLVED_PATH_LOG, resolveFfmpegExecutablePath, validateConcreteFfmpegPath } from "./ffmpeg-path.ts";
+import { FFMPEG_CONFIGURATION_HINT, FFMPEG_RESOLVED_PATH_LOG, resolveFfmpegExecutablePath, validateConcreteFfmpegPath } from "./ffmpeg-path.ts";
 import { PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import type { ProtectAccessory, ProtectPlatformConfig } from "./types.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
@@ -52,14 +52,17 @@ export class ProtectPlatform implements DynamicPlatformPlugin {
   public readonly retiredTranslation: RetiredTranslation;
   public readonly rtpPorts: RtpPortAllocator;
   public readonly streamingDelegateFactory: StreamingDelegateFactory;
+  private readonly ffmpegPathLookup: NonNullable<Parameters<typeof resolveFfmpegExecutablePath>[1]>;
 
   // Homebridge constructs the platform with three arguments. The fourth is a suite's, handing over the factory every controller builds its MQTT client through.
-  constructor(log: Logging, config: ProtectPlatformConfig | undefined, api: API, { mqttFactory = createMqttClient }: { mqttFactory?: typeof createMqttClient } = {}) {
+  constructor(log: Logging, config: ProtectPlatformConfig | undefined, api: API, { ffmpegPathLookup = {}, mqttFactory = createMqttClient }:
+    { ffmpegPathLookup?: NonNullable<Parameters<typeof resolveFfmpegExecutablePath>[1]>; mqttFactory?: typeof createMqttClient } = {}) {
 
     this.accessories = [];
     this.api = api;
     this.clock = systemClock;
     this.controllers = [];
+    this.ffmpegPathLookup = ffmpegPathLookup;
 
     // Every change to what Homebridge's accessory cache holds for our accessories is reported here, and the changes each save window gathers reach the cache in one
     // write. It is built ahead of the controllers, whose devices report through it from their first configure pass.
@@ -280,14 +283,12 @@ export class ProtectPlatform implements DynamicPlatformPlugin {
   // Launch our configured controllers once all accessories have been loaded. Once we do, they will sustain themselves.
   private async launchControllers(): Promise<void> {
 
-    const configuredFfmpeg = this.config.videoProcessor;
-    const resolvedFfmpegPath = resolveFfmpegExecutablePath(configuredFfmpeg);
+    const resolvedFfmpegPath = resolveFfmpegExecutablePath(this.config.videoProcessor, this.ffmpegPathLookup);
 
     if(!path.isAbsolute(resolvedFfmpegPath)) {
 
-      this.log.error("FFmpeg executable was not found on PATH: " + configuredFfmpeg);
-      this.log.error("This plugin requires a working version of FFmpeg. " +
-        "If you need to specify a path to your FFmpeg, you can do so under 'Settings | Additional Settings' in the plugin configuration webUI.");
+      this.log.error("FFmpeg executable was not found on PATH: " + this.config.videoProcessor);
+      this.log.error(FFMPEG_CONFIGURATION_HINT);
 
       return;
     }
@@ -297,8 +298,7 @@ export class ProtectPlatform implements DynamicPlatformPlugin {
     if(validationError) {
 
       this.log.error(validationError);
-      this.log.error("This plugin requires a working version of FFmpeg. " +
-        "If you need to specify a path to your FFmpeg, you can do so under 'Settings | Additional Settings' in the plugin configuration webUI.");
+      this.log.error(FFMPEG_CONFIGURATION_HINT);
 
       return;
     }
@@ -308,8 +308,7 @@ export class ProtectPlatform implements DynamicPlatformPlugin {
 
     if(!codecs) {
 
-      this.log.error("This plugin requires a working version of FFmpeg. " +
-        "If you need to specify a path to your FFmpeg, you can do so under 'Settings | Additional Settings' in the plugin configuration webUI.");
+      this.log.error(FFMPEG_CONFIGURATION_HINT);
 
       return;
     }

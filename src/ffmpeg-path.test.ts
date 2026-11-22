@@ -106,6 +106,18 @@ describe("ffmpeg path resolution", () => {
     assert.equal(resolved, pathFfmpeg);
   });
 
+  test("on Windows a bare name resolves through PATHEXT when only ffmpeg.exe exists", () => {
+
+    const binDirectory = mkdtempSync(path.join(tmpdir(), "hbup-ffmpeg-pathext-"));
+    const windowsExecutable = path.join(binDirectory, "ffmpeg.exe");
+
+    writeFileSync(windowsExecutable, "", { mode: 0o755 });
+
+    const resolved = resolveFfmpegExecutablePath("ffmpeg", { path: binDirectory, pathext: ".EXE", platform: "win32" });
+
+    assert.equal(resolved, windowsExecutable);
+  });
+
   test("PATH lookup skips a non-executable match and keeps scanning", () => {
 
     const firstDirectory = mkdtempSync(path.join(tmpdir(), "hbup-ffmpeg-nox-"));
