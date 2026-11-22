@@ -7,8 +7,8 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { Writable } from "node:stream";
 import type { HomebridgePluginLogging, Mp4FrameFeed } from "homebridge-plugin-utils";
-import { BackpressureWriter } from "homebridge-plugin-utils";
-import { TestClock, makeBox, makeContainer } from "homebridge-plugin-utils/testing";
+import { BackpressureWriter, HDLR_TYPE_VIDE } from "homebridge-plugin-utils";
+import { TestClock, makeBox, makeContainer, makeFragment, makeInitSegment, settle } from "homebridge-plugin-utils/testing";
 import { makeNonKeyframeFragment, makeUntimedNonKeyframeFragment } from "./testing.helpers.ts";
 import { COPY_ESCALATION_PRIME_FLOOR_MAX_WRITTEN_LIVE_MOOF_CHECKS, livePrimeMediaFloorFromIdentity,
   parsePrimeMediaFloorFromPrimingBuffer } from "./fmp4-fragment-identity.ts";
@@ -72,28 +72,55 @@ describe("rotateBackpressureWriterForCopyEscalation", () => {
   });
 });
 
+const testClock = new TestClock(0);
+
+const stubLog: HomebridgePluginLogging = {
+
+  debug: () => undefined,
+  error: () => undefined,
+  info: () => undefined,
+  warn: () => undefined
+};
+
+const INIT_WITH_VIDEO = makeInitSegment([{ handler: HDLR_TYPE_VIDE, id: 1, timescale: 90000 }]);
+const FRAME_TICKS = 3600;
+
+function framesOf(sizes: number[]): Buffer {
+
+  return makeFragment({ samples: sizes.map((size) => ({ duration: FRAME_TICKS, size })), trackId: 1 });
+}
+
+function frameFeedFor(proc: TestLiveStreamingFfmpegProcess): Mp4FrameFeed {
+
+  const writer = new BackpressureWriter(() => proc.stdin, { clock: testClock, signal: new AbortController().signal });
+
+  return createLiveFrameFeed(writer, testClock, stubLog);
+}
+
 describe("primeLiveFfmpegStdinAfterRespawn", () => {
 
-  test("prefers keyframe priming buffer over init alone", () => {
+  test("prefers keyframe priming buffer over init alone", async () => {
 
     const proc = new TestLiveStreamingFfmpegProcess("prime");
     const init = Buffer.from("init-segment");
     const priming = Buffer.concat([ init, Buffer.from("keyframe-bytes") ]);
 
     primeLiveFfmpegStdinAfterRespawn({ allowTimeshiftPrefix: true, headerWritten: true, primeMediaFloor: null }, { initSegment: { data: init } } as never,
-      proc as never, priming);
+      frameFeedFor(proc), priming);
+    await settle();
 
     assert.equal(proc.stdinWrites.length, 1);
     assert.deepEqual(proc.stdinWrites[0], priming);
   });
 
-  test("uses init only when keyframe priming buffer is null (mismatched buffer channel)", () => {
+  test("uses init only when keyframe priming buffer is null (mismatched buffer channel)", async () => {
 
     const proc = new TestLiveStreamingFfmpegProcess("prime-init-only");
     const init = Buffer.from("init-segment");
 
     primeLiveFfmpegStdinAfterRespawn({ allowTimeshiftPrefix: true, headerWritten: true, primeMediaFloor: null }, { initSegment: { data: init } } as never,
-      proc as never, null);
+      frameFeedFor(proc), null);
+    await settle();
 
     assert.equal(proc.stdinWrites.length, 1);
     assert.deepEqual(proc.stdinWrites[0], init);
@@ -107,7 +134,7 @@ describe("primeLiveFfmpegStdinAfterRespawn", () => {
     const priming = Buffer.concat([lagging.data]);
     const feedState: LiveTsbFeedState = { allowTimeshiftPrefix: true, headerWritten: false, primeMediaFloor: null };
 
-    primeLiveFfmpegStdinAfterRespawn(feedState, { initSegment: { data: init } } as never, proc as never, priming);
+    primeLiveFfmpegStdinAfterRespawn(feedState, { initSegment: { data: init } } as never, frameFeedFor(proc), priming);
 
     assert.ok(feedState.primeMediaFloor);
     assert.equal(feedState.primeMediaFloor.trackDecodeTimes[1], 77777);
@@ -123,24 +150,39 @@ describe("primeLiveFfmpegStdinAfterRespawn", () => {
     const priming = Buffer.concat([ video.data, audio.data ]);
     const feedState: LiveTsbFeedState = { allowTimeshiftPrefix: true, headerWritten: false, primeMediaFloor: null };
 
-    primeLiveFfmpegStdinAfterRespawn(feedState, { initSegment: { data: init } } as never, proc as never, priming);
+    primeLiveFfmpegStdinAfterRespawn(feedState, { initSegment: { data: init } } as never, frameFeedFor(proc), priming);
 
     assert.ok(feedState.primeMediaFloor);
     assert.equal(feedState.primeMediaFloor.trackDecodeTimes[1], 100);
     assert.equal(feedState.primeMediaFloor.trackDecodeTimes[2], 200);
     assert.equal(feedState.primeMediaFloor.sequenceNumber, 6);
   });
+
+  test("copy-escalation respawn primes the rotated Mp4FrameFeed via writeHeader so media fragments stay paced (R1)", async () => {
+
+    const proc = new TestLiveStreamingFfmpegProcess("respawn-prime-writeHeader");
+    const feed = frameFeedFor(proc);
+    const feedState: LiveTsbFeedState = { allowTimeshiftPrefix: true, headerWritten: true, primeMediaFloor: null };
+    const multiFrame = framesOf([ 100, 100 ]);
+
+    primeLiveFfmpegStdinAfterRespawn(feedState, { initSegment: { data: INIT_WITH_VIDEO } } as never, feed, null, stubLog);
+    await settle();
+
+    const writesBeforeFragment = proc.stdinWrites.length;
+
+    void feed.writeFragment(multiFrame);
+    await settle();
+    testClock.advance(FRAME_TICKS);
+    await settle();
+    testClock.advance(FRAME_TICKS);
+    await settle();
+
+    const fragmentStdinWrites = proc.stdinWrites.length - writesBeforeFragment;
+
+    assert.ok(fragmentStdinWrites > 1,
+      "priming must call writeHeader on the feed; otherwise writeFragment issues one blunt stdin write for the whole moof");
+  });
 });
-
-const testClock = new TestClock(0);
-
-const stubLog: HomebridgePluginLogging = {
-
-  debug: () => undefined,
-  error: () => undefined,
-  info: () => undefined,
-  warn: () => undefined
-};
 
 function makeMediaSubscription(segments: { data: Buffer; type: "init" | "media" }[]): LivestreamSubscription {
 
@@ -385,7 +427,7 @@ describe("consumeLiveStreamSegments prime dedup", () => {
     const priming = Buffer.concat([dual]);
     const feedState: LiveTsbFeedState = { allowTimeshiftPrefix: true, headerWritten: false, primeMediaFloor: null };
 
-    primeLiveFfmpegStdinAfterRespawn(feedState, { initSegment: { data: init } } as never, proc as never, priming);
+    primeLiveFfmpegStdinAfterRespawn(feedState, { initSegment: { data: init } } as never, frameFeedFor(proc), priming);
 
     assert.ok(feedState.primeMediaFloor);
     assert.equal(feedState.primeMediaFloor.trackDecodeTimes[1], 900000);
