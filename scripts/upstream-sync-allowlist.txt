@@ -60,10 +60,10 @@ LOST:src/media/stream.ts:853:deliberate fork delta vs upstream v8.3.0 (src/media
 RESURRECTED:src/media/stream.ts:853:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
 LOST:src/media/stream.ts:855:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
 RESURRECTED:src/media/stream.ts:857:deliberate fork delta vs upstream v8.3.0 (src/media/stream.ts)
-RESURRECTED:src/media/stream.ts:1050:upstream v8.3.0 comment not on fork head after stream-live extraction
 RESURRECTED:src/media/stream.ts:1051:upstream v8.3.0 comment not on fork head after stream-live extraction
 RESURRECTED:src/media/stream.ts:1052:upstream v8.3.0 comment not on fork head after stream-live extraction
 RESURRECTED:src/media/stream.ts:1053:upstream v8.3.0 comment not on fork head after stream-live extraction
+RESURRECTED:src/media/stream.ts:1054:upstream v8.3.0 comment not on fork head after stream-live extraction
 LOST:src/media/stream.ts:1070:upstream v8.3.0 comment not on fork head after stream-live extraction
 LOST:src/media/stream.ts:1071:upstream v8.3.0 comment not on fork head after stream-live extraction
 LOST:src/media/stream.ts:1072:upstream v8.3.0 comment not on fork head after stream-live extraction
@@ -79,12 +79,12 @@ LOST:src/media/stream.ts:1305:upstream v8.3.0 comment not on fork head after str
 LOST:src/media/stream.ts:1306:upstream v8.3.0 comment not on fork head after stream-live extraction
 LOST:src/media/stream.ts:1307:upstream v8.3.0 comment not on fork head after stream-live extraction
 LOST:src/media/stream.ts:1308:upstream v8.3.0 comment not on fork head after stream-live extraction
-RESURRECTED:src/media/stream.ts:1675:upstream v8.3.0 comment not on fork head after stream-live extraction
-RESURRECTED:src/media/stream.ts:1676:upstream v8.3.0 comment not on fork head after stream-live extraction
 RESURRECTED:src/media/stream.ts:1677:upstream v8.3.0 comment not on fork head after stream-live extraction
 RESURRECTED:src/media/stream.ts:1678:upstream v8.3.0 comment not on fork head after stream-live extraction
-RESURRECTED:src/media/stream.ts:1684:upstream v8.3.0 comment not on fork head after stream-live extraction
-RESURRECTED:src/media/stream.ts:1685:fork tracks return-audio ffmpeg in ongoingSessions array vs upstream omission
+RESURRECTED:src/media/stream.ts:1679:upstream v8.3.0 comment not on fork head after stream-live extraction
+RESURRECTED:src/media/stream.ts:1680:upstream v8.3.0 comment not on fork head after stream-live extraction
+RESURRECTED:src/media/stream.ts:1686:upstream v8.3.0 comment not on fork head after stream-live extraction
+RESURRECTED:src/media/stream.ts:1687:fork tracks return-audio ffmpeg in ongoingSessions array vs upstream omission
 LOST:src/media/testing.helpers.ts:6:fork fanout/FO2 harness vs upstream v8.3.0 slim helpers
 RESURRECTED:src/media/testing.helpers.ts:6:fork fanout/FO2 harness vs upstream v8.3.0 slim helpers
 LOST:src/media/testing.helpers.ts:7:fork fanout/FO2 harness vs upstream v8.3.0 slim helpers

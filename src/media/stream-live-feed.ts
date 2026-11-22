@@ -200,9 +200,9 @@ export async function consumeLiveStreamSegments(getFfmpeg: () => ProtectStreamin
   }
 }
 
-/** Reprime fMP4 init on a replacement FFmpeg stdin immediately (bypasses the shared writer queue so init precedes any stale queued media). */
-export function primeLiveFfmpegStdinAfterRespawn(feedState: LiveTsbFeedState, subscription: LivestreamSubscription,
-  ffmpeg: StreamingProcess, keyframePrimingBuffer?: Nullable<Buffer>, log?: HomebridgePluginLogging): void {
+/** Reprime fMP4 init on the rotated Mp4FrameFeed so later media fragments stay frame-paced (init once, never double-init). */
+export function primeLiveFfmpegStdinAfterRespawn(feedState: LiveTsbFeedState, subscription: LivestreamSubscription, feed: Mp4FrameFeed,
+  keyframePrimingBuffer?: Nullable<Buffer>, log?: HomebridgePluginLogging): void {
 
   feedState.allowTimeshiftPrefix = false;
   feedState.headerWritten = false;
@@ -217,7 +217,7 @@ export function primeLiveFfmpegStdinAfterRespawn(feedState: LiveTsbFeedState, su
   }
 
   feedState.headerWritten = true;
-  ffmpeg.stdin.write(header);
+  void feed.writeHeader(header).catch((error: unknown) => log?.debug("Live stream backpressure write dropped.", { error }));
 
   if(!keyframePrimingBuffer) {
 

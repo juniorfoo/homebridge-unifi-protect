@@ -247,7 +247,8 @@ describe("copy-to-transcode replacement effects", () => {
       }),
       transcodeTargetBitrate: 800,
       transcodeReason: "copy failed",
-      tsbResume: { feedState: feedState, keyframePrimingBuffer: null, rotateSegmentWriter: writerRail.rotateSegmentWriter, subscription: subscription }
+      tsbResume: { feedState: feedState, getFrameFeed: () => writerRail.getFrameFeed(), keyframePrimingBuffer: null, rotateSegmentWriter: writerRail.rotateSegmentWriter,
+        subscription: subscription }
     });
 
     assert.ok(active !== copy);
@@ -301,7 +302,8 @@ describe("copy-to-transcode replacement effects", () => {
       }),
       transcodeTargetBitrate: 800,
       transcodeReason: "copy failed",
-      tsbResume: { feedState: feedState, keyframePrimingBuffer: null, rotateSegmentWriter: writerRail.rotateSegmentWriter, subscription: subscription }
+      tsbResume: { feedState: feedState, getFrameFeed: () => writerRail.getFrameFeed(), keyframePrimingBuffer: null, rotateSegmentWriter: writerRail.rotateSegmentWriter,
+        subscription: subscription }
     });
 
     await drainBackpressureWrites();
@@ -538,6 +540,7 @@ describe("copy-to-transcode replacement effects", () => {
       tsbResume: {
 
         feedState: feedState,
+        getFrameFeed: () => writerRail.getFrameFeed(),
         keyframePrimingBuffer: null,
         rotateSegmentWriter: (replacement) => {
 

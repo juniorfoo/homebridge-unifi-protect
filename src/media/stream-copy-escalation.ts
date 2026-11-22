@@ -3,7 +3,7 @@
  * stream-copy-escalation.ts: In-session copy-to-transcode replacement (spawn-injectable for effect tests).
  */
 /* eslint-disable sort-imports -- type and value imports from the same package stay paired */
-import type { BackpressureWriter, HomebridgePluginLogging, Nullable, StreamingProcess } from "homebridge-plugin-utils";
+import type { BackpressureWriter, HomebridgePluginLogging, Mp4FrameFeed, Nullable, StreamingProcess } from "homebridge-plugin-utils";
 import type { ProtectStreamingFfmpegProcess } from "./stream-ffmpeg-process.ts";
 import { HbpuAbortError } from "homebridge-plugin-utils";
 import type { StartStreamRequest } from "homebridge";
@@ -52,6 +52,8 @@ export interface CopyEscalationTsbResume {
   feedState: LiveTsbFeedState;
   /** Init plus standing buffer from the last keyframe (when available) for decoder priming after copy exit. */
   keyframePrimingBuffer: Nullable<Buffer>;
+  /** The rotated segment writer's frame feed (must match the writer installed by the last rotateSegmentWriter call). */
+  getFrameFeed: () => Mp4FrameFeed;
   /** Spawn a new writer for the replacement stdin and abandon the prior writer (which may already be failed after copy exit). */
   rotateSegmentWriter: (replacement: StreamingProcess) => BackpressureWriter;
   subscription: LivestreamSubscription;
@@ -210,8 +212,8 @@ export async function replaceFailedCopyWithTranscode(input: CopyEscalationReplac
     if(input.tsbResume) {
 
       input.tsbResume.rotateSegmentWriter(ffmpegStream);
-      primeLiveFfmpegStdinAfterRespawn(input.tsbResume.feedState, input.tsbResume.subscription, ffmpegStream, input.tsbResume.keyframePrimingBuffer,
-        input.log);
+      primeLiveFfmpegStdinAfterRespawn(input.tsbResume.feedState, input.tsbResume.subscription, input.tsbResume.getFrameFeed(),
+        input.tsbResume.keyframePrimingBuffer, input.log);
     }
 
     input.onRespawned(ffmpegStream);

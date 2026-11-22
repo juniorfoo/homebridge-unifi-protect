@@ -4,7 +4,7 @@
  */
 /* eslint-disable sort-imports -- value/type import grouping follows dependency order */
 import type { StartStreamRequest } from "homebridge";
-import type { BackpressureWriter, FfmpegOptions, Nullable, StreamingProcess } from "homebridge-plugin-utils";
+import type { BackpressureWriter, FfmpegOptions, Mp4FrameFeed, Nullable, StreamingProcess } from "homebridge-plugin-utils";
 import { HOMEKIT_IDR_INTERVAL, isHbpuAbortReason } from "homebridge-plugin-utils";
 import type { ProtectCameraHost } from "./camera-host.ts";
 import type { CopyEscalationTsbResume } from "./stream-copy-escalation.ts";
@@ -184,6 +184,7 @@ export function createCopyEscalationTsbResume(input: { feedState: LiveTsbFeedSta
   return {
 
     feedState: input.feedState,
+    getFrameFeed: (): Mp4FrameFeed => input.rail.getFrameFeed(),
     keyframePrimingBuffer: input.keyframePrimingBuffer ?? null,
     rotateSegmentWriter: (replacement: StreamingProcess): BackpressureWriter => input.rail.rotateSegmentWriter(replacement),
     subscription: input.subscription
@@ -215,6 +216,9 @@ function buildLiveStreamEncoderPipelineOptions(protectCamera: ProtectCameraHost,
     inputFps: encoderInputFps,
     level: request.video.level,
     profile: request.video.profile,
+    // Post-sync fork delta (v8.3.0 sync): upstream commit 86b4a42 moved filter-free / capped output fps into stream-encode-policy.ts for the upstream delegate path.
+    // This fork still wires minterpolate here when stream.ts enables useInterpolationFilter (TSB-backed transcodes on recent Apple Silicon). Aligning with upstream's CPU
+    // tradeoff is a deliberate follow-up choice, not part of this sync PR.
     // When interpolating, hand the encoder the fps and interpolation filters to smooth the presentation timestamps; it composes them into its own chain and bridges
     // any GPU-to-CPU download transfer itself.
     ...(useInterpolation ? { videoFilters: [ "fps=" + requestedFps.toString(),

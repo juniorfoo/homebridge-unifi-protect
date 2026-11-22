@@ -1013,7 +1013,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     }
 
     // Decide whether this session re-encodes the video, and read the connection's latency from the negotiated audio packet time. Both are a pure policy over the user's
-    // configured hints and the camera's codec - stream-encode-policy.ts carries the full rationale for each circumstance that forces a transcode.
+    // configured hints and the camera's codec. Live argv uses resolveStartStreamEncodePlan / stream-live-wiring;
+    // stream-encode-policy.ts is upstream parity/tests only on this fork.
     const isHighLatency = request.audio.packet_time >= 60;
 
     // Copy vs transcode is decided in resolveStartStreamEncodePlan / decideLiveVideoEncode (user options, crop, codec, RTSP, avcC prefix, geometry).
@@ -1226,6 +1227,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate, Stream
     //
     // - Since we are using an already existing connection to the Protect controller, we don't need to create another connection which incurs an additional delay, as well
     //   as a resource hit on the Protect controller.
+    // Fork live gate for minterpolate (stream-live-wiring.ts); not stream-encode-policy.ts (upstream v8.3.0 test module only on this fork's hot path).
     const useInterpolationFilter = useTsb && !isPackageCameraContext(this.protectCamera.accessory.context) &&
       ((this.platform.codecSupport.hostSystem === "macOS.Apple") && (this.platform.codecSupport.cpuGeneration >= 3));
 
