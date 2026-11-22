@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * stream-encode-policy.ts: upstream v8.3.0 pure encoding decisions (file parity/tests; fork live argv uses stream-live-wiring.ts on the hot path, not this module), for UniFi Protect.
+ * stream-encode-policy.ts: upstream v8.3.0 pure encoding decisions (parity/tests only; live argv is stream-live-wiring.ts), for UniFi Protect.
  *
  * Once the transport a live view draws from is settled (stream-source-policy.ts), a handful of questions remain before an FFmpeg command line can be assembled: whether
  * the video is re-encoded at all, what source channel to ask the camera for, and - when we do re-encode - the exact encoder parameters. Each is a small decision over
